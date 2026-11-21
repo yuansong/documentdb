@@ -7,6 +7,7 @@
  */
 
 pub mod conn_mgmt;
+pub mod shmem_transport;
 mod data_client;
 pub(crate) mod document;
 mod documentdb_data_client;
