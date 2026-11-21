@@ -1,0 +1,230 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * documentdb_gateway/src/main.rs
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "Main binary uses expect for initialization failures that should crash the process"
+)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "Main binary uses unwrap for failures that should crash the process"
+)]
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod bootstrap;
+mod check;
+mod cli;
+
+use std::sync::Arc;
+
+use documentdb_gateway_core::{
+    auth::AuthenticationManager,
+    configuration::{DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
+    error::DocumentDBError,
+    postgres::{conn_mgmt, create_query_catalog, DocumentDBDataClient},
+    run_gateway, run_legacy_gateway,
+    service::{DefaultRequestRouter, TlsProvider},
+    shutdown_controller::SHUTDOWN_CONTROLLER,
+    startup::{create_postgres_object, get_service_context},
+    time::STARTUP_INSTANT,
+};
+use documentdb_gateway_otel::TelemetryManager;
+use tokio::{signal, time::Instant};
+
+/// Logs the startup failure, flushes telemetry, and exits.
+///
+/// Uses exit code 0 when shutdown was already requested (e.g. Ctrl+C during
+/// retry), since that is an expected, successful stop; otherwise exits with
+/// code 15 to signal a genuine startup failure to the process supervisor.
+fn exit_after_postgres_startup_failure(
+    telemetry_manager: Option<TelemetryManager>,
+    error: &DocumentDBError,
+) -> ! {
+    if SHUTDOWN_CONTROLLER.token().is_cancelled() {
+        eprintln!("Shutdown signal received during postgres startup. Aborting.");
+    } else {
+        eprintln!("Failed to create postgres object: {error}");
+    }
+
+    if let Some(manager) = telemetry_manager {
+        if let Err(err) = manager.shutdown() {
+            eprintln!("Failed to shutdown telemetry manager: {err}");
+        }
+    }
+
+    std::process::exit(if SHUTDOWN_CONTROLLER.token().is_cancelled() {
+        0
+    } else {
+        15
+    });
+}
+
+fn shutdown_telemetry(telemetry_manager: Option<TelemetryManager>) {
+    if let Some(manager) = telemetry_manager {
+        if let Err(error) = manager.shutdown() {
+            // Emit an error line and attempt to emit in tracing telemetry,
+            // which may or may not be in a good state to emit.
+            eprintln!("Failed to shutdown telemetry manager: {error}");
+            tracing::error!("Failed to shutdown telemetry manager: {error}");
+        }
+    }
+}
+
+fn main() {
+    STARTUP_INSTANT.get_or_init(Instant::now);
+
+    tracing::debug!("Gateway process started");
+
+    // Dispatch documentdb-gateway --help/--version/check subcommands; exits
+    // if any matched. For `run [--config <path>]` returns Some(path) (path is
+    // guaranteed to exist — cli validated). For the legacy invocation form
+    // `documentdb-gateway <path>` also returns Some(path) with the same
+    // must-exist guarantee. For the no-args form, returns None.
+    let explicit_config = cli::dispatch_or_passthrough();
+
+    let setup_configuration = bootstrap::with_bootstrap_tracing(|| {
+        // Load configuration via the shared helper so the `run` daemon path uses
+        // the same 3-tier resolution (explicit → packaged → dev → env-only) as
+        // the `check` subcommand. When explicit_config is Some(path), the path
+        // is guaranteed to exist; when None, the helper does the 3-tier fallback.
+        let setup_configuration = bootstrap::load_configuration(explicit_config);
+        tracing::info!("Starting server with configuration: {setup_configuration:?}");
+        setup_configuration
+    });
+
+    // Create Tokio runtime with configured worker threads
+    let async_runtime_worker_threads = setup_configuration.async_runtime_worker_threads();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(async_runtime_worker_threads)
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    bootstrap::with_bootstrap_tracing(|| {
+        tracing::info!("Created Tokio runtime with {async_runtime_worker_threads} worker threads");
+    });
+
+    // Run the async main logic
+    runtime.block_on(start_gateway(setup_configuration));
+}
+
+async fn start_gateway(mut setup_configuration: DocumentDBSetupConfiguration) {
+    let enable_v2_runtime = setup_configuration.enable_v2_runtime();
+
+    // Initialize the telemetry adapter before constructing the tracing subscriber.
+    // The manager owns provider resources and flushes them during shutdown.
+    let telemetry_manager = match TelemetryManager::init_telemetry(
+        setup_configuration.telemetry_provider_options(),
+        None,
+    ) {
+        Ok(manager) => {
+            setup_configuration.set_telemetry_settings(manager.settings());
+            Some(manager)
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize telemetry: {e}");
+            None
+        }
+    };
+
+    bootstrap::init_tracing_with_telemetry(telemetry_manager.as_ref());
+
+    tracing::info!(
+        "Tracing subscriber installed (trace_export_enabled={})",
+        telemetry_manager
+            .as_ref()
+            .is_some_and(TelemetryManager::traces_enabled)
+    );
+
+    let shutdown_token = SHUTDOWN_CONTROLLER.token();
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        tracing::info!("Ctrl+C received. Shutting down Rust gateway.");
+        SHUTDOWN_CONTROLLER.shutdown();
+    });
+
+    let tls_provider = TlsProvider::new(
+        SetupConfiguration::certificate_options(&setup_configuration),
+        None,
+        None,
+    )
+    .await
+    .expect("Failed to create TLS provider.");
+
+    tracing::info!("TLS provider initialized successfully.");
+
+    let connection_pool_manager = create_postgres_object(
+        || async {
+            conn_mgmt::create_connection_pool_manager(
+                create_query_catalog(),
+                Box::new(setup_configuration.clone()),
+            )
+            .await
+        },
+        &setup_configuration,
+    )
+    .await;
+    let connection_pool_manager = match connection_pool_manager {
+        Ok(manager) => manager,
+        Err(error) => exit_after_postgres_startup_failure(telemetry_manager, &error),
+    };
+
+    let dynamic_configuration = create_postgres_object(
+        || async {
+            PgConfiguration::new(
+                &setup_configuration,
+                Arc::clone(&connection_pool_manager),
+                vec!["documentdb.".to_owned()],
+            )
+            .await
+        },
+        &setup_configuration,
+    )
+    .await;
+    let dynamic_configuration = match dynamic_configuration {
+        Ok(configuration) => configuration,
+        Err(error) => exit_after_postgres_startup_failure(telemetry_manager, &error),
+    };
+
+    let service_context = get_service_context(
+        Box::new(setup_configuration),
+        dynamic_configuration,
+        connection_pool_manager,
+        tls_provider,
+        AuthenticationManager::new(),
+    );
+
+    if enable_v2_runtime {
+        tracing::info!("Starting gateway v2 runtime");
+        run_gateway::<DocumentDBDataClient, _>(
+            service_context,
+            None,
+            DefaultRequestRouter {},
+            shutdown_token,
+        )
+        .await
+        .unwrap();
+    } else {
+        tracing::info!("Starting gateway v1 runtime");
+        run_legacy_gateway::<DocumentDBDataClient, _>(
+            service_context,
+            None,
+            DefaultRequestRouter {},
+            shutdown_token,
+        )
+        .await
+        .unwrap();
+    }
+
+    shutdown_telemetry(telemetry_manager);
+}

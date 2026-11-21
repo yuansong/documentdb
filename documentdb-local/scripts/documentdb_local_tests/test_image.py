@@ -1,0 +1,2211 @@
+"""
+Image-level integration tests for documentdb-local.
+
+Scope: documentdb-local's own contract as a published image.
+
+  - The image must build.
+  - A freshly-started container must reach readiness within a sane timeout.
+  - The entrypoint flags documented in `emulator_entrypoint.sh --help` must
+    actually take effect: `--username`, `--password`, `--documentdb-port`,
+    `--tlsMode`, `--data-path`, `--init-data`, `--init-data-path`,
+    `--skip-init-data`.
+  - The published port must be reachable from outside the container when
+    mapped via `docker run -p HOST:CONTAINER` (the most-used scenario).
+  - Data placed under `--data-path` must survive container recreation.
+  - Authentication must be enforced (wrong password rejected).
+  - The image must run as a non-root user.
+
+Out of scope (by design):
+
+  - Wire-protocol / aggregation / CRUD / indexing / BSON correctness:
+    those are covered by the upstream functional-tests image referenced
+    from `documentdb-local/functional-tests/config/image.yml`. The tests
+    here use `mongosh` only as a vehicle to assert image-contract
+    properties (port binding, auth enforcement, data persistence),
+    never to assert engine semantics.
+  - Performance, clustering / replication, custom certificate fixture
+    generation, telemetry endpoint behavior.
+
+The image reference is supplied via DOCUMENTDB_LOCAL_IMAGE so the same
+script works locally and in CI:
+
+    DOCUMENTDB_LOCAL_IMAGE=documentdb-local:dev \\
+        python3 -m unittest discover -v \\
+            -s documentdb-local/scripts/documentdb_local_tests \\
+            -p 'test_image.py'
+
+Each test class spawns its own throwaway container; lifecycles are
+isolated so one class's failure doesn't cascade.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import uuid
+from unittest import mock
+
+# The shared backend-contract detector lives alongside this file. Make it
+# importable regardless of how the suite is launched: `unittest discover -s
+# <dir>` puts <dir> on sys.path, but a dotted
+# `-m unittest documentdb_local_tests.test_image` run does not.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import backend_contract  # noqa: E402
+import catalog_contract  # noqa: E402
+
+# The gateway QueryCatalog source path and the parser floor are single-sourced
+# from catalog_contract so this image test and the unit tests cannot disagree.
+QUERY_CATALOG_RS = catalog_contract.QUERY_CATALOG_RS
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+READY_LOG = "=== DocumentDB is ready ==="
+DEFAULT_PORT = 10260
+DEFAULT_USERNAME = "docdb_admin"
+
+DEFAULT_READY_TIMEOUT = int(os.environ.get("DOCUMENTDB_READY_TIMEOUT", "240"))
+DEFAULT_MONGOSH_TIMEOUT = 30
+SAMPLE_DATA_COUNTS = {"stores": 41505, "ratings": 2}
+
+# Directory where container logs are persisted before container removal.
+# CI uploads the contents of this directory as an artifact when a job
+# fails. Logs MUST be written here before `docker rm -f` runs.
+LOG_DIR = pathlib.Path(
+    os.environ.get("DOCUMENTDB_LOCAL_LOG_DIR", ".test-results/image-test")
+)
+
+# Container name prefix - tests use this as a `docker ps --filter name=`
+# anchor for log capture on failure. Kept deliberately short so it fits
+# in CI artifact names.
+CONTAINER_PREFIX = "docdb-image-test"
+
+# Skip every TestCase in this module when the image reference is not
+# provided. Keeps the file safe under `unittest discover` outside CI.
+_SKIP_REASON = (
+    "Set DOCUMENTDB_LOCAL_IMAGE to the documentdb-local image reference to run."
+)
+_SKIP_UNLESS_IMAGE = unittest.skipUnless(
+    os.environ.get("DOCUMENTDB_LOCAL_IMAGE"), _SKIP_REASON
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _docker(*args: str, check: bool = True, capture: bool = True,
+            timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Thin wrapper around subprocess.run for `docker` calls."""
+    return subprocess.run(
+        ["docker", *args],
+        check=check,
+        text=True,
+        # Decode leniently: container logs can carry invalid UTF-8, and the
+        # runner/dev-machine locale must not turn a benign byte into a decode
+        # error that fails the backend-contract gate (or breaks on cp1252).
+        encoding="utf-8",
+        errors="replace",
+        capture_output=capture,
+        timeout=timeout,
+    )
+
+
+def _random_password(length: int = 32) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _random_container_name() -> str:
+    return f"{CONTAINER_PREFIX}-{uuid.uuid4().hex[:8]}"
+
+
+def _persist_container_logs(container: str | None) -> None:
+    """Write `docker logs <container>` to LOG_DIR so the CI artifact
+    step can find them. Must run BEFORE `docker rm -f` because logs
+    disappear with the container. Best-effort: never raises."""
+    if not container:
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logs = _docker("logs", container, check=False)
+        (LOG_DIR / f"{container}.log").write_text(
+            f"--- stdout ---\n{logs.stdout}\n"
+            f"--- stderr ---\n{logs.stderr}\n",
+            encoding="utf-8",
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _wait_for_ready(container: str, *, timeout: int = DEFAULT_READY_TIMEOUT,
+                    poll_interval: float = 2.0) -> None:
+    """Poll docker logs for READY_LOG. Raises RuntimeError on timeout
+    or premature container exit. Caller is responsible for log capture
+    and container removal."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        running = _docker(
+            "inspect", "-f", "{{.State.Running}}", container, check=False,
+        )
+        if running.returncode != 0 or running.stdout.strip() != "true":
+            raise RuntimeError(
+                f"container {container!r} exited before becoming ready "
+                f"(state inspect: {running.stdout.strip()!r})"
+            )
+        logs = _docker("logs", container, check=False)
+        if READY_LOG in logs.stdout or READY_LOG in logs.stderr:
+            return
+        time.sleep(poll_interval)
+    raise RuntimeError(
+        f"container {container!r} did not emit readiness marker "
+        f"{READY_LOG!r} within {timeout}s"
+    )
+
+
+def _wait_for_healthy(container: str, *, timeout: int = 120,
+                      poll_interval: float = 2.0) -> None:
+    """Poll `docker inspect` until the built-in HEALTHCHECK reports healthy.
+    The probe runs on a 30s interval, so allow at least one full interval
+    past readiness. Raises RuntimeError on timeout or premature exit."""
+    deadline = time.monotonic() + timeout
+    status = "<never inspected>"
+    while time.monotonic() < deadline:
+        result = _docker(
+            "inspect", "-f",
+            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+            container, check=False, timeout=30,
+        )
+        status = result.stdout.strip()
+        if status == "healthy":
+            return
+        if status == "none":
+            # No health state at all: the image has no HEALTHCHECK wired up.
+            # Polling to the timeout would report this as "not healthy yet"
+            # instead of the configuration failure it is.
+            raise RuntimeError(
+                f"container {container!r} has no healthcheck configured; "
+                f"the image predates the built-in probe?"
+            )
+        running = _docker(
+            "inspect", "-f", "{{.State.Running}}", container, check=False,
+            timeout=30,
+        )
+        if running.returncode != 0 or running.stdout.strip() != "true":
+            raise RuntimeError(
+                f"container {container!r} exited while waiting for healthy "
+                f"(last health status: {status!r})"
+            )
+        time.sleep(poll_interval)
+    raise RuntimeError(
+        f"container {container!r} did not report healthy within {timeout}s "
+        f"(last health status: {status!r})"
+    )
+
+
+def _start_container(image: str, *, extra_run_args: list[str] | None = None,
+                     entrypoint_flags: list[str] | None = None,
+                     name: str | None = None) -> str:
+    """Spawn a container and return its name. Caller owns cleanup.
+
+    Usage telemetry is disabled for every container started here. These are
+    test boots, not deployments, and counting them inflates the adoption
+    numbers the telemetry exists to measure. The emitter's own CI detection
+    cannot do this for us: it reads CI/GITHUB_ACTIONS/TF_BUILD inside the
+    container, and `docker run` does not forward them from the agent, so an
+    ADO or GitHub run looks exactly like a real deployment from in there.
+
+    Applied here rather than at the call sites so a new test cannot
+    reintroduce the problem by forgetting it.
+    """
+    container = name or _random_container_name()
+    args = ["run", "-d", "--name", container,
+            "-e", "DOCUMENTDB_USAGE_TELEMETRY=false"]
+    if extra_run_args:
+        args.extend(extra_run_args)
+    args.append(image)
+    if entrypoint_flags:
+        args.extend(entrypoint_flags)
+    _docker(*args, timeout=60)
+    return container
+
+
+def _cleanup_container(container: str | None) -> None:
+    """Persist logs then remove the container. Best-effort."""
+    if not container:
+        return
+    _persist_container_logs(container)
+    # -v drops the anonymous /data volume from the image's VOLUME; named volumes stay.
+    _docker("rm", "-fv", container, check=False)
+
+
+def _stop_then_cleanup_container(container: str | None) -> None:
+    """Graceful stop before removal, for a container whose volume is booted
+    again: `docker rm -f` SIGKILLs and leaves postmaster.pid behind, which
+    the next boot refuses. The SIGTERM trap runs pg_ctl stop, which removes it."""
+    if not container:
+        return
+    _docker("stop", "-t", "60", container, check=False, timeout=120)
+    _cleanup_container(container)
+
+
+def _mongosh_exec(container: str, eval_code: str, *,
+                  username: str, password: str,
+                  port: int = DEFAULT_PORT,
+                  use_tls: bool = True,
+                  auth_mechanism: str = "SCRAM-SHA-256",
+                  timeout: int = DEFAULT_MONGOSH_TIMEOUT,
+                  ) -> subprocess.CompletedProcess:
+    """Run mongosh via `docker exec` inside the target container."""
+    cmd = [
+        "exec", "-i", container,
+        "mongosh",
+        f"localhost:{port}",
+        "-u", username, "-p", password,
+        "--authenticationMechanism", auth_mechanism,
+    ]
+    if use_tls:
+        cmd.extend(["--tls", "--tlsAllowInvalidCertificates"])
+    cmd.extend(["--quiet", "--eval", eval_code])
+    return _docker(*cmd, check=False, timeout=timeout)
+
+
+def _mongosh_sibling(image: str, host: str, port: int, eval_code: str, *,
+                     username: str, password: str,
+                     use_tls: bool = True,
+                     timeout: int = DEFAULT_MONGOSH_TIMEOUT,
+                     ) -> subprocess.CompletedProcess:
+    """Run mongosh in a sibling container with `--network host`, talking
+    to the documentdb-local container via its host-published port.
+    Reuses the documentdb-local image (it ships mongosh) so no extra
+    image pull is needed."""
+    cmd = [
+        "run", "--rm", "--network", "host",
+        "--entrypoint", "mongosh",
+        image,
+        f"{host}:{port}",
+        "-u", username, "-p", password,
+        "--authenticationMechanism", "SCRAM-SHA-256",
+    ]
+    if use_tls:
+        cmd.extend(["--tls", "--tlsAllowInvalidCertificates"])
+    cmd.extend(["--quiet", "--eval", eval_code])
+    return _docker(*cmd, check=False, timeout=timeout)
+
+
+def _last_nonempty_line(text: str) -> str:
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _combined_logs(proc: subprocess.CompletedProcess) -> str:
+    """Join a `docker logs` process's stdout and stderr with a newline. The
+    explicit separator prevents a dangling (newline-less) final stdout line from
+    gluing onto the first stderr line (which could hide or fabricate a match)."""
+    return proc.stdout + "\n" + proc.stderr
+
+
+def _container_pg_socket_port(container: str) -> str:
+    """Return the single in-container PostgreSQL port from its unix socket.
+
+    The emulator runs exactly one PostgreSQL cluster on a non-default port
+    (default 9712) whose socket lives at `/var/run/postgresql/.s.PGSQL.<port>`.
+    We require exactly one socket: zero means PostgreSQL is not up, and more than
+    one would make introspection ambiguous (the contract could be satisfied by
+    the wrong cluster). Both are errors with a clear message."""
+    res = _docker(
+        "exec", container, "sh", "-c",
+        "ls /var/run/postgresql/.s.PGSQL.* 2>/dev/null",
+        check=False, timeout=15,
+    )
+    ports = sorted(set(re.findall(r"\.s\.PGSQL\.(\d+)", res.stdout)))
+    if not ports:
+        raise RuntimeError(
+            "could not find a PostgreSQL unix socket "
+            "(/var/run/postgresql/.s.PGSQL.*) in the container; "
+            f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        )
+    if len(ports) > 1:
+        raise RuntimeError(
+            "expected exactly one PostgreSQL cluster in the container but found "
+            f"sockets for ports {ports}; backend introspection is ambiguous."
+        )
+    return ports[0]
+
+
+def _existing_documentdb_functions(container: str) -> set[str]:
+    """Return the `schema.function` names present in the documentdb backend
+    schemas (documentdb_api, documentdb_api_internal, documentdb_api_catalog,
+    documentdb_core) of the container's `postgres` database.
+
+    Connects as the container's OS user (a superuser via peer auth) over the
+    single local socket -- the same path the emulator's own setup uses. The SQL
+    is passed as a single argv element (no shell), so its quoting is literal."""
+    sql = (
+        "SELECT n.nspname || '.' || p.proname "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE n.nspname IN ('documentdb_api', 'documentdb_api_internal', "
+        "'documentdb_api_catalog', 'documentdb_core')"
+    )
+    port = _container_pg_socket_port(container)
+    res = _docker(
+        "exec", container, "psql", "-p", port, "-d", "postgres",
+        "-tAqc", sql, check=False, timeout=30,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"psql introspection on port {port} failed: rc={res.returncode} "
+            f"stderr={res.stderr.strip()!r}"
+        )
+    functions = {
+        line.strip() for line in res.stdout.splitlines() if line.strip()
+    }
+    if not functions:
+        raise RuntimeError(
+            "no documentdb backend functions found on the PostgreSQL socket "
+            f"(port {port}) -- the extension may not be installed in the "
+            "'postgres' database."
+        )
+    return functions
+
+
+# ---------------------------------------------------------------------------
+# Base classes
+# ---------------------------------------------------------------------------
+
+class StartContainerTests(unittest.TestCase):
+    """Check launch arguments without building or starting an image."""
+
+    def test_default_launch_disables_telemetry(self):
+        with mock.patch(__name__ + "._docker") as docker, \
+                mock.patch(__name__ + "._random_container_name", return_value="test-container"):
+            container = _start_container("test-image")
+
+        self.assertEqual(container, "test-container")
+        docker.assert_called_once_with(
+            "run", "-d", "--name", "test-container",
+            "-e", "DOCUMENTDB_USAGE_TELEMETRY=false", "test-image", timeout=60,
+        )
+
+    def test_custom_launch_keeps_opt_out_before_image(self):
+        with mock.patch(__name__ + "._docker") as docker:
+            container = _start_container(
+                "test-image", name="custom-container",
+                extra_run_args=["-p", "10260:10260"],
+                entrypoint_flags=["--skip-init-data"],
+            )
+
+        self.assertEqual(container, "custom-container")
+        docker.assert_called_once_with(
+            "run", "-d", "--name", "custom-container",
+            "-e", "DOCUMENTDB_USAGE_TELEMETRY=false",
+            "-p", "10260:10260", "test-image", "--skip-init-data", timeout=60,
+        )
+
+
+class _ContainerTestBase(unittest.TestCase):
+    """Test case base that spawns one container per class.
+
+    Subclasses override class attributes:
+      - EXTRA_RUN_ARGS: extra `docker run` flags (e.g. `-p`, `-v`).
+      - ENTRYPOINT_FLAGS: extra emulator_entrypoint.sh flags.
+      - USERNAME: gateway username to provision (default DEFAULT_USERNAME).
+
+    Subclasses inherit shared setUpClass / tearDownClass that handle:
+      - lazy skip if DOCUMENTDB_LOCAL_IMAGE is unset (via decorator).
+      - random container name + random password.
+      - readiness polling.
+      - log persistence + container removal.
+    """
+
+    EXTRA_RUN_ARGS: list[str] = []
+    ENTRYPOINT_FLAGS: list[str] = []
+    USERNAME: str = DEFAULT_USERNAME
+
+    image: str
+    container: str | None
+    password: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        cls.container = None
+        cls.password = _random_password()
+
+        # This body runs only when DOCUMENTDB_LOCAL_IMAGE is set (the class-level
+        # @_SKIP_UNLESS_IMAGE decorator skips otherwise), i.e. we are in the CI
+        # gate that this suite exists to enforce. So an unavailable or unbootable
+        # image is a hard ERROR, not a SkipTest -- a silent skip here would let a
+        # broken image pass green, the exact silent-no-op #650 is about.
+        result = _docker("image", "inspect", cls.image, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Image not available locally: {cls.image}\n"
+                f"docker image inspect stderr:\n{result.stderr}"
+            )
+
+        flags = ["--username", cls.USERNAME, "--password", cls.password,
+                 *cls.ENTRYPOINT_FLAGS]
+        try:
+            cls.container = _start_container(
+                cls.image,
+                extra_run_args=cls.EXTRA_RUN_ARGS,
+                entrypoint_flags=flags,
+            )
+            _wait_for_ready(cls.container)
+        except Exception:
+            _cleanup_container(cls.container)
+            cls.container = None
+            # Re-raise the original failure (do NOT downgrade to SkipTest): an
+            # image that will not boot must fail the gate.
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        _cleanup_container(cls.container)
+        cls.container = None
+
+    # Convenience wrapper that fills in the per-test creds and container.
+    def _mongosh(self, eval_code: str, *,
+                 username: str | None = None,
+                 password: str | None = None,
+                 port: int = DEFAULT_PORT,
+                 use_tls: bool = True,
+                 timeout: int = DEFAULT_MONGOSH_TIMEOUT,
+                 ) -> subprocess.CompletedProcess:
+        return _mongosh_exec(
+            self.container,
+            eval_code,
+            username=username if username is not None else self.USERNAME,
+            password=password if password is not None else self.password,
+            port=port,
+            use_tls=use_tls,
+            timeout=timeout,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 1. Default container - boot, readiness, ping, auth, non-root,
+#    mongosh binary, post-workload liveness.
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class DefaultContainerTests(_ContainerTestBase):
+    """Defaults-only container: --skip-init-data, allowTLS, internal port."""
+
+    ENTRYPOINT_FLAGS = ["--skip-init-data"]
+
+    def test_container_is_running(self):
+        result = _docker("inspect", "-f", "{{.State.Running}}", self.container)
+        self.assertEqual(
+            result.stdout.strip(), "true",
+            f"container not running: {result.stdout!r}",
+        )
+
+    def test_readiness_log_is_present(self):
+        logs = _docker("logs", self.container)
+        combined = logs.stdout + "\n" + logs.stderr
+        self.assertIn(
+            READY_LOG, combined,
+            "readiness log not found in container logs (last 40 lines):\n"
+            + "\n".join(combined.splitlines()[-40:]),
+        )
+
+    def test_password_flag_is_not_in_any_process_argv(self):
+        # Covers the Dockerfile's `bash -c` wrapper, which the unit test bypasses.
+        result = _docker("exec", self.container, "sh", "-c",
+                         "cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' '")
+        self.assertNotIn(self.password, result.stdout)
+
+    def test_first_boot_adopts_baked_data_template(self):
+        """Startup-time contract (issue #480): the image ships a
+        pre-initialized PostgreSQL data directory, and a default first boot
+        must adopt it instead of running initdb + CREATE EXTENSION (the
+        expensive path this feature exists to skip)."""
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        self.assertIn(
+            "Adopting pre-initialized data directory template", combined,
+            "first boot did not adopt the image-baked data directory "
+            "template; the pre-initialized fast path regressed (issue #480). "
+            "Last 40 log lines:\n"
+            + "\n".join(combined.splitlines()[-40:]),
+        )
+        self.assertNotIn(
+            "Calling initdb", combined,
+            "first boot ran initdb even though the image ships a "
+            "pre-initialized data directory (issue #480).",
+        )
+
+    def test_image_runs_as_non_root(self):
+        """Security baseline: the runtime user must not be root."""
+        result = _docker(
+            "inspect", "-f", "{{.Config.User}}", self.image,
+        )
+        configured_user = result.stdout.strip()
+        self.assertNotIn(
+            configured_user, ("", "root", "0", "0:0"),
+            f"image Config.User is {configured_user!r}; expected a non-root user.",
+        )
+        # Cross-check the live process is also non-root.
+        whoami = _docker(
+            "exec", self.container, "whoami", check=False, timeout=10,
+        )
+        self.assertEqual(whoami.returncode, 0, msg=whoami.stderr)
+        self.assertNotEqual(
+            whoami.stdout.strip(), "root",
+            "in-container `whoami` reports root; expected a non-root user.",
+        )
+
+    def test_image_exposes_default_gateway_port(self):
+        ports = _docker("inspect", "-f", "{{json .Config.ExposedPorts}}", self.image)
+        self.assertIn(f'"{DEFAULT_PORT}/tcp"', ports.stdout)
+
+    def test_image_reports_build_provenance(self):
+        """Provenance contract (issue #687): the image must self-identify.
+
+        Mechanism-level check that must hold for ARGLESS builds too (the
+        pre-merge image builds pass no provenance build args): the OCI labels
+        exist, /version.txt is well-formed with a REAL version (derived from
+        the installed extension package, never from a build arg), and the
+        entrypoint printed it at startup. Value-level checks for the
+        pipeline-passed args (revision == build sha, version == the resolved
+        release version, created non-empty) live in the publishing workflow's
+        smoke step — the only builder that passes them."""
+        for key in ("version", "revision", "source"):
+            label = _docker(
+                "inspect", "-f",
+                f'{{{{index .Config.Labels "org.opencontainers.image.{key}"}}}}',
+                self.image,
+            ).stdout.strip()
+            self.assertTrue(
+                label,
+                f"org.opencontainers.image.{key} label is missing/empty; the "
+                "provenance LABEL block in Dockerfile_documentdb_local was "
+                "dropped or renamed.",
+            )
+        version_txt = _docker(
+            "exec", self.container, "cat", "/version.txt", timeout=10,
+        ).stdout.strip()
+        self.assertRegex(
+            version_txt,
+            r"^\S+ \(commit \S+, built \S+, postgresql \d+\)$",
+            f"/version.txt is missing or malformed: {version_txt!r}",
+        )
+        # The version component comes from dpkg-query against the installed
+        # extension package (an unresolvable package fails the image build
+        # itself), so even an argless build must report a real version here;
+        # 'unknown' means the stamp regressed to trusting a build arg.
+        self.assertFalse(
+            version_txt.startswith("unknown "),
+            f"/version.txt version component is 'unknown': {version_txt!r}",
+        )
+        logs = _combined_logs(_docker("logs", self.container))
+        self.assertIn(
+            f"Release Version: {version_txt}", logs,
+            "startup banner did not print /version.txt; the entrypoint's "
+            "'Release Version:' line regressed.",
+        )
+
+    def test_builtin_healthcheck_probe_succeeds(self):
+        """The shipped probe must pass on a ready default container. Runs it
+        directly (not via the HEALTHCHECK schedule) for a fast, attributable
+        verdict with the probe's own diagnostic output on failure."""
+        result = _docker(
+            "exec", self.container, "/usr/local/bin/documentdb-healthcheck",
+            check=False, timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"health probe failed on a ready container.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_builtin_healthcheck_reports_healthy(self):
+        """The HEALTHCHECK instruction must be wired up: docker itself (and
+        thus compose `depends_on: condition: service_healthy`) must converge
+        on healthy without any healthcheck configuration by the user."""
+        try:
+            _wait_for_healthy(self.container)
+        except RuntimeError as exc:
+            self.fail(str(exc))
+
+    def test_mongosh_binary_is_shipped_in_image(self):
+        """The image must ship mongosh - we rely on it for in-container
+        client work, and users follow our docs that assume it's there."""
+        result = _docker(
+            "exec", self.container, "which", "mongosh",
+            check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertTrue(
+            result.stdout.strip().endswith("/mongosh"),
+            f"`which mongosh` returned {result.stdout!r}",
+        )
+
+    def test_mongosh_ping_succeeds_with_correct_credentials(self):
+        result = self._mongosh("db.runCommand({ping: 1}).ok")
+        self.assertEqual(
+            result.returncode, 0,
+            f"mongosh exited {result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1 as the last stdout line\n"
+            f"full stdout:\n{result.stdout}",
+        )
+
+    def test_mongosh_ping_succeeds_without_tls(self):
+        """Default mode is allowTLS, so a plain (non-TLS) client must be
+        able to connect. This is the documented 'connect without TLS'
+        behavior and the regression guard for the TLS_MODE wiring."""
+        result = self._mongosh("db.runCommand({ping: 1}).ok", use_tls=False)
+        self.assertEqual(
+            result.returncode, 0,
+            f"plain (non-TLS) mongosh failed against the allowTLS default "
+            f"container; the gateway appears to still enforce TLS.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1 over a plain (non-TLS) connection\n"
+            f"full stdout:\n{result.stdout}",
+        )
+
+    def test_mongosh_ping_rejected_with_wrong_password(self):
+        """Authentication must be enforced - a wrong password must fail."""
+        result = self._mongosh(
+            "db.runCommand({ping: 1})",
+            password=self.password + "-wrong",
+        )
+        self.assertNotEqual(
+            result.returncode, 0,
+            "mongosh unexpectedly succeeded with a wrong password\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_no_undefined_backend_function_errors_in_logs(self):
+        """Backend-contract guard for issue #650.
+
+        A gateway command whose backend SQL references a function, column,
+        schema or callable of the wrong kind that the shipped extension does not
+        define surfaces as a PostgreSQL undefined_function (42883),
+        undefined_column (42703), wrong_object_type (42809), invalid_schema_name
+        (3F000), syntax_error (42601) or invalid_catalog_name (3D000) error in
+        the container logs -- but clients silently tolerate failed discovery
+        probes (e.g. mongosh's getParameter on connect), so a green ping/CRUD
+        assertion cannot catch it. That is exactly how #650 shipped. Drive one
+        connection to force the discovery handshake, then scan the logs with the
+        shared, ANSI-aware detector.
+
+        The scanned window is cumulative: `docker logs` returns the whole boot
+        history plus every prior test's traffic in this class (they share one
+        container). That is intentional -- benign failures (e.g. the
+        wrong-password test) log an EMPTY sub_status, so they neither trip this
+        deny-list scan nor the strict unexpected-SQLSTATE scan below."""
+        ping = self._mongosh("db.runCommand({ping: 1}).ok")
+        self.assertEqual(
+            ping.returncode, 0,
+            "mongosh ping failed while priming the backend-contract check\n"
+            f"stdout:\n{ping.stdout}\nstderr:\n{ping.stderr}",
+        )
+
+        # Let any teardown-path server logging (e.g. endSessions) land before the
+        # snapshot so a late error line is not raced past the capture.
+        time.sleep(2)
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        offending = backend_contract.find_backend_contract_errors(combined)
+        self.assertEqual(
+            offending, [],
+            "gateway logged PostgreSQL backend-contract error(s) (undefined_"
+            "function/undefined_column/wrong_object_type/invalid_schema_name/"
+            "syntax_error/invalid_catalog_name): the gateway's hard-coded SQL "
+            "references a function, column, schema or callable kind the shipped "
+            "extension does not define, or runs a malformed static statement "
+            "(cf. issue #650). Offending lines:\n" + "\n".join(offending),
+        )
+
+    def test_no_unexpected_backend_sqlstates_in_logs(self):
+        """Strict backend-contract net (issue #650, manager's hybrid mode).
+
+        Beyond the narrow deny-list above, assert the logs carry NO non-empty
+        `sub_status` SQLSTATE outside that class at all. Evidence: a green
+        documentdb-local workload emits only EMPTY sub_status on its benign
+        failure paths (a wrong-password SCRAM attempt is a Gateway-kind error
+        whose `as_db_error()` is None, so the field renders empty; retried
+        transients log a different field). So any non-empty unexpected SQLSTATE
+        is a new backend-error class worth surfacing before it silently becomes
+        the next #650.
+
+        Kept as a SEPARATE method from the deny-list scan so, if a future
+        workload legitimately introduces a benign non-empty code, this can be
+        triaged (and the code added to the deny-list or an allow-list) without
+        masking the hard gate. Shares the cumulative-log-window property noted
+        above."""
+        time.sleep(2)
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        unexpected = backend_contract.find_unexpected_sqlstates(combined)
+        self.assertEqual(
+            unexpected, [],
+            "gateway logged non-empty sub_status SQLSTATE(s) outside the gated "
+            "deny-list; a green documentdb-local workload emits none (benign "
+            f"failures log an empty sub_status). Unexpected codes: {unexpected}",
+        )
+
+    def test_no_unparseable_sub_status_values_in_logs(self):
+        """Value-format guard for the backend-contract gate (issue #650).
+
+        The deny-list and strict scans both key off the 5-char SQLSTATE shape, so
+        a `sub_status` value logged in a DIFFERENT shape (a bit-packed integer, a
+        doubled-quote, a JSON reformat) leaves both scans silently blind -- a
+        green-but-dead risk. Assert the cumulative logs carry no such value.
+
+        Kept SEPARATE from the channel-alive canary below so its signal is not
+        lost if the canary's count-delta assertion fails first, and separate from
+        the strict scan so a value-shape regression is triaged independently from
+        a new-SQLSTATE regression. Shares the cumulative-log-window property."""
+        time.sleep(2)
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        unparseable = backend_contract.find_unparseable_sub_status_values(combined)
+        self.assertEqual(
+            unparseable, [],
+            "gateway logged a `sub_status` value the gate cannot parse as a "
+            "SQLSTATE (e.g. a bit-packed integer or reformatted field); the "
+            "deny-list and strict scans are blind to such values, a green-but-"
+            f"dead risk (cf. issue #650). Offending values: {unparseable}",
+        )
+
+    def test_all_backend_catalog_functions_exist_in_image(self):
+        """Active backend-contract coverage for issue #650.
+
+        The log scan above only catches backend-contract errors for commands
+        the smoke actually exercises. Assert instead that EVERY backend routine
+        the gateway's QueryCatalog calls exists in the shipped extension -- so a
+        function used only by an unexercised command (compact, collStats,
+        dbStats, ...) cannot go missing silently, the generalised #650 class.
+        The required set is the statically-parsed calls plus the enumerated
+        explain aggregation family (bson_aggregation_{find,pipeline,count,
+        distinct}), which the gateway builds by a runtime-templated name.
+
+        This is a name-existence check (schema.proname), not a signature/arity
+        or prokind match: a routine shipped with the wrong overload (e.g.
+        get_parameter(bson) vs (bool,bool,text[])) or the wrong kind for a CALL
+        proc surfaces as SQLSTATE 42883/42809 and is caught by the log scan
+        above, not here."""
+        # query_catalog.rs ships in the same repo tree as this test, so a missing
+        # file is a hard error (path logic / source layout broke), not a skip --
+        # a silent skip would disable the active gate, the #650 failure mode.
+        if not QUERY_CATALOG_RS.is_file():
+            self.fail(f"gateway QueryCatalog source not found: {QUERY_CATALOG_RS}")
+        referenced = catalog_contract.required_backend_functions(
+            QUERY_CATALOG_RS.read_text(encoding="utf-8")
+        )
+        self.assertGreaterEqual(
+            len(referenced), catalog_contract.MIN_EXPECTED_BACKEND_FUNCTIONS,
+            f"parsed only {len(referenced)} catalog routines; the parser or "
+            "query_catalog.rs layout may have changed",
+        )
+        # _existing_documentdb_functions raises with a clear message if the
+        # extension is absent or the cluster is unreachable, so an empty result
+        # cannot reach here -- no separate emptiness assertion is needed.
+        existing = _existing_documentdb_functions(self.container)
+        missing = sorted(referenced - existing)
+        self.assertEqual(
+            missing, [],
+            "backend routines the gateway QueryCatalog calls but which are "
+            f"ABSENT from the shipped image (cf. issue #650): {missing}",
+        )
+
+    def test_zz_gateway_failure_log_channel_is_alive(self):
+        """Positive control for the backend-contract log gate (issue #650).
+
+        The gate scans for a `sub_status=` field. If a tracing field rename or a
+        switch to JSON logging changed that shape, the deny-list and strict
+        scans would silently pass forever (green-but-dead). Guard against it:
+        deliberately drive one FAILED request (a wrong-password auth, a
+        Gateway-kind error) and assert a NEW `sub_status=` line then appears.
+
+        The count-delta (new line vs. before) matters because an alphabetically
+        earlier test already deposited a `sub_status=` line in this shared
+        container -- a plain "field present" check could pass even if failure
+        logging died mid-run. Both snapshots are taken after a `sleep 2` so an
+        in-flight line from an earlier test cannot land between them and satisfy
+        the delta on its own. A wrong-password failure logs an EMPTY sub_status,
+        so this canary cannot trip the deny-list/strict/unparseable scans
+        regardless of order (hence the `zz` name that runs it last). The value
+        SHAPE is checked separately by
+        test_no_unparseable_sub_status_values_in_logs."""
+        # Quiesce first so the `before` count does not absorb a still-arriving
+        # line from a prior test (which would let the delta pass spuriously).
+        time.sleep(2)
+        before = backend_contract.count_sub_status_fields(
+            _combined_logs(_docker("logs", self.container))
+        )
+        rejected = self._mongosh(
+            "db.runCommand({ping: 1})", password=self.password + "-canary-wrong",
+        )
+        self.assertNotEqual(
+            rejected.returncode, 0,
+            "wrong-password attempt unexpectedly succeeded while priming the "
+            "log-channel canary",
+        )
+        time.sleep(2)
+        after = backend_contract.count_sub_status_fields(
+            _combined_logs(_docker("logs", self.container))
+        )
+        self.assertGreater(
+            after, before,
+            "the canary's own failed request produced no NEW `sub_status=` line "
+            "-- the failure-log channel the backend-contract gate relies on may "
+            "have been renamed or switched to a different format (or the runner "
+            "rotated the container log between snapshots), which would leave the "
+            "gate green-but-dead (cf. issue #650).",
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Post-workload liveness re-check, then cleanup. Done here (rather than
+        as a `test_*` method) so it runs unconditionally AFTER every test in the
+        class regardless of unittest's alphabetical method order -- the entrypoint
+        must not have exited after all the client connections. State is captured
+        before cleanup so the container is always removed even if the assertion
+        fails."""
+        inspect = None
+        if cls.container:
+            inspect = _docker(
+                "inspect", "-f", "{{.State.Running}}", cls.container, check=False,
+            )
+        _cleanup_container(cls.container)
+        cls.container = None
+        if inspect is None:
+            return
+        if inspect.returncode != 0:
+            # A daemon/inspect failure must not be misreported as a crashed
+            # entrypoint -- raise a distinct error so triage is not misdirected.
+            raise RuntimeError(
+                "docker inspect failed during post-workload liveness check: "
+                f"rc={inspect.returncode} stderr={inspect.stderr.strip()!r}"
+            )
+        if inspect.stdout.strip() != "true":
+            raise AssertionError(
+                "container exited after workload; entrypoint likely returned "
+                "early or a managed process crashed. "
+                f"State.Running={inspect.stdout.strip()!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 2. External port binding - the published-port surface that real
+#    users hit when running `docker run -p HOST:10260 documentdb-local`.
+#    The default container above tests in-container loopback only.
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class ExternalPortBindingTests(_ContainerTestBase):
+    """Catches a regression where the gateway binds to 127.0.0.1 inside
+    the container instead of 0.0.0.0 (in-container ping would still pass)."""
+
+    # Publish to a random host port to avoid runner-side collisions when
+    # multiple tests run on the same machine.
+    EXTRA_RUN_ARGS = ["-p", f"127.0.0.1::{DEFAULT_PORT}/tcp"]
+    ENTRYPOINT_FLAGS = ["--skip-init-data"]
+
+    def _published_host_port(self) -> int:
+        result = _docker(
+            "port", self.container, f"{DEFAULT_PORT}/tcp", timeout=10,
+        )
+        # Output like "127.0.0.1:32768" (possibly multi-line for ipv4/ipv6).
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            host, _, port_str = line.rpartition(":")
+            try:
+                return int(port_str)
+            except ValueError:
+                continue
+        self.fail(
+            f"unable to parse `docker port` output: {result.stdout!r}"
+        )
+
+    def _container_ip(self) -> str:
+        # Emit one address PER LINE and take the first non-empty one. The
+        # obvious `{{range ...}}{{.IPAddress}}{{end}}` concatenates every
+        # network's address with no separator, so a container attached to two
+        # networks yields garbage like "172.17.0.2172.18.0.3" -- which is
+        # truthy, so an emptiness check passes it through, mongosh then fails
+        # to resolve it, and the test blames the product ("the gateway is
+        # likely bound to the container loopback only") for a harness defect.
+        # An exited container, whose .IPAddress is empty, has the same shape.
+        result = _docker(
+            "inspect", "-f",
+            "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
+            self.container, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            candidate = line.strip()
+            if candidate:
+                return candidate
+        return ""
+
+    def test_published_host_port_accepts_mongosh_from_outside(self):
+        host_port = self._published_host_port()
+        result = _mongosh_sibling(
+            self.image,
+            host="127.0.0.1",
+            port=host_port,
+            eval_code="db.runCommand({ping: 1}).ok",
+            username=self.USERNAME,
+            password=self.password,
+        )
+
+        # `--network host` does not reach a `-p 127.0.0.1:...` publish on
+        # Docker Desktop (Mac/Windows/WSL): the sibling joins the Docker
+        # VM's network namespace while the publish is proxied to the
+        # client host's loopback, so the connection is refused there even
+        # though the gateway is bound correctly. Fall back to dialing the
+        # container's own bridge IP, which proves the SAME property this
+        # test exists for -- the gateway accepts connections on a
+        # non-loopback address rather than binding container loopback
+        # only -- without depending on host-network semantics.
+        if result.returncode != 0:
+            container_ip = self._container_ip()
+            self.assertTrue(
+                container_ip,
+                "host-network attempt failed and the container has no "
+                "bridge IP to fall back to.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            result = _mongosh_sibling(
+                self.image,
+                host=container_ip,
+                port=DEFAULT_PORT,
+                eval_code="db.runCommand({ping: 1}).ok",
+                username=self.USERNAME,
+                password=self.password,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f"mongosh from a sibling container failed against both the "
+                f"published host port 127.0.0.1:{host_port} and the "
+                f"container address {container_ip}:{DEFAULT_PORT}; the "
+                f"gateway is likely bound to the container loopback only.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1 from external client\n"
+            f"full stdout:\n{result.stdout}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Custom --documentdb-port: the flag must actually move the listener.
+# ---------------------------------------------------------------------------
+
+CUSTOM_PORT = 11000
+
+
+@_SKIP_UNLESS_IMAGE
+class CustomDocumentDBPortTests(_ContainerTestBase):
+    """Catches a regression where --documentdb-port is silently ignored."""
+
+    ENTRYPOINT_FLAGS = [
+        "--skip-init-data",
+        "--documentdb-port", str(CUSTOM_PORT),
+    ]
+
+    def test_ping_succeeds_on_custom_port(self):
+        result = self._mongosh(
+            "db.runCommand({ping: 1}).ok", port=CUSTOM_PORT,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"mongosh on custom port {CUSTOM_PORT} failed; --documentdb-port "
+            f"likely not honored.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1 on custom port {CUSTOM_PORT}\n"
+            f"full stdout:\n{result.stdout}",
+        )
+
+    def test_builtin_healthcheck_tracks_custom_port(self):
+        """The probe must follow the CLI-configured port. `docker exec`
+        sessions still see the image default DOCUMENTDB_PORT=10260 in the
+        environment (where nothing is listening here), so this passes only
+        if the probe reads the entrypoint's published runtime state."""
+        result = _docker(
+            "exec", self.container, "/usr/local/bin/documentdb-healthcheck",
+            check=False, timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"health probe failed with --documentdb-port {CUSTOM_PORT}; it "
+            f"is likely probing the default port from the exec environment "
+            f"instead of the entrypoint's runtime state.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_default_port_not_listening(self):
+        """Sanity: with --documentdb-port set, the default port should
+        NOT be serving the gateway. We tolerate `port 10260 still has
+        SOMETHING bound` (unusual but possible) by only failing if a
+        full SCRAM-SHA-256 ping completes successfully."""
+        result = self._mongosh(
+            "db.runCommand({ping: 1}).ok", port=DEFAULT_PORT,
+        )
+        if result.returncode == 0 and _last_nonempty_line(result.stdout) == "1":
+            self.fail(
+                "ping succeeded on the default port even though "
+                "--documentdb-port was set; the gateway appears to be "
+                "listening on the default port in addition to (or instead "
+                "of) the requested custom port.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 4. TLS modes. allowTLS (the default) accepts both plain (non-TLS) and TLS
+#    client connections; that default is exercised by DefaultContainerTests
+#    above, which pings over both TLS and a plain connection. The requireTLS
+#    path (plain rejected, TLS accepted) is exercised below. `--tlsMode
+#    disabled` is not separately smoke-tested: it maps to the same
+#    accept-both behavior as allowTLS (the gateway has no plain-only mode),
+#    so it would assert nothing new here.
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class TlsRequiredTests(_ContainerTestBase):
+    """--tlsMode requireTLS: WITHOUT --tls must be rejected, WITH --tls works."""
+
+    ENTRYPOINT_FLAGS = ["--skip-init-data", "--tlsMode", "requireTLS"]
+
+    def test_ping_with_tls_succeeds(self):
+        result = self._mongosh(
+            "db.runCommand({ping: 1}).ok", use_tls=True,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"mongosh --tls failed against --tlsMode=requireTLS container.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1 over TLS\n"
+            f"full stdout:\n{result.stdout}",
+        )
+
+    def test_ping_without_tls_rejected(self):
+        result = self._mongosh(
+            "db.runCommand({ping: 1})", use_tls=False,
+        )
+        self.assertNotEqual(
+            result.returncode, 0,
+            "mongosh without --tls unexpectedly succeeded against a "
+            "--tlsMode=requireTLS container; the require mode is not "
+            "being enforced.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Custom username - --username FOO must actually provision FOO,
+#    and the documented default user must not be auto-created.
+# ---------------------------------------------------------------------------
+
+ALT_USERNAME = "alt_admin"
+LEGACY_DEFAULT_USERNAME = "default_user"
+
+
+@_SKIP_UNLESS_IMAGE
+class CustomUsernameTests(_ContainerTestBase):
+    """Catches a regression where --username is silently ignored."""
+
+    USERNAME = ALT_USERNAME
+    ENTRYPOINT_FLAGS = ["--skip-init-data"]
+
+    def test_ping_with_alt_username_succeeds(self):
+        result = self._mongosh("db.runCommand({ping: 1}).ok")
+        self.assertEqual(
+            result.returncode, 0,
+            f"mongosh as --username {ALT_USERNAME!r} failed; the custom "
+            f"username does not appear to have been provisioned.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_ping_with_default_username_rejected(self):
+        """The image's hard-coded default user must not be auto-created
+        when the operator passes --username explicitly."""
+        result = self._mongosh(
+            "db.runCommand({ping: 1})",
+            username=LEGACY_DEFAULT_USERNAME,
+        )
+        self.assertNotEqual(
+            result.returncode, 0,
+            f"mongosh succeeded as {LEGACY_DEFAULT_USERNAME!r} even though "
+            f"the container was started with --username {ALT_USERNAME!r}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. Built-in sample data - the entrypoint exposes a flag that loads
+#    the sample-data shipped in the image; verify the flag actually
+#    populates the expected collection. NOTE: the documentdb-local
+#    default is `--init-data false` since PR 2027838, so we must
+#    pass `--init-data true` explicitly to exercise this path.
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class BuiltInSampleDataTests(_ContainerTestBase):
+    """Catches a regression where the bundled sample-data files stop
+    being executed when the user opts in via `--init-data true`
+    (e.g. COPY missing in Dockerfile, init script changes)."""
+
+    ENTRYPOINT_FLAGS = ["--init-data", "true"]
+
+    def test_store_data_load_and_rerun(self):
+        result = self._mongosh(
+            f"const expected = {json.dumps(SAMPLE_DATA_COUNTS)};\n"
+            """
+            const sample = db.getSiblingDB('StoreData');
+            function checkSampleCounts() {
+                const counts = {
+                    stores: sample.stores.countDocuments({}),
+                    ratings: sample.ratings.countDocuments({})
+                };
+                printjson(counts);
+                if (counts.stores !== expected.stores ||
+                    counts.ratings !== expected.ratings) {
+                    throw new Error('Unexpected StoreData counts');
+                }
+            }
+            checkSampleCounts();
+
+            const store = sample.stores.findOne({_id: 'binary-test'});
+            const validTypes = store &&
+                store.logo && store.logo._bsontype === 'Binary' &&
+                store.signature && store.signature._bsontype === 'Binary' &&
+                store.storeOpeningDate instanceof Date &&
+                store.lastUpdated && store.lastUpdated._bsontype === 'Timestamp';
+            if (!validTypes) {
+                throw new Error('StoreData Extended JSON types were not preserved');
+            }
+
+            if (sample.ratings.deleteOne({}).deletedCount !== 1) {
+                throw new Error('Could not remove a sample rating before replay');
+            }
+            process.env.DOCUMENTDB_INIT_FILE =
+                '/home/documentdb/gateway/sample-data/01-store-data.js';
+            load(process.env.DOCUMENTDB_INIT_FILE);
+            checkSampleCounts();
+            """,
+            timeout=DEFAULT_READY_TIMEOUT,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"StoreData validation failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. Custom init-data path - user-mounted .js files in
+#    --init-data-path must be executed at first boot.
+# ---------------------------------------------------------------------------
+
+CUSTOM_INIT_DB_NAME = "image_smoke_init_db"
+CUSTOM_INIT_COLLECTION = "init_marker"
+
+
+@_SKIP_UNLESS_IMAGE
+class CustomInitDataTests(unittest.TestCase):
+    """Catches regressions in the custom init-data path: the directory
+    mount, the discovery glob, the script execution loop."""
+
+    image: str
+    container: str | None
+    password: str
+    init_dir: str | None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        cls.container = None
+        cls.password = _random_password()
+        cls.init_dir = None
+
+        init_dir = tempfile.mkdtemp(prefix="docdb-image-init-")
+        # Marker script the entrypoint must execute. Using `use(db)` +
+        # insertOne mirrors the shape of the shipped sample-data scripts
+        # without asserting any engine semantics beyond round-tripping
+        # the document we insert.
+        script_path = pathlib.Path(init_dir) / "00-marker.js"
+        script_path.write_text(
+            f"""use('{CUSTOM_INIT_DB_NAME}');
+db.{CUSTOM_INIT_COLLECTION}.insertOne({{
+    _id: 'image-smoke-marker',
+    placed_by: 'documentdb_local_tests',
+    via: 'init-data-path'
+}});
+print('init-data marker placed');
+""",
+            encoding="utf-8",
+        )
+        os.chmod(init_dir, 0o755)
+        os.chmod(script_path, 0o644)
+        cls.init_dir = init_dir
+
+        try:
+            cls.container = _start_container(
+                cls.image,
+                extra_run_args=["-v", f"{init_dir}:/init_doc_db.d:ro"],
+                entrypoint_flags=[
+                    "--username", DEFAULT_USERNAME,
+                    "--password", cls.password,
+                    "--init-data-path", "/init_doc_db.d",
+                    "--init-data", "true",
+                ],
+            )
+            _wait_for_ready(cls.container)
+        except Exception:
+            # Ensure the init dir is always removed even if _cleanup_container
+            # itself raises (e.g. the docker daemon vanished, so `docker rm` times
+            # out) -- otherwise the mkdtemp dir leaks (tearDownClass does not run
+            # when setUpClass errors) and the secondary error masks the original
+            # boot failure.
+            try:
+                _cleanup_container(cls.container)
+            finally:
+                cls.container = None
+                if cls.init_dir:
+                    shutil.rmtree(cls.init_dir, ignore_errors=True)
+                    cls.init_dir = None
+            # Re-raise the original failure (do NOT downgrade to SkipTest): an
+            # image that wedges only under --init-data-path must fail the gate,
+            # not silently skip -- the silent-no-op mode issue #650 is about.
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        _cleanup_container(cls.container)
+        cls.container = None
+        if cls.init_dir:
+            shutil.rmtree(cls.init_dir, ignore_errors=True)
+            cls.init_dir = None
+
+    def test_custom_init_script_was_executed(self):
+        """Verify the marker we wrote at init time is queryable."""
+        # Allow the init step a few extra seconds to complete after
+        # readiness - the entrypoint streams the readiness marker
+        # before init scripts finish in some configurations.
+        deadline = time.monotonic() + 30
+        last_result = None
+        while time.monotonic() < deadline:
+            last_result = _mongosh_exec(
+                self.container,
+                f"db.getSiblingDB('{CUSTOM_INIT_DB_NAME}')"
+                f".{CUSTOM_INIT_COLLECTION}.countDocuments({{}})",
+                username=DEFAULT_USERNAME,
+                password=self.password,
+            )
+            if (last_result.returncode == 0
+                    and _last_nonempty_line(last_result.stdout).isdigit()
+                    and int(_last_nonempty_line(last_result.stdout)) >= 1):
+                return
+            time.sleep(2)
+        self.fail(
+            f"custom init-data marker not found in "
+            f"{CUSTOM_INIT_DB_NAME}.{CUSTOM_INIT_COLLECTION} after 30s.\n"
+            f"last mongosh stdout:\n{getattr(last_result, 'stdout', '')}\n"
+            f"last mongosh stderr:\n{getattr(last_result, 'stderr', '')}"
+        )
+
+
+@_SKIP_UNLESS_IMAGE
+class NoPasswordTests(unittest.TestCase):
+    """Run the image as built, so a PASSWORD baked into its ENV fails this."""
+
+    def test_image_refuses_to_start_without_a_password(self):
+        name = _random_container_name()
+        try:
+            # A regression starts the server and hangs here until the timeout.
+            result = _docker("run", "--name", name, os.environ["DOCUMENTDB_LOCAL_IMAGE"],
+                             check=False, timeout=120)
+        finally:
+            _cleanup_container(name)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no password was supplied", result.stderr)
+
+
+@_SKIP_UNLESS_IMAGE
+class FailingCustomInitDataTests(unittest.TestCase):
+    """A seed that throws or does not parse must fail the container (#759)."""
+
+    def _run_seed(self, script: str, seed_error: str) -> None:
+        image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        init_dir = tempfile.mkdtemp(prefix="docdb-image-bad-init-")
+        # Named up front so a launch that fails after `docker run` is still removed.
+        container = _random_container_name()
+        try:
+            seed = pathlib.Path(init_dir) / "00-seed.js"
+            seed.write_text(script, encoding="utf-8")
+            os.chmod(init_dir, 0o755)
+            os.chmod(seed, 0o644)
+            _start_container(
+                image,
+                name=container,
+                extra_run_args=["-v", f"{init_dir}:/init_doc_db.d:ro"],
+                entrypoint_flags=[
+                    "--username", DEFAULT_USERNAME,
+                    "--password", _random_password(),
+                    "--init-data-path", "/init_doc_db.d",
+                ],
+            )
+            # Stop waiting once it exits or, on a regression, reports ready.
+            deadline = time.monotonic() + DEFAULT_READY_TIMEOUT
+            while time.monotonic() < deadline:
+                running = _docker("inspect", "-f", "{{.State.Running}}",
+                                  container, check=False, timeout=30)
+                logs = _docker("logs", container, check=False)
+                if (running.stdout.strip() == "false"
+                        or READY_LOG in logs.stdout + logs.stderr):
+                    break
+                time.sleep(2)
+            state = json.loads(_docker("inspect", "-f", "{{json .State}}",
+                                       container, timeout=30).stdout)
+            logs = _docker("logs", container, check=False)
+            output = logs.stdout + logs.stderr
+            self.assertFalse(state["Running"],
+                             f"container still running after a failing seed:\n{output[-3000:]}")
+            self.assertNotEqual(state["ExitCode"], 0, output[-3000:])
+            self.assertNotIn(READY_LOG, output)
+            self.assertIn("Custom data initialization failed", output)
+            # The seed's own error, so a connection or auth failure cannot pass.
+            self.assertIn(seed_error, output)
+            self.assertNotEqual((state.get("Health") or {}).get("Status"), "healthy")
+        finally:
+            _cleanup_container(container)
+            shutil.rmtree(init_dir, ignore_errors=True)
+
+    def test_seed_that_throws_after_a_write_fails_the_container(self):
+        self._run_seed(
+            "db.getSiblingDB('image_smoke_failing_seed').t.insertOne({_id: 1});\n"
+            "throw new Error('seed failed on purpose');\n",
+            "seed failed on purpose",
+        )
+
+    def test_seed_with_a_syntax_error_fails_the_container(self):
+        self._run_seed("db.getSiblingDB('image_smoke_failing_seed').t.insertOne({_id: 1\n",
+                       "SyntaxError")
+
+
+# ---------------------------------------------------------------------------
+# 8. Data persistence across container recreation - --data-path mounted
+#    on a docker volume must retain data when the container is replaced.
+#    This is the central value proposition of the --data-path flag.
+# ---------------------------------------------------------------------------
+
+PERSISTENCE_DB_NAME = "image_smoke_persistence_db"
+PERSISTENCE_COLLECTION = "persistence_marker"
+PERSISTENCE_DOC_ID = "persistence-marker-1"
+
+
+class _VolumeTestBase(unittest.TestCase):
+    """Per-test fixture for tests that boot several containers, one after
+    another or side by side, on a single named volume."""
+
+    ENTRYPOINT_FLAGS: list[str] = ["--skip-init-data"]
+    EXTRA_RUN_ARGS: list[str] = []
+    NAME_TAG: str = "vol"
+
+    def setUp(self) -> None:
+        self.image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        self.password = _random_password()
+        self.volume = f"docdb-image-test-vol-{uuid.uuid4().hex[:8]}"
+        self.containers: list[str] = []
+
+    def tearDown(self) -> None:
+        for container in self.containers:
+            _cleanup_container(container)
+        _docker("volume", "rm", "-f", self.volume, check=False)
+
+    def _start(self, tag: str, *, run_args: list[str] | None = None) -> str:
+        name = f"{CONTAINER_PREFIX}-{self.NAME_TAG}-{tag}-{uuid.uuid4().hex[:6]}"
+        self.containers.append(name)
+        return _start_container(
+            self.image,
+            extra_run_args=["-v", f"{self.volume}:/data",
+                            *self.EXTRA_RUN_ARGS, *(run_args or [])],
+            entrypoint_flags=[
+                "--username", DEFAULT_USERNAME,
+                "--password", self.password,
+                "--data-path", "/data",
+                *self.ENTRYPOINT_FLAGS,
+            ],
+            name=name,
+        )
+
+    def _stop(self, container: str) -> None:
+        """Clean stop between boots of the same volume; see _stop_then_cleanup_container."""
+        _stop_then_cleanup_container(container)
+        self.containers.remove(container)
+
+    def _count(self, db: str, collection: str, container: str,
+               query: str = "{}") -> str:
+        res = _mongosh_exec(
+            container,
+            f"db.getSiblingDB('{db}').{collection}.countDocuments({query})",
+            username=DEFAULT_USERNAME, password=self.password,
+        )
+        self.assertEqual(
+            res.returncode, 0,
+            f"countDocuments failed\nstdout:\n{res.stdout}\n"
+            f"stderr:\n{res.stderr}",
+        )
+        return _last_nonempty_line(res.stdout)
+
+
+@_SKIP_UNLESS_IMAGE
+class PersistenceTests(_VolumeTestBase):
+    """Catches regressions where --data-path stops mapping to the
+    PostgreSQL data directory, or where data is wiped on second boot."""
+
+    NAME_TAG = "persist"
+
+    def test_doc_survives_container_recreate(self):
+        first_container = self._start("a")
+        _wait_for_ready(first_container)
+
+        insert = _mongosh_exec(
+            first_container,
+            f"""const r = db.getSiblingDB('{PERSISTENCE_DB_NAME}')
+.{PERSISTENCE_COLLECTION}
+.insertOne({{_id: '{PERSISTENCE_DOC_ID}', placed_at: new Date()}});
+print(r.acknowledged ? 'ack' : 'noack');""",
+            username=DEFAULT_USERNAME,
+            password=self.password,
+        )
+        self.assertEqual(
+            insert.returncode, 0,
+            f"insert on first container failed\n"
+            f"stdout:\n{insert.stdout}\nstderr:\n{insert.stderr}",
+        )
+        self.assertIn(
+            "ack", insert.stdout,
+            f"insert was not acknowledged on first container\n"
+            f"stdout:\n{insert.stdout}",
+        )
+
+        self._stop(first_container)
+
+        second_container = self._start("b")
+        _wait_for_ready(second_container)
+
+        self.assertEqual(
+            self._count(PERSISTENCE_DB_NAME, PERSISTENCE_COLLECTION,
+                        second_container, f"{{_id: '{PERSISTENCE_DOC_ID}'}}"),
+            "1",
+            f"document with _id={PERSISTENCE_DOC_ID!r} not found on "
+            f"second container; --data-path persistence is broken.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. Sample-data restart idempotency (regression test for #612) - re-running
+#    the container with --init-data true on a persistent volume must NOT
+#    re-seed and crash with a duplicate-key error. The entrypoint writes a
+#    one-shot marker under DATA_PATH and skips initialization on later boots.
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNLESS_IMAGE
+class SampleDataRestartIdempotencyTests(_VolumeTestBase):
+    """Regression guard for #612: a documentdb-local container with a
+    persistent --data-path and --init-data true entered a restart loop on
+    its second boot because the bundled sample-data seed re-ran and failed
+    with a duplicate _id. The container must instead start cleanly and skip
+    the already-loaded sample data."""
+
+    ENTRYPOINT_FLAGS = ["--init-data", "true"]
+    NAME_TAG = "restart"
+
+    def _sample_counts(self, container: str) -> dict[str, int]:
+        result = _mongosh_exec(
+            container,
+            "const database = db.getSiblingDB('StoreData');"
+            "print(JSON.stringify({"
+            "stores: database.stores.countDocuments({}),"
+            "ratings: database.ratings.countDocuments({})"
+            "}));",
+            username=DEFAULT_USERNAME,
+            password=self.password,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"countDocuments failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        return json.loads(_last_nonempty_line(result.stdout))
+
+    def test_second_boot_skips_seed_and_does_not_crash(self):
+        # First boot: seeds StoreData and writes the one-shot marker.
+        first = self._start("a")
+        _wait_for_ready(first)
+        self.assertEqual(
+            self._sample_counts(first), SAMPLE_DATA_COUNTS,
+            "StoreData counts should match the expected sample sizes after first-boot seeding",
+        )
+        self._stop(first)
+
+        # Second boot on the SAME volume. Before the #612 fix this
+        # re-ran the seed, hit a duplicate _id, exited non-zero, and
+        # never emitted the readiness marker -> _wait_for_ready raises.
+        second = self._start("b")
+        _wait_for_ready(second)
+
+        logs = _docker("logs", second, check=False)
+        combined = logs.stdout + logs.stderr
+        self.assertIn(
+            "already initialized", combined,
+            "second boot should log that sample data was already "
+            "initialized and skip re-seeding",
+        )
+        self.assertNotIn(
+            "Sample data initialization failed", combined,
+            "second boot must not fail re-running the seed",
+        )
+        self.assertEqual(
+            self._sample_counts(second), SAMPLE_DATA_COUNTS,
+            "StoreData counts must still match the expected sample sizes (no "
+            "duplicate-key crash, no data loss) on second boot",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 10. Custom init-data restart idempotency (regression test for #612, custom
+#     path) - re-running the container on a persistent volume with a
+#     NON-IDEMPOTENT custom script must NOT re-run that script and crash. The
+#     init script writes a one-shot attempt marker under DATA_PATH immediately
+#     before the first user script runs, so later boots skip custom init.
+# ---------------------------------------------------------------------------
+
+CUSTOM_RESTART_DB_NAME = "image_custom_restart_db"
+CUSTOM_RESTART_COLLECTION = "restart_marker"
+
+
+@_SKIP_UNLESS_IMAGE
+class CustomInitDataRestartIdempotencyTests(_VolumeTestBase):
+    """Regression guard for #612 on the custom init-data path: a container
+    with a persistent --data-path and a user-mounted --init-data-path whose
+    script is NOT idempotent (a fixed-_id insertOne that fails on replay)
+    must start cleanly on its second boot and skip the already-applied custom
+    init, instead of re-running the script, hitting a duplicate _id, exiting
+    non-zero, and looping under a restart policy. The single-boot
+    CustomInitDataTests proves the script runs; this proves it is one-shot."""
+
+    # --skip-init-data disables only the bundled sample data; the custom
+    # --init-data-path still runs (it is gated solely on the presence of
+    # *.js files), which keeps this test focused on the custom path.
+    ENTRYPOINT_FLAGS = ["--init-data-path", "/init_doc_db.d", "--skip-init-data"]
+    NAME_TAG = "custom-restart"
+
+    def setUp(self) -> None:
+        super().setUp()
+        init_dir = tempfile.mkdtemp(prefix="docdb-image-custom-restart-")
+        self.addCleanup(shutil.rmtree, init_dir, ignore_errors=True)
+        # Deliberately NON-idempotent: a fixed _id with no countDocuments
+        # guard. Replaying this script against the already-seeded volume
+        # raises a duplicate-key error -- the exact failure that drove the
+        # #612 restart loop. The one-shot attempt marker must prevent replay.
+        script_path = pathlib.Path(init_dir) / "00-restart-marker.js"
+        script_path.write_text(
+            f"""use('{CUSTOM_RESTART_DB_NAME}');
+db.{CUSTOM_RESTART_COLLECTION}.insertOne({{
+    _id: 'custom-restart-marker',
+    placed_by: 'documentdb_local_tests',
+    via: 'init-data-path'
+}});
+print('custom restart marker placed');
+""",
+            encoding="utf-8",
+        )
+        os.chmod(init_dir, 0o755)
+        os.chmod(script_path, 0o644)
+        self.EXTRA_RUN_ARGS = ["-v", f"{init_dir}:/init_doc_db.d:ro"]
+
+    def _marker_count(self, container: str) -> str:
+        return self._count(CUSTOM_RESTART_DB_NAME, CUSTOM_RESTART_COLLECTION,
+                           container)
+
+    def test_second_boot_skips_custom_init_and_does_not_crash(self):
+        # First boot: runs the custom script and writes the one-shot
+        # attempt + success markers under /data.
+        first = self._start("a")
+        _wait_for_ready(first)
+        self.assertEqual(
+            self._marker_count(first), "1",
+            "custom collection should have 1 doc after first-boot init",
+        )
+        self._stop(first)
+
+        # Second boot on the SAME volume with the SAME non-idempotent
+        # script still mounted. Before the #612 custom-path fix this
+        # re-ran the script, hit a duplicate _id, exited non-zero, and
+        # never emitted the readiness marker -> _wait_for_ready raises.
+        second = self._start("b")
+        _wait_for_ready(second)
+
+        logs = _docker("logs", second, check=False)
+        combined = logs.stdout + logs.stderr
+        self.assertIn(
+            "already initialized", combined,
+            "second boot should log that custom data was already "
+            "initialized and skip re-running the script",
+        )
+        self.assertNotIn(
+            "Custom data initialization failed", combined,
+            "second boot must not fail re-running the custom script",
+        )
+        self.assertEqual(
+            self._marker_count(second), "1",
+            "custom collection must still have exactly 1 doc (no "
+            "duplicate-key crash, no data loss) on second boot",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. --disable-extended-rum is accepted but changes nothing.
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class DisableExtendedRumCompatibilityTests(_ContainerTestBase):
+    """The retired opt-out stays parse-compatible without changing startup."""
+
+    ENTRYPOINT_FLAGS = ["--skip-init-data", "--disable-extended-rum"]
+
+    def test_template_is_adopted_and_deprecation_is_logged(self):
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        self.assertIn(
+            "--disable-extended-rum (DISABLE_EXTENDED_RUM) is deprecated and has no effect",
+            combined,
+        )
+        self.assertIn(
+            "Adopting pre-initialized data directory template",
+            combined,
+            "the deprecated option must not discard the baked template. "
+            "Last 40 log lines:\n"
+            + "\n".join(combined.splitlines()[-40:]),
+        )
+        # Only place the probe's real SQL runs; unit tests stub psql.
+        self.assertIn(
+            "documentdb_extended_rum is created on this data volume",
+            combined,
+            "the startup probe must report the extension created. "
+            "Last 40 log lines:\n"
+            + "\n".join(combined.splitlines()[-40:]),
+        )
+
+    def test_extended_rum_extension_and_handler_are_active(self):
+        port = _container_pg_socket_port(self.container)
+        res = _docker(
+            "exec", self.container, "psql", "-p", port, "-d", "postgres",
+            "-tAq", "-F,", "-c",
+            "SELECT (SELECT count(*) FROM pg_extension "
+            "WHERE extname = 'documentdb_extended_rum'), "
+            "current_setting('documentdb.alternate_index_handler_name')",
+            check=False, timeout=30,
+        )
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        self.assertEqual(
+            res.stdout.strip(), "1,extended_rum",
+            "the deprecated option must not disable documentdb_extended_rum "
+            "or stop the handler GUC from selecting it",
+        )
+
+    def test_ping_succeeds(self):
+        result = self._mongosh("db.runCommand({ping: 1}).ok")
+        self.assertEqual(
+            result.returncode, 0,
+            "ping failed on a container using the deprecated option.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1\nfull stdout:\n{result.stdout}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Custom --data-path - the cp -a template-population branch against a real
+# PostgreSQL (no unit test ever starts a postmaster from a copied cluster).
+# ---------------------------------------------------------------------------
+
+@_SKIP_UNLESS_IMAGE
+class CustomDataPathTests(_ContainerTestBase):
+    """Issue #480 review follow-up: the only in-container coverage of the
+    custom --data-path branch. The cluster is instantiated by copying the
+    baked template, then a real postmaster must start from the copy and
+    serve traffic."""
+
+    ENTRYPOINT_FLAGS = ["--skip-init-data", "--data-path", "/custom-data"]
+
+    def test_template_is_copied_to_custom_path(self):
+        logs = _docker("logs", self.container)
+        combined = _combined_logs(logs)
+        self.assertIn(
+            "Populating empty data directory /custom-data", combined,
+            "an empty custom --data-path must be instantiated from the "
+            "baked template, not fully re-initialized. Last 40 log lines:\n"
+            + "\n".join(combined.splitlines()[-40:]),
+        )
+        self.assertNotIn(
+            "Calling initdb", combined,
+            "the custom --data-path boot ran initdb: the 'Populating' "
+            "message alone proves nothing (it is printed BEFORE cp -a, and "
+            "a failed copy rolls back to full initialization), so without "
+            "this guard the fast path can silently regress while every "
+            "custom-path test stays green (issue #480).",
+        )
+
+    def test_copied_marker_is_consumed(self):
+        res = _docker(
+            "exec", self.container, "test", "-e",
+            "/custom-data/.documentdb-local/baked_template",
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(
+            res.returncode, 0,
+            "the template marker copied into the custom data path must be "
+            "consumed on the boot that adopted it",
+        )
+
+    def test_ping_succeeds_from_copied_cluster(self):
+        result = self._mongosh("db.runCommand({ping: 1}).ok")
+        self.assertEqual(
+            result.returncode, 0,
+            f"mongosh ping failed on a custom --data-path container.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            _last_nonempty_line(result.stdout), "1",
+            f"expected ping ok=1\nfull stdout:\n{result.stdout}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bake-time fingerprint seam - the unit suite proves the prepare script
+# against a STUBBED pg_controldata; this proves the image's real marker
+# matches the real tool's output before any entrypoint has run.
+# ---------------------------------------------------------------------------
+
+# The fingerprint recompute pipeline, kept in lockstep with
+# documentdb_prepare_data_directory.sh's live_fingerprint (normalization,
+# 3-field anchored grep, checkpoint-LSN zero-padding canonicalization).
+_FINGERPRINT_PIPELINE = (
+    "LC_ALL=C pg_controldata /data "
+    "| sed -E 's/[[:space:]]+/ /g; s/ $//' "
+    "| grep -E '^(Database system identifier"
+    "|Database cluster state"
+    "|Latest checkpoint location): '"
+    "| sed -E 's|^(Latest checkpoint location: [0-9A-F]+/)0*([0-9A-F])|\\1\\2|'"
+)
+
+
+@_SKIP_UNLESS_IMAGE
+class BakedFingerprintSeamTests(unittest.TestCase):
+    """Runs the image with the entrypoint bypassed, so the fresh anonymous
+    /data volume still carries the unconsumed marker in its baked state."""
+
+    def test_marker_matches_live_pg_controldata(self):
+        image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        script = (
+            "set -e; "
+            "marker=/data/.documentdb-local/baked_template; "
+            "cat \"$marker\"; "
+            "echo ---; "
+            + _FINGERPRINT_PIPELINE
+        )
+        res = _docker(
+            "run", "--rm", "--entrypoint", "bash", image, "-c", script,
+            timeout=120,
+        )
+        marker, _, live = res.stdout.partition("---")
+        marker_lines = marker.strip().splitlines()
+        live_lines = live.strip().splitlines()
+        self.assertEqual(
+            marker_lines, live_lines,
+            "the baked marker must byte-match the fingerprint recomputed by "
+            "the image's own pg_controldata; a mismatch means every first "
+            "boot silently takes the slow treat-as-user-data path",
+        )
+        self.assertEqual(len(marker_lines), 3, marker.strip())
+        self.assertIn("Database cluster state: shut down", marker_lines)
+
+    def test_booted_template_no_longer_matches_marker(self):
+        """The other half of the safety claim, against a REAL PostgreSQL:
+        after the baked cluster is started and cleanly stopped, the
+        recomputed fingerprint must differ from the marker (the shutdown
+        checkpoint advances), so a used volume can never re-pass the
+        pristineness proof."""
+        image = os.environ["DOCUMENTDB_LOCAL_IMAGE"]
+        script = (
+            "set -e; "
+            "cp /data/.documentdb-local/baked_template /tmp/marker.orig; "
+            "sudo mkdir -p /var/run/postgresql; "
+            "sudo chown \"$(whoami)\" /var/run/postgresql; "
+            "pg_ctl start -D /data -w -t 120 -l /tmp/seam_pg.log; "
+            "pg_ctl stop -D /data -m fast -w -t 120; "
+            "echo ---MARKER---; "
+            "cat /tmp/marker.orig; "
+            "echo ---LIVE---; "
+            + _FINGERPRINT_PIPELINE
+        )
+        res = _docker(
+            "run", "--rm", "--entrypoint", "bash", image, "-c", script,
+            timeout=300,
+        )
+        _, _, rest = res.stdout.partition("---MARKER---")
+        marker, _, live = rest.partition("---LIVE---")
+        marker_lines = marker.strip().splitlines()
+        live_lines = live.strip().splitlines()
+        self.assertEqual(len(marker_lines), 3, res.stdout)
+        self.assertEqual(len(live_lines), 3, res.stdout)
+        self.assertNotEqual(
+            marker_lines, live_lines,
+            "a booted-and-stopped cluster still matches the baked marker: "
+            "the pristineness proof would treat a used volume as wipeable",
+        )
+        # The identifier never changes; the discriminators are state and/or
+        # the checkpoint location (a clean stop advances the checkpoint).
+        self.assertEqual(marker_lines[0], live_lines[0], res.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 12. Data directory interlock - the entrypoint holds an flock on the data
+#     directory and refuses to start over a postmaster.pid it cannot vouch
+#     for. Same-namespace unit tests cannot show what a second container
+#     sees, so these run real containers on one volume.
+# ---------------------------------------------------------------------------
+
+INTERLOCK_DB_NAME = "image_smoke_interlock_db"
+INTERLOCK_COLLECTION = "interlock_marker"
+IMAGE_ENTRYPOINT = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh"
+# The exact call line in the image's entrypoint; a holder with it removed
+# behaves like an image that predates the interlock.
+CLAIM_CALL = '    claim_data_directory "$DATA_PATH" 2>&6\n'
+LOCK_HELD_MSG = "already using the data directory"
+PIDFILE_REFUSED_MSG = "DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID"
+PIDFILE_REMOVED_MSG = "Warning: removing /data/postmaster.pid"
+PIDFILE_STALE_MSG = "left by an unclean stop of the previous container"
+POST_START_MSG = "Checking if PostgreSQL is running"
+OWNER_RECORD = "/data/.documentdb-local/postmaster-owner"
+IMAGE_START_SCRIPT = "/home/documentdb/gateway/scripts/start_oss_server.sh"
+# Appended to the start script: the first boot stays inside startup, with
+# PostgreSQL up, until the test kills it. /tmp is in the container's own
+# layer, so the restart runs the script normally.
+HOLD_MARKER = "/tmp/documentdb-test-held"
+START_HOLD = (
+    f"\nif [ ! -e {HOLD_MARKER} ]; then\n"
+    f"    touch {HOLD_MARKER}\n"
+    "    while :; do sleep 1; done\n"
+    "fi\n"
+)
+# The marker must exist before the kill, or the restart would hold too.
+HELD_AND_RECORDED = (
+    f'[ -e {HOLD_MARKER} ] && r="$(cat {OWNER_RECORD})" && '
+    '[ "$r" = "$(sed -n 1p /data/postmaster.pid) $(sed -n 3p /data/postmaster.pid)" ]'
+)
+
+
+@_SKIP_UNLESS_IMAGE
+class DataDirectoryInterlockTests(_VolumeTestBase):
+
+    NAME_TAG = "lock"
+
+    def _wait_for_exit(self, container: str) -> tuple[int, str]:
+        """Block until the container exits; return its status and logs."""
+        waited = _docker("wait", container, timeout=DEFAULT_READY_TIMEOUT)
+        logs = _docker("logs", container, check=False)
+        return int(waited.stdout.strip()), logs.stdout + logs.stderr
+
+    def _assert_refused(self, container: str, message: str) -> None:
+        status, logs = self._wait_for_exit(container)
+        self.assertNotEqual(status, 0, f"container should have refused to start\n{logs}")
+        self.assertIn(message, logs)
+
+    def _insert(self, container: str, doc_id: str) -> None:
+        res = _mongosh_exec(
+            container,
+            f"const r = db.getSiblingDB('{INTERLOCK_DB_NAME}').{INTERLOCK_COLLECTION}"
+            f".insertOne({{_id: '{doc_id}'}}); print(r.acknowledged ? 'ack' : 'noack');",
+            username=DEFAULT_USERNAME, password=self.password,
+        )
+        self.assertEqual(res.returncode, 0, _combined_logs(res))
+        self.assertIn("ack", res.stdout)
+
+    def _assert_pidfile_intact(self, container: str) -> None:
+        res = _docker("exec", container, "test", "-f", "/data/postmaster.pid", check=False)
+        self.assertEqual(res.returncode, 0, "the holder's postmaster.pid was removed")
+
+    def _data_metadata(self, container: str) -> str:
+        return _docker(
+            "exec", container, "stat", "-c", "%u:%g %a", "/data", "/data/PG_VERSION",
+        ).stdout.strip()
+
+    def _different_uid_run_args(self) -> list[str]:
+        script_dir = pathlib.Path(tempfile.mkdtemp(prefix="docdb-image-different-uid-"))
+        self.addCleanup(shutil.rmtree, script_dir, ignore_errors=True)
+        script = script_dir / "entrypoint.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "uid=$(($(id -u documentdb) + 10000))\n"
+            "gid=$(($(id -g documentdb) + 10000))\n"
+            'groupmod -g "$gid" documentdb\n'
+            'usermod -u "$uid" -g "$gid" documentdb\n'
+            "chown documentdb:documentdb /var/run/postgresql\n"
+            "export HOME=/home/documentdb USER=documentdb LOGNAME=documentdb\n"
+            'exec setpriv --reuid="$uid" --regid="$gid" --init-groups '
+            f'bash {IMAGE_ENTRYPOINT} "$@"\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return [
+            "--user", "root", "--entrypoint", "/different-uid-entrypoint.sh",
+            "-v", f"{script}:/different-uid-entrypoint.sh:ro",
+        ]
+
+    def test_a_root_owned_private_volume_is_claimed_before_repair(self):
+        _docker(
+            "run", "--rm", "--user", "root", "--entrypoint", "sh",
+            "-v", f"{self.volume}:/data", self.image,
+            "-c", "chown root:root /data && chmod 700 /data",
+            timeout=120,
+        )
+
+        container = self._start("root")
+        _wait_for_ready(container)
+
+        self._insert(container, "after-repair")
+        contender = self._start("after-root-repair")
+        self._assert_refused(contender, LOCK_HELD_MSG)
+        self._insert(container, "root-repaired-holder-still-serving")
+
+    def test_a_second_container_on_an_in_use_volume_is_refused(self):
+        holder = self._start("holder")
+        _wait_for_ready(holder)
+
+        contender = self._start("contender")
+        self._assert_refused(contender, LOCK_HELD_MSG)
+
+        self._insert(holder, "holder-still-serving")
+        self._assert_pidfile_intact(holder)
+
+    def test_a_losing_contender_does_not_rewrite_the_served_volume(self):
+        """A forced-repair contender that loses the lock used to chmod -R the
+        live cluster before exiting (PG_VERSION 600 -> 750)."""
+        holder = self._start("holder")
+        _wait_for_ready(holder)
+        _docker("exec", holder, "chmod", "700", "/data")
+        before = self._data_metadata(holder)
+        self.assertEqual(before.splitlines()[0].split()[-1], "700")
+        self.assertEqual(before.splitlines()[1].split()[-1], "600")
+
+        for tag, run_args in (
+            ("same-uid", []),
+            ("different-uid", self._different_uid_run_args()),
+        ):
+            with self.subTest(contender=tag):
+                contender = self._start(
+                    tag, run_args=[*run_args, "-e", "DOCUMENTDB_FORCE_OWNERSHIP_REPAIR=true"],
+                )
+                self._assert_refused(contender, LOCK_HELD_MSG)
+                self.assertEqual(
+                    self._data_metadata(holder), before,
+                    "a losing contender rewrote the holder's directory or files",
+                )
+                self._assert_pidfile_intact(holder)
+                self._insert(holder, f"still-serving-after-{tag}")
+
+    def _noclaim_run_args(self) -> list[str]:
+        """Run args for a holder that behaves like an image without the interlock."""
+        shipped = _docker("run", "--rm", "--entrypoint", "cat", self.image,
+                          IMAGE_ENTRYPOINT, timeout=120).stdout
+        self.assertEqual(
+            shipped.count(CLAIM_CALL), 1,
+            "the image's entrypoint does not contain the expected claim call; "
+            "update CLAIM_CALL so this test keeps simulating a non-locking holder",
+        )
+        script_dir = pathlib.Path(tempfile.mkdtemp(prefix="docdb-image-noclaim-"))
+        self.addCleanup(shutil.rmtree, script_dir, ignore_errors=True)
+        script = script_dir / "emulator_entrypoint.sh"
+        script.write_text(shipped.replace(
+            CLAIM_CALL, "    : claim removed to simulate an image without the interlock\n"
+        ), encoding="utf-8")
+        script.chmod(0o755)
+        return ["-v", f"{script}:{IMAGE_ENTRYPOINT}:ro"]
+
+    def test_a_holder_that_takes_no_lock_is_not_taken_over(self):
+        """The pidfile of a live container that predates the interlock has no
+        flock behind it. A free flock must not be read as proof of staleness."""
+        holder = self._start("noclaim", run_args=self._noclaim_run_args())
+        _wait_for_ready(holder)
+        _docker("exec", holder, "chmod", "700", "/data")
+        before = self._data_metadata(holder)
+
+        for tag, run_args in (
+            ("same-uid", []),
+            ("different-uid", self._different_uid_run_args()),
+        ):
+            with self.subTest(contender=tag):
+                contender = self._start(tag, run_args=run_args)
+                self._assert_refused(contender, PIDFILE_REFUSED_MSG)
+                self.assertEqual(self._data_metadata(holder), before)
+                self._insert(holder, f"unlocked-holder-still-serving-after-{tag}")
+                self._assert_pidfile_intact(holder)
+
+    def test_inactive_volume_is_repaired_for_a_different_runtime_uid(self):
+        first = self._start("original-uid")
+        _wait_for_ready(first)
+        self._insert(first, "before-uid-change")
+        before = self._data_metadata(first)
+        self._stop(first)
+
+        replacement = self._start("replacement-uid", run_args=self._different_uid_run_args())
+        _wait_for_ready(replacement)
+        self.assertNotEqual(self._data_metadata(replacement), before)
+        self.assertEqual(
+            self._count(INTERLOCK_DB_NAME, INTERLOCK_COLLECTION, replacement,
+                        "{_id: 'before-uid-change'}"),
+            "1",
+        )
+
+        contender = self._start("original-uid-contender")
+        self._assert_refused(contender, LOCK_HELD_MSG)
+        self._insert(replacement, "replacement-holder-still-serving")
+        self._stop(replacement)
+
+        restarted = self._start("after-uid-repair-stop")
+        _wait_for_ready(restarted)
+        self.assertEqual(
+            self._count(INTERLOCK_DB_NAME, INTERLOCK_COLLECTION, restarted,
+                        "{_id: 'before-uid-change'}"),
+            "1",
+        )
+
+    def test_an_unclean_stop_recovers_on_the_next_start(self):
+        """docker start (and so restart: unless-stopped) must not need the
+        override after docker kill or a dead postmaster (#109)."""
+        first = self._start("first")
+        _wait_for_ready(first)
+        self._insert(first, "before-kill")
+        _docker("kill", first, timeout=60)
+
+        _docker("start", first, timeout=60)
+        # docker logs still holds the first boot's readiness marker.
+        deadline = time.monotonic() + DEFAULT_READY_TIMEOUT
+        while True:
+            logs = _docker("logs", first, check=False)
+            if (logs.stdout + logs.stderr).count(READY_LOG) >= 2:
+                break
+            running = _docker("inspect", "-f", "{{.State.Running}}", first, check=False)
+            self.assertEqual(running.stdout.strip(), "true",
+                             "restart exited:\n" + logs.stdout + logs.stderr)
+            self.assertLess(time.monotonic(), deadline, "restart never became ready")
+            time.sleep(2)
+        self.assertIn(PIDFILE_STALE_MSG, logs.stdout + logs.stderr)
+        self._insert(first, "after-restart")
+
+        # The postmaster dies on its own, as on an OOM kill.
+        _docker("exec", first, "bash", "-c",
+                "kill -9 \"$(head -1 /data/postmaster.pid)\"", timeout=60)
+        self._wait_for_exit(first)
+        replacement = self._start("replacement")
+        _wait_for_ready(replacement)
+        self.assertEqual(
+            self._count(INTERLOCK_DB_NAME, INTERLOCK_COLLECTION, replacement,
+                        "{_id: {$in: ['before-kill', 'after-restart']}}"),
+            "2",
+        )
+
+    def _held_start_run_args(self) -> list[str]:
+        """Run args whose first boot never returns from start_oss_server.sh."""
+        shipped = _docker("run", "--rm", "--entrypoint", "cat", self.image,
+                          IMAGE_START_SCRIPT, timeout=120).stdout
+        script_dir = pathlib.Path(tempfile.mkdtemp(prefix="docdb-image-held-"))
+        self.addCleanup(shutil.rmtree, script_dir, ignore_errors=True)
+        script = script_dir / "start_oss_server.sh"
+        script.write_text(shipped + START_HOLD, encoding="utf-8")
+        script.chmod(0o755)
+        return ["-v", f"{script}:{IMAGE_START_SCRIPT}:ro"]
+
+    def test_a_kill_during_startup_recovers_on_the_next_start(self):
+        """A kill before startup finishes, e.g. during crash recovery, must not
+        need the override. Only the record taken while PostgreSQL starts can
+        vouch for the pidfile; the readiness-time kill above cannot tell."""
+        first = self._start("first", run_args=self._held_start_run_args())
+        deadline = time.monotonic() + 120
+        while _docker("exec", first, "bash", "-c", HELD_AND_RECORDED,
+                      check=False).returncode != 0:
+            logs = _docker("logs", first, check=False)
+            self.assertLess(time.monotonic(), deadline,
+                            "the postmaster was not recorded while startup was held:\n"
+                            + logs.stdout + logs.stderr)
+            time.sleep(0.5)
+        logs = _docker("logs", first, check=False)
+        self.assertNotIn(POST_START_MSG, logs.stdout + logs.stderr, "startup was not held open")
+        _docker("kill", first, timeout=60)
+
+        _docker("start", first, timeout=60)
+        _wait_for_ready(first)
+        logs = _docker("logs", first, check=False)
+        self.assertIn(PIDFILE_STALE_MSG, logs.stdout + logs.stderr)
+
+    def test_an_unrecorded_pidfile_is_recovered_only_with_the_override(self):
+        holder = self._start("noclaim", run_args=self._noclaim_run_args())
+        _wait_for_ready(holder)
+        self._insert(holder, "before-kill")
+        _docker("kill", holder, timeout=60)
+
+        refused = self._start("refused")
+        self._assert_refused(refused, PIDFILE_REFUSED_MSG)
+
+        recovered = self._start(
+            "recovered", run_args=["-e", "DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID=true"],
+        )
+        _wait_for_ready(recovered)
+        logs = _docker("logs", recovered, check=False)
+        self.assertIn(PIDFILE_REMOVED_MSG, logs.stdout + logs.stderr)
+        self.assertEqual(
+            self._count(INTERLOCK_DB_NAME, INTERLOCK_COLLECTION, recovered,
+                        "{_id: 'before-kill'}"),
+            "1",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

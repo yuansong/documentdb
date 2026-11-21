@@ -1,0 +1,175 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * include/utils/role_utils.h
+ *
+ * Headers of role utility functions.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef ROLE_UTILS_H
+#define ROLE_UTILS_H
+
+#include "postgres.h"
+#include "fmgr.h"
+#include "nodes/pg_list.h"
+#include "utils/hsearch.h"
+#include "utils/string_view.h"
+#include "io/bson_core.h"
+
+/*
+ * Baseline RBAC group role names.
+ */
+
+/*
+ * Every group role the RBAC surface provisions for its own use carries this
+ * prefix, so the names can be recognized as a family rather than one at a time.
+ */
+#define API_RBAC_API_ROLE_PREFIX "documentdb_rbac_api_"
+
+#define API_RBAC_API_ACCESS_ROLE "documentdb_rbac_api_access_role"
+#define API_RBAC_API_COLLECTION_OWNER_ROLE "documentdb_rbac_api_collection_owner_role"
+#define API_RBAC_API_COLLECTION_CREATE_ROLE "documentdb_rbac_api_collection_create_role"
+#define API_RBAC_API_INDEX_CREATE_ROLE "documentdb_rbac_api_index_create_role"
+#define API_RBAC_BASELINE_READ_ROLE "documentdb_rbac_baseline_read_role"
+#define API_RBAC_BASELINE_WRITE_ROLE "documentdb_rbac_baseline_write_role"
+#define API_RBAC_READWRITE_ANYDB_ROLE "documentdb_rbac_readwrite_anydb_role"
+
+/* Macro to check if a role is a system role */
+#define IS_SYSTEM_LOGIN_ROLE(roleName) \
+	(strcmp((roleName), ApiBgWorkerRole) == 0 || \
+	 strcmp((roleName), ApiBgWorkerRoleV3) == 0 || \
+	 strcmp((roleName), ApiReplicationRole) == 0 || \
+	 strcmp((roleName), ApiSettingsManagerRole) == 0)
+
+/* Macro to check if a role is a customer facing built-in role */
+#define IS_BUILTIN_ROLE(roleName) \
+	(strcmp((roleName), ApiAdminRole) == 0 || \
+	 strcmp((roleName), ApiAdminRoleV2) == 0 || \
+	 strcmp((roleName), ApiAdminRoleV3) == 0 || \
+	 strcmp((roleName), ApiClusterAdminRole) == 0 || \
+	 strcmp((roleName), ApiReadOnlyRole) == 0 || \
+	 strcmp((roleName), ApiReadWriteRole) == 0 || \
+	 strcmp((roleName), ApiRootInternalRole) == 0 || \
+	 strcmp((roleName), ApiRootRole) == 0 || \
+	 strcmp((roleName), ApiUserAdminRole) == 0 || \
+	 strcmp((roleName), API_RBAC_READWRITE_ANYDB_ROLE) == 0)
+
+/*
+ * Macro to check if a role is an internal custom rbac role.
+ *
+ * Everything under API_RBAC_API_ROLE_PREFIX is matched as a family, so a role
+ * added to that family does not have to be listed here as well. The remaining
+ * names sit outside that prefix and are matched individually.
+ */
+#define IS_CUSTOM_RBAC_ROLE(roleName) \
+	(strncmp((roleName), API_RBAC_API_ROLE_PREFIX, \
+			 sizeof(API_RBAC_API_ROLE_PREFIX) - 1) == 0 || \
+	 strcmp((roleName), ApiCollectionFindRole) == 0 || \
+	 strcmp((roleName), ApiCollectionInsertRole) == 0 || \
+	 strcmp((roleName), ApiCollectionUpdateRole) == 0 || \
+	 strcmp((roleName), ApiCollectionRemoveRole) == 0 || \
+	 strcmp((roleName), API_RBAC_BASELINE_READ_ROLE) == 0 || \
+	 strcmp((roleName), API_RBAC_BASELINE_WRITE_ROLE) == 0)
+
+/* Macro to check if a role name matches a native built-in role */
+#define IS_NATIVE_BUILTIN_ROLE(roleName) \
+	(strcmp((roleName), "__system") == 0 || \
+	 strcmp((roleName), "autoCompact") == 0 || \
+	 strcmp((roleName), "backup") == 0 || \
+	 strcmp((roleName), "backupAndRestore") == 0 || \
+	 strcmp((roleName), "clusterAdmin") == 0 || \
+	 strcmp((roleName), "clusterManager") == 0 || \
+	 strcmp((roleName), "clusterMonitor") == 0 || \
+	 strcmp((roleName), "dbAdmin") == 0 || \
+	 strcmp((roleName), "dbAdminAnyDatabase") == 0 || \
+	 strcmp((roleName), "dbOwner") == 0 || \
+	 strcmp((roleName), "directShardOperations") == 0 || \
+	 strcmp((roleName), "enableSharding") == 0 || \
+	 strcmp((roleName), "killOpSession") == 0 || \
+	 strcmp((roleName), "manageShardBalancer") == 0 || \
+	 strcmp((roleName), "MongodbAutomationAgentUserRole") == 0 || \
+	 strcmp((roleName), "read") == 0 || \
+	 strcmp((roleName), "readAnyDatabase") == 0 || \
+	 strcmp((roleName), "readWrite") == 0 || \
+	 strcmp((roleName), "readWriteAnyDatabase") == 0 || \
+	 strcmp((roleName), "restore") == 0 || \
+	 strcmp((roleName), "root") == 0 || \
+	 strcmp((roleName), "searchCoordinator") == 0 || \
+	 strcmp((roleName), "userAdmin") == 0 || \
+	 strcmp((roleName), "userAdminAnyDatabase") == 0)
+
+/*
+ * Privilege stores a privilege and its actions.
+ */
+typedef struct
+{
+	const char *db;
+	const char *collection;
+	bool isCluster;
+	size_t numActions;
+	const StringView *actions;
+} Privilege;
+
+/*
+ * ConsolidatedPrivilege contains the db, collection, isCluster, and actions of a privilege.
+ */
+typedef struct
+{
+	const char *db;
+	const char *collection;
+	bool isCluster;
+	HTAB *actions;
+} ConsolidatedPrivilege;
+
+/* Function to write a single role's privileges to a BSON array writer */
+void WritePrivileges(const StringView *internalRoleName,
+					 pgbson_array_writer *privilegesArrayWriter);
+
+/* Function to write multiple roles' privileges from an HTAB to a BSON array writer*/
+void WriteMultipleRolePrivileges(HTAB *rolesTable,
+								 pgbson_array_writer *privilegesArrayWriter);
+
+/* Function to check if a given role name contains any reserved pg role name prefixes. */
+bool ContainsReservedPgRoleNamePrefix(const char *name);
+
+/* Function to check if a given name matches a reserved internal role name
+* (system login role, builtin role, or custom RBAC role).
+* Note: this function does not check against native built-in role names */
+bool IsReservedInternalRoleName(const char *name);
+
+/* Function to check whether a name is reserved for the extension's own roles,
+ * a blocked prefix, or a built-in role name. Roles and users share one
+ * namespace, so this applies to both. */
+bool IsReservedRoleName(const char *name);
+
+/* Returns whether standalone readWriteAnyDatabase assignment is available. */
+bool IsReadWriteAnyDatabaseRoleAvailable(void);
+
+/* Function to check whether a name identifies a custom role */
+bool IsCustomRole(const char *roleName);
+
+/* Function to check whether a text value identifies a custom role */
+bool IsCustomRoleCore(text *roleName);
+
+/* Function to build a List of parent role names from an array of Datums */
+List * ConvertUserOrRoleNamesDatumToList(Datum *parentRolesDatums, int parentRolesCount);
+
+void EnsureRoleMembershipLimits(const char *roleName, int64 numRolesToAdd);
+
+void GrantCollectionPrivilegesToBaselineRoles(uint64 collectionId, bool
+											  includeRetryTable);
+
+/*
+ * Reports whether the current effective role is the role that owns the
+ * collections the creation path produces.
+ */
+bool IsCurrentUserCollectionOwnerRole(void);
+
+/*
+ * Reports whether the current effective role is the role the creation path
+ * runs as.
+ */
+bool IsCurrentUserCollectionCreateRole(void);
+
+#endif

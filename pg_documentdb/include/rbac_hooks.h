@@ -1,0 +1,117 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * include/rbac_hooks.h
+ *
+ * Hook definitions for resource-scoped role privileges. These hooks let the
+ * hosting extension layer persist the privileges a role is granted on a
+ * resource, and hold the native relation privileges that reaching the
+ * authorization path requires.
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#ifndef EXTENSION_RBAC_HOOKS_H
+#define EXTENSION_RBAC_HOOKS_H
+
+#include <nodes/pg_list.h>
+#include <nodes/parsenodes.h>
+#include <nodes/plannodes.h>
+#include <utils/acl.h>
+
+#include "utils/string_view.h"
+
+/*
+ * Actions a role can be granted on a resource. These name what the caller asked
+ * for and carry no storage semantics: the layer that persists a grant maps them
+ * onto whatever privilege model its storage uses.
+ */
+typedef enum CustomPrivilegeAction
+{
+	CustomPrivilegeAction_None = 0,
+	CustomPrivilegeAction_Find = 1 << 0,
+	CustomPrivilegeAction_Insert = 1 << 1,
+	CustomPrivilegeAction_Update = 1 << 2,
+	CustomPrivilegeAction_Remove = 1 << 3,
+} CustomPrivilegeAction;
+
+/*
+ * A collection-scoped privilege, pairing a resource with the actions the role
+ * was granted on it. actions is a bitmask of CustomPrivilegeAction values.
+ */
+typedef struct CustomCollectionPrivilege
+{
+	StringView databaseName;
+	StringView collectionName;
+	CustomPrivilegeAction actions;
+} CustomCollectionPrivilege;
+
+typedef void (*GrantCollectionPrivilegesToRole_HookType)(const char *roleName,
+														 List *collectionPrivileges);
+extern GrantCollectionPrivilegesToRole_HookType
+	grant_collection_privileges_to_role_hook;
+
+typedef void (*RemoveCollectionPrivileges_HookType)(const char *roleName);
+extern RemoveCollectionPrivileges_HookType
+	remove_collection_privileges_hook;
+
+
+/*
+ * Persists collection-scoped privileges for a newly created role.
+ * An empty list is a no-op when no implementation is registered, and is
+ * passed through when one is registered. Nonempty lists error without an
+ * implementation.
+ */
+void GrantCollectionPrivilegesToRole(const char *roleName, List *collectionPrivileges);
+
+/*
+ * Removes every collection-scoped privilege recorded for a role.
+ * Must run while the role still resolves, since entries are matched by name.
+ * No-op when no implementation is registered.
+ */
+void RemoveCollectionPrivileges(const char *roleName);
+
+/* Runs optional work after a collection is created. */
+void PostCreateCollection(uint64 collectionId);
+
+/*
+ * Records, on a plan built without the planner, the identity a relation's
+ * permission record should be checked against, and marks the plan role
+ * dependent.
+ *
+ * A plan returned without running the planner carries a permission record that
+ * nothing has had the chance to evaluate. Every other statement has that record
+ * settled while planning, so this hands the ones that skip the planner to
+ * whichever layer settles it.
+ *
+ * The record is read from the plan's own permission list, so a caller does not
+ * need a Query. No-op when no implementation is registered, which leaves the
+ * record checked against the invoking role.
+ */
+void ApplyCollectionAccessIdentityToPlan(RangeTblEntry *rte, PlannedStmt *stmt);
+
+
+bool RequireBaseCollectionRteInMetadataQueries(void);
+
+struct FromExpr;
+void UpdateJoinTreeForCollectionsQuery(struct FromExpr *fromExpr, List *rtes);
+
+const char * GetCollectionsStringFilter(void);
+
+/*
+ * Runs a collection level function after the privilege checks the registered
+ * implementation applies.
+ *
+ * canUseLibPq tells the implementation whether the call is allowed to be
+ * carried on a connection of its own rather than in the caller's transaction.
+ * Only a caller that can tolerate the work committing before it continues may
+ * pass true.
+ */
+Datum RunCollectionLevelFunctionWithPrivilegeChecks(const char *schemaName,
+													const char *functionName,
+													Datum *args, Oid *argTypes,
+													char *argNulls, int nargs,
+													bool readOnly, bool canUseLibPq,
+													bool *isNull);
+
+#endif

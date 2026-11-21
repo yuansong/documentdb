@@ -1,0 +1,1594 @@
+# shellcheck shell=bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# documentdb-tools-lib.sh — shared helpers for the DocumentDB administrator
+# tools.
+#
+# This file is *sourced*, not executed. It single-sources the safety-critical
+# managed-block primitives and shared_preload_libraries parsing that were
+# previously copy-pasted (with renamed locals) into multiple tools, so the tools
+# cannot drift on marker or parser semantics.
+#
+# Contract — this library is safe to source under `set -u`: sourcing it only
+# defines functions and constants. The sourcing script MUST define, before the
+# first helper call:
+#  * die <msg> — print an error and exit non-zero.
+#  * log_verbose <msg> — verbose diagnostic to stderr (no-op unless verbose).
+#  * create_temp_in_dir <var> <dir> — create a temp file in <dir>, assign its
+#    path to the named <var>, and register it for cleanup on the sourcing
+#    script's EXIT trap.
+#
+# merge_shared_preload_libraries additionally requires HAS_EXTENDED_RUM to be
+# set before it is called: "true" when pg_documentdb_extended_rum must be added
+# to shared_preload_libraries, "false" otherwise. The required-library set
+# itself comes from documentdb_required_preload_libraries, which delegates to
+# the extension-owned preload_libraries.sh -- the tools no longer carry their
+# own copies of that list.
+# documentdb_resolve_toast_compression sets TOAST_COMPRESSION in the sourcing
+# script: the value to write for default_toast_compression, or "" to leave the
+# setting alone.
+# die / log_verbose / create_temp_in_dir remain per-tool because the logging
+# idiom and temp-file/cleanup infrastructure are still being unified separately.
+
+# True when systemd is actually usable: the binary alone is not enough —
+# containers often ship systemctl with no PID-1 systemd, and calling it
+# there just emits "Failed to connect to bus" noise. /run/systemd/system
+# exists only when systemd is PID 1. Single-sourced here so the tools
+# cannot drift on the probe (they once did: two scripts carried copies
+# with different command probes). The gateway maintainer scripts keep
+# deliberate inline copies — they run at uninstall time when this file
+# may already be gone.
+has_working_systemd() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+strip_wrapping_quotes() {
+    local value="$1"
+    if [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    printf '%s' "${value}"
+}
+
+array_contains() {
+    local needle="$1"
+    shift || true
+    local item=""
+    # Use ${@+"$@"} instead of "$@" so an empty argument list does not
+    # trigger an "unbound variable" error under set -u on bash 4.x.
+    for item in ${@+"$@"}; do
+        if [[ "${item}" == "${needle}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# read_shared_preload_libraries_from_stdin: print the last uncommented
+# shared_preload_libraries value from the config text on STDIN. Split out from
+# read_shared_preload_libraries_from_file so a caller that already has the text
+# in a pipe (e.g. a managed-block-stripped stream from strip_managed_block) can
+# parse it WITHOUT materializing a temp file — keeping read-only callers
+# (documentdb-tune --print / --dry-run) side-effect-free. The awk parser lives
+# here only (single-sourced); read_shared_preload_libraries_from_file is a thin
+# file wrapper around it.
+#
+# Match PostgreSQL's postgresql.conf syntax: parameter names are
+# case-INsensitive and the "=" between name and value is OPTIONAL
+# (whitespace also separates them), so "SHARED_PRELOAD_LIBRARIES 'x'" is a
+# valid assignment. The (=|space) boundary after the key keeps a longer
+# parameter that merely starts with it from matching. Mirrors
+# documentdb-tune's _read_scalar_guc_from_file.
+read_shared_preload_libraries_from_stdin() {
+    local current_value=""
+    current_value="$(
+        awk '
+            BEGIN { klen = length("shared_preload_libraries") }
+            /^[[:space:]]*#/ { next }
+            tolower($0) ~ /^[[:space:]]*shared_preload_libraries([[:space:]]*=|[[:space:]])/ {
+                v = $0
+                sub(/^[[:space:]]*/, "", v)                 # drop leading whitespace
+                v = substr(v, klen + 1)                     # drop the key name (any case, exact length)
+                sub(/^[[:space:]]*=?[[:space:]]*/, "", v)   # drop the optional "=" and surrounding whitespace
+                # Strip the inline "#..." comment that the stock Debian line
+                # ships with, honoring PostgreSQL`s rule that # ends the value
+                # unless it is inside a quoted string. \047 is a single quote.
+                if (v ~ /^\047/) { if (match(v, /^\047[^\047]*\047/)) v = substr(v, RSTART, RLENGTH) }
+                else if (v ~ /^"/) { if (match(v, /^"[^"]*"/)) v = substr(v, RSTART, RLENGTH) }
+                else { sub(/[[:space:]]*#.*$/, "", v) }
+                gsub(/[[:space:]]+$/, "", v)
+                print v
+            }
+        ' | tail -n 1
+    )"
+    current_value="$(strip_wrapping_quotes "${current_value}")"
+    printf '%s' "${current_value}"
+}
+
+# read_shared_preload_libraries_from_file <config_path>: thin file wrapper around
+# read_shared_preload_libraries_from_stdin. Empty when the file is absent.
+read_shared_preload_libraries_from_file() {
+    local config_path="$1"
+    [[ -f "${config_path}" ]] || return 0
+    read_shared_preload_libraries_from_stdin < "${config_path}"
+}
+
+# documentdb_required_preload_libraries <true|false>: print the libraries
+# DocumentDB requires in shared_preload_libraries, one per line, derived from
+# the extension-owned GetDocumentDBBasePreloadLibraries in preload_libraries.sh.
+documentdb_required_preload_libraries() {
+    local with_rum="$1"
+    local -a args=()
+    local raw item
+
+    [[ "${with_rum}" == "true" ]] && args+=("--rum")
+
+    # Always re-sourced: callers run this inside $(), so a declare -F guard
+    # caches nothing and would accept any same-named function in scope.
+    _documentdb_source_preload_authority \
+        || die "cannot locate preload_libraries.sh, the shared_preload_libraries authority."
+
+    # A partial answer (printed "pg_cron", then failed) is non-empty and would
+    # pass the emptiness check, so the helper's own status must be fatal.
+    raw="$(GetDocumentDBBasePreloadLibraries "${args[@]+"${args[@]}"}")" \
+        || die "GetDocumentDBBasePreloadLibraries failed; refusing to write a partial shared_preload_libraries list."
+
+    local -a fields=() items=()
+    IFS=',' read -r -a fields <<< "${raw}"
+    for item in "${fields[@]}"; do
+        item="$(trim_whitespace "${item}")"
+        [[ -n "${item}" ]] && items+=("${item}")
+    done
+    (( ${#items[@]} > 0 )) \
+        || die "the required shared_preload_libraries set came back empty; refusing to write a configuration without it."
+    printf '%s\n' "${items[@]}"
+    return 0
+}
+
+# Lazy (per call, not at source time) so sourcers that never need the preload
+# list do not depend on preload_libraries.sh being installed. The packages
+# install it beside this library; a checkout has it at oss/scripts/.
+_documentdb_source_preload_authority() {
+    local here candidate
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for candidate in \
+        "${here}/preload_libraries.sh" \
+        "${here}/../../scripts/preload_libraries.sh"; do
+        if [[ -r "${candidate}" ]]; then
+            # shellcheck source=/dev/null
+            . "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+merge_shared_preload_libraries() {
+    local current_value="$1"
+    local item joined=""
+    local -a merged=() current_items=()
+    local -a required=()
+    : "${HAS_EXTENDED_RUM:?merge_shared_preload_libraries requires HAS_EXTENDED_RUM to be 'true' or 'false'}"
+
+    # Command substitution, not `< <(...)`: a process substitution runs in a
+    # subshell, so a die() inside it would end only that subshell and leave this
+    # function running with an empty array -- rendering a managed block with no
+    # shared_preload_libraries line at all.
+    local _raw
+    _raw="$(documentdb_required_preload_libraries "${HAS_EXTENDED_RUM}")" \
+        || die "cannot determine the required shared_preload_libraries set."
+    mapfile -t required <<< "${_raw}"
+
+    local cleaned
+    cleaned="$(strip_wrapping_quotes "${current_value}")"
+    if [[ -n "${cleaned}" ]]; then
+        IFS=',' read -r -a current_items <<< "${cleaned}"
+        for item in "${current_items[@]}"; do
+            item="$(trim_whitespace "${item}")"
+            [[ -z "${item}" ]] && continue
+            array_contains "${item}" "${merged[@]+"${merged[@]}"}" || merged+=("${item}")
+        done
+    fi
+
+    for item in "${required[@]}"; do
+        array_contains "${item}" "${merged[@]+"${merged[@]}"}" || merged+=("${item}")
+    done
+
+    for item in "${merged[@]}"; do
+        joined+="${joined:+, }${item}"
+    done
+    printf '%s' "${joined}"
+}
+
+# render_documentdb_pg_conf: the one DocumentDB settings-block renderer behind
+# documentdb-tune, documentdb-setup and the generated documentdb.conf.sample.
+#   --preload VALUE         shared_preload_libraries; required, non-empty
+#   --localhost-conn VALUE  documentdb.localhost_connection_string; omitted if empty
+#   --toast VALUE           default_toast_compression; omitted if empty
+#   --extended-rum true     add the extended RUM overlay
+# No option has a default here; defaults belong to the caller.
+render_documentdb_pg_conf() {
+    local preload="" localhost_conn="" toast="" extended_rum="false"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --preload|--localhost-conn|--toast|--extended-rum)
+                # Every known option takes a value; keep unknown options on
+                # the unknown-option path.
+                if [[ $# -lt 2 ]]; then
+                    echo "render_documentdb_pg_conf: option '$1' requires a value" >&2
+                    return 1
+                fi
+                case "$1" in
+                    --preload)        preload="$2" ;;
+                    --localhost-conn) localhost_conn="$2" ;;
+                    --toast)          toast="$2" ;;
+                    --extended-rum)   extended_rum="$2" ;;
+                esac
+                shift 2 ;;
+            *)
+                echo "render_documentdb_pg_conf: unknown option '$1'" >&2
+                return 1 ;;
+        esac
+    done
+
+    [[ -n "${preload}" ]] || {
+        echo "render_documentdb_pg_conf: --preload is required and must not be empty" >&2
+        return 1
+    }
+    [[ "${extended_rum}" == "true" || "${extended_rum}" == "false" ]] || {
+        echo "render_documentdb_pg_conf: --extended-rum must be true or false (got: ${extended_rum})" >&2
+        return 1
+    }
+
+    local _guard
+    for _guard in "${preload}" "${localhost_conn}" "${toast}"; do
+        case "${_guard}" in
+            *\'*|*\\*|*$'\n'*)
+                echo "render_documentdb_pg_conf: values must not contain single quotes, backslashes, or newlines (got: ${_guard})" >&2
+                return 1 ;;
+        esac
+    done
+
+    local -a lines=()
+    lines+=("shared_preload_libraries = '${preload}'")
+    lines+=("cron.database_name = 'postgres'")
+    # Background-worker mode: the hardened pg_hba.conf admits no pg_cron client
+    # connection, so client mode fails every job and createIndexes hangs.
+    lines+=("cron.use_background_workers = on")
+    lines+=("documentdb.enableBackgroundWorker = true")
+    lines+=("documentdb.enableBackgroundWorkerJobs = true")
+    lines+=("documentdb.indexBuildsScheduledOnBgWorker = false")
+    if [[ -n "${localhost_conn}" ]]; then
+        lines+=("documentdb.localhost_connection_string = '${localhost_conn}'")
+    fi
+    if [[ -n "${toast}" ]]; then
+        lines+=("default_toast_compression = '${toast}'")
+    fi
+    if [[ "${extended_rum}" == "true" ]]; then
+        lines+=("documentdb.rum_library_load_option = 'require_documentdb_extended_rum'")
+        lines+=("documentdb.alternate_index_handler_name = 'extended_rum'")
+    fi
+
+    # Trailing newline; callers capture this in $( ), which strips it.
+    printf '%s\n' "${lines[@]}"
+}
+
+# documentdb_rendered_value <name>: print the value the settings block on
+# stdin assigns to <name>, wrapping quotes stripped; non-zero when the block
+# does not set it. Lets a consumer compare against what the renderer writes
+# instead of carrying its own copy of the value.
+documentdb_rendered_value() {
+    local name="$1" line key value
+    while IFS= read -r line; do
+        [[ "${line}" == *=* ]] || continue
+        key="$(trim_whitespace "${line%%=*}")"
+        [[ "${key}" == "${name}" ]] || continue
+        value="$(trim_whitespace "${line#*=}")"
+        printf '%s' "$(strip_wrapping_quotes "${value}")"
+        return 0
+    done
+    return 1
+}
+
+# documentdb_normalize_pg_bool <value>: print on/off for any spelling
+# PostgreSQL accepts for a boolean GUC; anything else passes through unchanged.
+documentdb_normalize_pg_bool() {
+    case "${1,,}" in
+        on|true|yes|1) printf 'on' ;;
+        off|false|no|0) printf 'off' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# assert_managed_markers_balanced <file> <start> <end>: fail closed (die) when a
+# managed block's start/end marker counts differ — the file is truncated/corrupt
+# and must not be edited automatically.
+assert_managed_markers_balanced() {
+    local target_file="$1" start="$2" end="$3"
+    [[ -f "${target_file}" ]] || return 0
+    # Validate that the managed markers are balanced AND correctly ordered —
+    # each start is closed by a LATER end, with no nesting and no end-before-
+    # start — tolerating a trailing CR so a CRLF-encoded block is still
+    # recognised. A start==end COUNT alone is insufficient: reversed markers have
+    # equal counts yet corrupt a strip (deleting real rules), and a CRLF block
+    # that goes unrecognised lingers with stale, possibly auth-relevant rules.
+    if ! awk -v s="${start}" -v e="${end}" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == s { if (open) { bad = 1; exit } open = 1; next }
+        line == e { if (!open) { bad = 1; exit } open = 0; next }
+        END { exit((bad || open) ? 1 : 0) }
+    ' "${target_file}"; then
+        die "refusing to strip managed block in ${target_file}: unbalanced or misordered start/end markers (file appears truncated/corrupt). Fix the markers manually and retry."
+    fi
+}
+
+# strip_managed_block <file> <start> <end>: print <file> with the managed block
+# (inclusive of its markers) removed. Asserts marker balance/order first, and
+# matches markers tolerating a trailing CR (so a CRLF-encoded block is stripped
+# rather than left behind as a stale duplicate). Non-marker lines are printed
+# verbatim (their original line endings preserved).
+strip_managed_block() {
+    local target_file="$1" start="$2" end="$3"
+    [[ -f "${target_file}" ]] || return 0
+    assert_managed_markers_balanced "${target_file}" "${start}" "${end}"
+    awk -v s="${start}" -v e="${end}" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == s { skip = 1; next }
+        line == e { skip = 0; next }
+        !skip { print }
+    ' "${target_file}"
+}
+
+# extract_managed_block_content <file> <start> <end>: print only the content
+# between the managed markers (exclusive of the markers), tolerating a trailing
+# CR on the marker lines.
+extract_managed_block_content() {
+    local target_file="$1" start="$2" end="$3"
+    [[ -f "${target_file}" ]] || return 0
+    awk -v s="${start}" -v e="${end}" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == s { b = 1; next }
+        line == e { b = 0; next }
+        b { print }
+    ' "${target_file}"
+}
+
+# rewrite_with_managed_block <file> <start> <end> <content>: atomically replace
+# (or append) the managed block in <file> with <content>. An empty <content>
+# removes the block. Temp files are created in the target's directory so the
+# final mv is an atomic same-filesystem rename and config contents never leak
+# into /tmp.
+rewrite_with_managed_block() {
+    local target_file="$1" start="$2" end="$3" content="$4"
+    local _rwmb_stripped _rwmb_tmp
+    local _rwmb_dir
+    _rwmb_dir="$(dirname "${target_file}")"
+
+    # Validate marker balance up front: strip_managed_block fails closed
+    # (die -> exit) on an unbalanced file. The EXIT trap installed by the
+    # sourcing script cleans up any registered temp file on a die/abort, so
+    # checking here keeps the abort path side-effect free before any temp
+    # file is even created.
+    assert_managed_markers_balanced "${target_file}" "${start}" "${end}"
+
+    # Create temp files in the target file's directory so the eventual mv is an
+    # atomic same-filesystem rename, and so an interrupted run does not leak
+    # config contents into /tmp. create_temp_in_dir registers each path in the
+    # sourcing script's global cleanup array (no per-path trap interpolation, so
+    # a path containing shell metacharacters cannot break out).
+    create_temp_in_dir _rwmb_stripped "${_rwmb_dir}"
+    create_temp_in_dir _rwmb_tmp "${_rwmb_dir}"
+
+    strip_managed_block "${target_file}" "${start}" "${end}" > "${_rwmb_stripped}"
+
+    {
+        cat "${_rwmb_stripped}"
+        if [[ -n "${content}" ]]; then
+            [[ -s "${_rwmb_stripped}" ]] && printf '\n'
+            printf '%s\n' "${start}"
+            printf '%s\n' "${content}"
+            printf '%s\n' "${end}"
+        fi
+    } > "${_rwmb_tmp}"
+
+    if [[ -e "${target_file}" ]]; then
+        chown --reference="${target_file}" "${_rwmb_tmp}" 2>/dev/null || true
+        chmod --reference="${target_file}" "${_rwmb_tmp}" 2>/dev/null || true
+    fi
+    mv "${_rwmb_tmp}" "${target_file}"
+    rm -f "${_rwmb_stripped}"
+}
+
+# prepend_with_managed_block <file> <start> <end> <content>: like
+# rewrite_with_managed_block, but inserts the managed block BEFORE the first
+# non-comment, non-blank line instead of appending it. This matters for
+# pg_hba.conf, where rules are evaluated top-to-bottom and the FIRST match wins,
+# so the documentdb rules must precede any pre-existing administrator rules.
+# Idempotent (an existing managed block with the same markers is stripped
+# first), fails closed on a torn/unbalanced block, uses temp files in the target
+# directory for an atomic same-filesystem rename, and preserves the target's
+# owner and mode. Single-sourced here so documentdb-setup and
+# documentdb-register-gateway cannot drift on this security-sensitive helper.
+prepend_with_managed_block() {
+    local target_file="$1" start="$2" end="$3" content="$4"
+    local _pwmb_stripped _pwmb_tmp _pwmb_block
+    local _pwmb_dir
+    _pwmb_dir="$(dirname "${target_file}")"
+
+    # Reject a torn/unbalanced managed block before creating any temp file
+    # (strip_managed_block also fails closed; this keeps the abort side-effect
+    # free), mirroring rewrite_with_managed_block.
+    assert_managed_markers_balanced "${target_file}" "${start}" "${end}"
+
+    create_temp_in_dir _pwmb_stripped "${_pwmb_dir}"
+    create_temp_in_dir _pwmb_tmp "${_pwmb_dir}"
+    create_temp_in_dir _pwmb_block "${_pwmb_dir}"
+
+    strip_managed_block "${target_file}" "${start}" "${end}" > "${_pwmb_stripped}"
+
+    if [[ -z "${content}" ]]; then
+        cat "${_pwmb_stripped}" > "${_pwmb_tmp}"
+    else
+        {
+            printf '%s\n' "${start}"
+            printf '%s\n' "${content}"
+            printf '%s\n' "${end}"
+        } > "${_pwmb_block}"
+
+        # Insert the block before the first non-comment, non-blank line; if the
+        # file is empty or all comments/blanks, append it at the end.
+        awk -v blockfile="${_pwmb_block}" '
+            BEGIN { inserted = 0 }
+            !inserted && /^[^#]/ && !/^[[:space:]]*$/ {
+                while ((getline line < blockfile) > 0) print line
+                close(blockfile)
+                print ""
+                inserted = 1
+            }
+            { print }
+            END {
+                if (!inserted) {
+                    while ((getline line < blockfile) > 0) print line
+                    close(blockfile)
+                }
+            }
+        ' "${_pwmb_stripped}" > "${_pwmb_tmp}"
+    fi
+
+    if [[ -e "${target_file}" ]]; then
+        # Preserve owner/mode, and FAIL CLOSED if we cannot: a security-sensitive
+        # pg_hba.conf must never be left with the temp file's 0600/root mode,
+        # which PostgreSQL — running as the DB user — could not read (an auth
+        # outage). Use explicit `|| die` (rather than relying on set -e) so the
+        # helper fails closed even if a caller invokes it in an `if`/`&&`/`||`
+        # context where errexit is disabled. This preserves documentdb-setup's
+        # prior preserve_file_metadata behavior and additionally hardens
+        # documentdb-register-gateway's HBA path (its prior copy suppressed these
+        # errors). Both callers run as root, where the calls succeed; failing
+        # closed only bites a genuinely broken environment, where aborting (with
+        # the original file intact) beats writing an unreadable HBA.
+        chown --reference="${target_file}" "${_pwmb_tmp}" \
+            || die "prepend_with_managed_block: cannot preserve ownership of ${target_file}"
+        chmod --reference="${target_file}" "${_pwmb_tmp}" \
+            || die "prepend_with_managed_block: cannot preserve mode of ${target_file}"
+    fi
+    mv "${_pwmb_tmp}" "${target_file}"
+    rm -f "${_pwmb_stripped}" "${_pwmb_block}"
+}
+
+# backup_file <file>: copy <file> to a timestamped sibling backup before an
+# in-place edit. No-op when <file> does not exist.
+backup_file() {
+    local file="$1"
+    [[ -f "${file}" ]] || return 0
+    local timestamp
+    timestamp="$(date +%Y%m%d%H%M%S)"
+    local backup
+    backup="$(mktemp "$(dirname "${file}")/$(basename "${file}").documentdb-backup.${timestamp}.XXXXXX")" \
+        || die "Cannot create backup file for ${file}."
+    cp -a "${file}" "${backup}"
+    log_verbose "Backed up ${file} -> ${backup}"
+}
+
+# check_foreign_markers <file>: die if <file> contains managed-block markers
+# owned by a tool outside the documentdb-* family (we never edit a file another
+# tool manages). Markers from documentdb-setup / -tune / -register-gateway are
+# treated as friendly (same package set, never collide on one logical block).
+check_foreign_markers() {
+    local file="$1"
+    [[ -f "${file}" ]] || return 0
+    local foreign_count
+    # Total managed-block start markers (any tool).
+    local total_count
+    total_count="$(grep -cE '^\s*#\s*>>>\s+\S+\s+managed\s+' "${file}" 2>/dev/null || true)"
+    # Markers owned by sibling tools in the documentdb-* family
+    # (documentdb-setup, documentdb-tune, documentdb-register-gateway):
+    # we treat these as friendly because all three are shipped by the
+    # same package set and never collide on the same logical block.
+    local family_count
+    family_count="$(grep -cE '^\s*#\s*>>>\s+documentdb-(setup|tune|register-gateway)\s+managed\s+' "${file}" 2>/dev/null || true)"
+    # Any managed-block marker that is not part of the documentdb family is
+    # foreign. Refuse if even one is present (the family count already excludes
+    # our own blocks, so a re-apply over our own markers does not trip this).
+    foreign_count=$(( total_count - family_count ))
+    if (( foreign_count > 0 )); then
+        die "${file} contains managed-block markers from another tool. Refusing to modify."
+    fi
+}
+
+# Port the gateway listens on when the administrator does not choose one. The
+# tools, the gateway registration and the documented client URI all read it here.
+# shellcheck disable=SC2034  # read by the sourcing script
+DOCUMENTDB_DEFAULT_GATEWAY_PORT=10260
+
+# Managed-block markers. documentdb-tune writes documentdb-setup's pair so the
+# existing postrm cleanup keeps matching both.
+# shellcheck disable=SC2034  # read by the sourcing script
+DOCUMENTDB_MANAGED_BLOCK_START="# >>> documentdb-setup managed configuration >>>"
+# shellcheck disable=SC2034  # read by the sourcing script
+DOCUMENTDB_MANAGED_BLOCK_END="# <<< documentdb-setup managed configuration <<<"
+
+# Base the per-major PostgreSQL port is derived from; see
+# documentdb_default_pg_port below.
+DOCUMENTDB_PG_PORT_BASE_PER_MAJOR=9700
+
+# Defaults of a distro-managed PostgreSQL instance the tools adopt rather than
+# create: PostgreSQL's own default port and OS account.
+# shellcheck disable=SC2034  # read by the sourcing scripts
+DOCUMENTDB_DISTRO_PG_PORT=5432
+# shellcheck disable=SC2034  # read by the sourcing scripts
+DOCUMENTDB_DISTRO_PG_OWNER=postgres
+
+# documentdb_distro_pg_socket_dir: print the distro socket directory, Debian's
+# /var/run/postgresql when present, else RHEL's /run/postgresql. When neither
+# exists it prints the Debian convention and returns 1, so a caller can die
+# or accept the conventional default.
+documentdb_distro_pg_socket_dir() {
+    if [[ -d /var/run/postgresql ]]; then
+        printf '/var/run/postgresql'
+    elif [[ -d /run/postgresql ]]; then
+        printf '/run/postgresql'
+    else
+        printf '/var/run/postgresql'
+        return 1
+    fi
+}
+
+# documentdb_default_pg_port <major>: print the per-major default PostgreSQL
+# port (base + major, e.g. 9718 for PG 18) so the private stand-alone instance
+# gets a predictable, collision-avoiding port that never lands on 5432. Single-
+# sourced so the formula lives in exactly one place.
+documentdb_default_pg_port() {
+    # $(( )) is an eval context and an empty operand is an arithmetic error, so
+    # the major is validated as digits and quoted before it is substituted.
+    if [[ -z "${1:-}" || ! "${1}" =~ ^[0-9]+$ ]]; then
+        echo "documentdb_default_pg_port: requires a numeric PostgreSQL major version (got: '${1:-}')" >&2
+        return 1
+    fi
+    printf '%s' "$(( DOCUMENTDB_PG_PORT_BASE_PER_MAJOR + ${1} ))"
+}
+
+# documentdb_pg_bindir_candidates <major>: print the candidate PostgreSQL bin
+# directories for <major>, most-preferred first — the Debian/Ubuntu layout
+# (/usr/lib/postgresql/N/bin) then the RHEL/PGDG layout (/usr/pgsql-N/bin), one
+# per line. Callers probe for the specific binary they need (pg_config, psql,
+# ...). Single-sourced so the layout list cannot drift across documentdb-tune,
+# documentdb-register-gateway, and documentdb-setup.
+documentdb_pg_bindir_candidates() {
+    local major="$1"
+    printf '/usr/lib/postgresql/%s/bin\n/usr/pgsql-%s/bin\n' "${major}" "${major}"
+}
+
+# documentdb_detect_extended_rum <sharedir>: set HAS_EXTENDED_RUM to "true" when
+# the extended-RUM extension control file is present under <sharedir>, else
+# "false". Single-sourced so documentdb-tune and documentdb-setup probe the
+# extension identically before feeding HAS_EXTENDED_RUM into
+# merge_shared_preload_libraries.
+documentdb_detect_extended_rum() {
+    local sharedir="$1"
+    if [[ -n "${sharedir}" && -f "${sharedir}/extension/documentdb_extended_rum.control" ]]; then
+        HAS_EXTENDED_RUM=true
+    else
+        HAS_EXTENDED_RUM=false
+    fi
+}
+
+# ── Extension-creation guidance (shared) ────────────────────────────
+#
+# documentdb-tune pins documentdb.alternate_index_handler_name (cluster-wide)
+# from a control-file probe, but the access method it names needs per-database
+# state that only CREATE EXTENSION documentdb_extended_rum supplies — and
+# CASCADE does not pull it in. When the two disagree, a new index build fails
+# with "Index access method extended_rum is not available", so any tool telling
+# an operator how to create the extension must name the extended-RUM one too.
+#
+# Single-sourced here. The gateway package banners (maintainer-scripts/gateway/
+# postinst, packaging/rpm/spec/documentdb-gateway.spec) are static duplicates —
+# they run before documentdb-postgresql-tools is necessarily installed — so
+# verify_install_banner_extension_hint in the packaged-install E2E suites fails
+# the build if one of them drops a statement, reverses the two, or loses its
+# flags or coordinates. That is a bounded check, not proof of equivalence.
+
+# documentdb_alternate_index_handler_extension <handler_name>: echo the
+# extension <handler_name> needs, or nothing (the built-in documentdb_rum
+# handler ships in pg_documentdb itself).
+documentdb_alternate_index_handler_extension() {
+    case "$(trim_whitespace "${1:-}")" in
+        extended_rum) printf 'documentdb_extended_rum' ;;
+        *)            printf '' ;;
+    esac
+}
+
+# documentdb_index_handler_for_extension <extension>: the reverse — echo the
+# access-method name <extension> provides, for diagnostics that name the
+# handler when it was resolved from disk. Paired with the forward direction
+# above so the mapping cannot drift.
+documentdb_index_handler_for_extension() {
+    case "$(trim_whitespace "${1:-}")" in
+        documentdb_extended_rum) printf 'extended_rum' ;;
+        *)                       printf '' ;;
+    esac
+}
+
+# documentdb_create_extension_sql [extra_extension]: the CREATE EXTENSION
+# statements, one per line, for feeding to psql. One transaction, so a failed
+# extended-RUM statement cannot leave documentdb committed without it.
+documentdb_create_extension_sql() {
+    printf 'BEGIN;\n'
+    printf 'CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;\n'
+    if [[ -n "${1:-}" ]]; then
+        printf 'CREATE EXTENSION IF NOT EXISTS %s CASCADE;\n' "$1"
+    fi
+    printf 'COMMIT;\n'
+}
+
+# documentdb_shell_quote <word>...: the words as one shell command line, each
+# argument quoted so that whatever it contains stays literal argument data.
+# Single quotes rather than printf %q because these lines are meant to be read
+# and pasted by an operator: %q escapes every space in the SQL, and the static
+# DEB/RPM banners quote the same statements this way.
+documentdb_shell_quote() {
+    local word="" line="" sep=""
+    for word in ${@+"$@"}; do
+        if [[ -n "${word}" && "${word}" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+            line+="${sep}${word}"
+        else
+            line+="${sep}'${word//\'/\'\\\'\'}'"
+        fi
+        sep=" "
+    done
+    printf '%s' "${line}"
+}
+
+# documentdb_create_extension_command <pg_owner> <target_db> <extra_extension>
+# [psql connection argument...]: the copy-pasteable psql command, one -c per
+# line of documentdb_create_extension_sql. The -c strings share one session, so
+# its BEGIN/COMMIT spans them and ON_ERROR_STOP exits before COMMIT.
+#
+# Connection coordinates are separate arguments — "--cluster" "N/name" on
+# Debian, "-h" "DIR" "-p" "PORT" anywhere — never one free-text string: a
+# socket directory or owner read off the host's configuration has to reach the
+# operator's shell as data, not as syntax. Pass them whenever you have them:
+# without coordinates psql follows the default socket and port, which on a
+# multi-cluster host (or the stand-alone instance on port 9700+major) is a
+# different cluster than the caller meant.
+#
+# Returns 1 and prints nothing when the host has no way to run a command as
+# another user — documentdb_create_extension_advice handles that case.
+#
+# pg_documentdb_extended_rum errors out of _PG_init unless already in
+# shared_preload_libraries, so print this only AFTER the restart instruction.
+documentdb_create_extension_command() {
+    local owner="${1:-postgres}" target_db="${2:-postgres}" extra="${3:-}"
+    if (( $# > 3 )); then shift 3; else shift $#; fi
+
+    local -a psql_args=(psql ${@+"$@"} -d "${target_db}" -X -v ON_ERROR_STOP=1)
+    local statement=""
+    while IFS= read -r statement; do
+        [[ -n "${statement}" ]] || continue
+        psql_args+=(-c "${statement}")
+    done < <(documentdb_create_extension_sql "${extra}")
+
+    # sudo first, unlike run_as_user: this command is printed for an operator
+    # to paste into their own shell, where runuser/su would fail unless they
+    # are already root.
+    if command -v sudo >/dev/null 2>&1; then
+        documentdb_shell_quote sudo -u "${owner}" "${psql_args[@]}"
+    elif command -v runuser >/dev/null 2>&1; then
+        documentdb_shell_quote runuser -u "${owner}" -- "${psql_args[@]}"
+    elif command -v su >/dev/null 2>&1; then
+        documentdb_shell_quote su -s /bin/bash "${owner}" -c \
+            "$(documentdb_shell_quote "${psql_args[@]}")"
+    else
+        return 1
+    fi
+}
+
+# documentdb_create_extension_advice <pg_owner> <target_db> <extra_extension>
+# [psql connection argument...]: what to actually show an operator — the
+# command above, plus the caveat it needs, one advisory line per output line so
+# callers can prefix each with their own logger. Never empty: a host with no
+# privilege runner gets the statements themselves rather than a command that
+# cannot run.
+documentdb_create_extension_advice() {
+    local owner="${1:-postgres}" target_db="${2:-postgres}" extra="${3:-}"
+    if (( $# > 3 )); then shift 3; else shift $#; fi
+
+    local recipe="" runner=""
+    if recipe="$(documentdb_create_extension_command "${owner}" "${target_db}" \
+            "${extra}" ${@+"$@"})"; then
+        printf '%s\n' "${recipe}"
+        if ! command -v sudo >/dev/null 2>&1; then
+            runner="su"
+            if command -v runuser >/dev/null 2>&1; then runner="runuser"; fi
+            printf 'Run that as root: this host has no sudo, so it uses %s.\n' "${runner}"
+        fi
+        return 0
+    fi
+
+    printf 'This host has no sudo, runuser or su, so there is no command to paste.\n'
+    if (( $# > 0 )); then
+        # Still name the instance: statements run against the default socket
+        # land in whichever cluster owns it.
+        printf 'As %s, run these statements against %s in database %s:\n' \
+            "${owner}" "$(documentdb_shell_quote "$@")" "${target_db}"
+    else
+        printf 'As %s, run these statements in database %s:\n' "${owner}" "${target_db}"
+    fi
+    documentdb_create_extension_sql "${extra}"
+}
+
+# documentdb_pg_sharedir <major>: echo the PostgreSQL share directory, or
+# return non-zero.
+#
+# Callers decide what a failure means, and both answers are defensible:
+# documentdb-tune's resolve_pg_sharedir swallows the same failure and so does
+# NOT pin the handler, meaning a caller that reads the failure as "no extended
+# RUM" stays consistent with the config tune wrote. What must not happen is the
+# two sides disagreeing in either direction.
+documentdb_pg_sharedir() {
+    local major="$1" candidate="" sharedir=""
+    while IFS= read -r candidate; do
+        if [[ -x "${candidate}/pg_config" ]]; then
+            sharedir="$("${candidate}/pg_config" --sharedir 2>/dev/null)" || sharedir=""
+            break
+        fi
+    done < <(documentdb_pg_bindir_candidates "${major}")
+    [[ -n "${sharedir}" ]] || return 1
+    printf '%s' "${sharedir}"
+}
+
+# documentdb_read_alternate_index_handler <psql> <socket_dir> <port> <db>
+# [run_as_user]: echo the live documentdb.alternate_index_handler_name.
+# Returns 0 if the GUC exists (an empty value is legitimate — that is its
+# default), 2 if it does not exist, 1 if it could not be read.
+#
+# The 0-with-empty vs 2 split is the point and is easy to lose:
+# current_setting(..., true) yields NULL for an unknown GUC and '' for a known
+# one at its default, and psql -tA renders both as an empty line — hence the
+# sentinel. Unknown means pg_documentdb is not preloaded yet, i.e. after
+# documentdb-tune wrote the config and before PostgreSQL restarted. Merging the
+# two states breaks both ways: as "no handler" the advice silently drops back
+# to the single-statement recipe exactly when it is needed, and as "handler
+# pinned" it tells an operator on an untuned cluster to create an extension
+# whose library is not preloaded.
+#
+# Prefer documentdb_required_index_extension unless you want the raw GUC.
+documentdb_read_alternate_index_handler() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4" as_user="${5:-}"
+    # Function-local, not a readonly global: re-sourcing this library would
+    # abort on a readonly reassignment under set -e.
+    local absent_sentinel='__documentdb_guc_absent__'
+    local sql="SELECT coalesce(current_setting('documentdb.alternate_index_handler_name', true), '${absent_sentinel}');"
+    local out=""
+    if [[ -n "${as_user}" ]] && declare -F run_as_user >/dev/null 2>&1; then
+        out="$(run_as_user "${as_user}" "${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 1
+    else
+        out="$("${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 1
+    fi
+    out="$(trim_whitespace "${out}")"
+    [[ "${out}" == "${absent_sentinel}" ]] && return 2
+    printf '%s' "${out}"
+    return 0
+}
+
+# documentdb_read_pg_major <psql> <socket_dir> <port> <db> [run_as_user]: echo
+# the connected server's major version, or nothing. For tools that hold a
+# working connection but no configured major (documentdb-gateway-admin resolves
+# socket and port from state files) and need it to locate the share directory.
+documentdb_read_pg_major() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4" as_user="${5:-}"
+    local sql="SELECT current_setting('server_version_num')::int / 10000;"
+    local out=""
+    if [[ -n "${as_user}" ]] && declare -F run_as_user >/dev/null 2>&1; then
+        out="$(run_as_user "${as_user}" "${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 0
+    else
+        out="$("${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 0
+    fi
+    out="$(trim_whitespace "${out}")"
+    [[ "${out}" =~ ^[0-9]+$ ]] && printf '%s' "${out}"
+    return 0
+}
+
+# documentdb_required_index_extension <psql> <socket_dir> <port> <db>
+# [run_as_user] [pg_major]: echo the extension <db> needs for index creation to
+# work, or nothing. The exit status says how much that answer is worth:
+#
+#   0  read from the live server: authoritative for this connection and
+#      database, empty output included (no alternate handler is configured).
+#   2  not live-confirmed. Named output comes from the installed control file —
+#      what a tuned cluster will demand once it has restarted — and empty
+#      output means the requirement could not be determined at all, NOT that
+#      there is none.
+#
+# Callers must handle both and must not turn any other status into an answer:
+# under set -e capture it explicitly (`|| rc=$?`), since a bare assignment
+# aborts the caller.
+#
+# Prefers the live GUC — what the running cluster actually demands — and falls
+# back to the on-disk probe when it is unreadable or not loaded yet. The
+# fallback is the same probe documentdb-tune used to pin the handler, so the
+# two agree.
+#
+# The fallback assigns HAS_EXTENDED_RUM via documentdb_detect_extended_rum. No
+# caller reads it afterwards today, but a tool with its own HAS_EXTENDED_RUM
+# state (documentdb-tune, documentdb-setup) must re-derive it after calling.
+documentdb_required_index_extension() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4"
+    local as_user="${5:-}" major="${6:-}"
+    local handler="" rc=0 sharedir=""
+
+    handler="$(documentdb_read_alternate_index_handler "${psql_bin}" "${socket_dir}" \
+        "${port}" "${target_db}" "${as_user}")" || rc=$?
+
+    if (( rc == 0 )); then
+        # GUC exists, so the running cluster is authoritative — including when
+        # it is empty, which means no alternate handler.
+        documentdb_alternate_index_handler_extension "${handler}"
+        return 0
+    fi
+
+    # rc 1 (unreadable) or 2 (absent — not preloaded yet). The control file is
+    # what this cluster will demand after its next restart. Status 2 either way:
+    # without a major, or with no readable share directory, this returns empty
+    # without having looked at disk at all, and empty must not be read as "no
+    # extra extension needed".
+    if [[ -n "${major}" ]] && sharedir="$(documentdb_pg_sharedir "${major}")"; then
+        documentdb_detect_extended_rum "${sharedir}"
+        if [[ "${HAS_EXTENDED_RUM}" == "true" ]]; then
+            printf 'documentdb_extended_rum'
+        fi
+    fi
+    return 2
+}
+
+# documentdb_tune_fragment_path <major> <cluster>: echo the per-cluster
+# fragment documentdb-tune writes on Debian split layouts (picked up by the
+# createcluster.d hook's include_if_exists). Shared so documentdb-setup can
+# track the same file for its restart decision.
+documentdb_tune_fragment_path() {
+    printf '/etc/postgresql-common/documentdb/%s/%s/documentdb.conf\n' "$1" "$2"
+}
+
+# Compression the tools write for default_toast_compression when the
+# administrator does not choose one. lz4 decompresses substantially faster than
+# pglz for a modest ratio tradeoff. The method is recorded per stored value, so
+# only new writes are affected and existing pglz values stay readable, which
+# makes this safe to adopt on an existing cluster.
+DOCUMENTDB_DEFAULT_TOAST_COMPRESSION="lz4"
+
+# documentdb_probe_lz4_support <major>: set LZ4_SUPPORT to "yes", "no", or
+# "unknown" for the PostgreSQL build serving <major>.
+#
+# A build without lz4 rejects default_toast_compression = 'lz4' and refuses to
+# start, so lz4 must never be written unverified. pg_config --configure is the
+# only offline signal (the server may be down), and only autoconf builds
+# populate it:
+#   --with-lz4 present           -> yes
+#   non-empty, no --with-lz4     -> no (pre-lz4 builds land here too)
+#   empty / no usable pg_config  -> unknown (meson compiles CONFIGURE_ARGS in
+#                                   empty, so offline proof is impossible)
+# shellcheck disable=SC2034  # LZ4_SUPPORT is read by the sourcing script
+documentdb_probe_lz4_support() {
+    local major="${1:-}"
+    local bindir="" pg_config_bin="" configure_args="" found=false
+
+    LZ4_SUPPORT="unknown"
+
+    if [[ -n "${major}" ]]; then
+        while IFS= read -r bindir; do
+            pg_config_bin="${bindir}/pg_config"
+            if [[ -x "${pg_config_bin}" ]]; then
+                # Assignment-in-if: exact status without tripping callers'
+                # set -e. A failed pg_config's output is discarded so a partial
+                # --with-lz4 print cannot authorize lz4. Empty stays "unknown".
+                if ! configure_args="$("${pg_config_bin}" --configure 2>/dev/null)"; then
+                    configure_args=""
+                fi
+                found=true
+                break
+            fi
+        done < <(documentdb_pg_bindir_candidates "${major}")
+    fi
+
+    # PATH fallback for builds with no per-major pg_config (source builds,
+    # unusual layouts). Trusted only when its major matches the target: a
+    # foreign build's --with-lz4 could approve a value the target server
+    # rejects. A failed --version or a mismatch stays "unknown", which is safe
+    # because callers then write nothing or defer to a runtime probe. With no
+    # major given, PATH is the best answer available. Statuses are captured via
+    # assignment-in-if because tune and setup run set -euo pipefail and a bare
+    # pipeline here once aborted them.
+    if [[ "${found}" != "true" ]] && command -v pg_config >/dev/null 2>&1; then
+        local path_version="" path_major="" path_ok=false
+        if path_version="$(pg_config --version 2>/dev/null)"; then
+            path_major="${path_version#* }"       # "PostgreSQL 17.2 ..." -> "17.2 ..."
+            path_major="${path_major%%[!0-9]*}"   # "17.2" / "18devel" -> "17" / "18"
+            if [[ -z "${major}" || "${path_major}" == "${major}" ]]; then
+                path_ok=true
+            fi
+        fi
+        if [[ "${path_ok}" == "true" ]]; then
+            if ! configure_args="$(pg_config --configure 2>/dev/null)"; then
+                configure_args=""
+            fi
+            found=true
+        fi
+    fi
+
+    [[ "${found}" == "true" ]] || return 0
+    if [[ -z "$(trim_whitespace "${configure_args}")" ]]; then
+        return 0
+    fi
+    if [[ "${configure_args}" == *"--with-lz4"* ]]; then
+        LZ4_SUPPORT="yes"
+    else
+        LZ4_SUPPORT="no"
+    fi
+}
+
+# documentdb_resolve_toast_compression <requested> [major]: set
+# TOAST_COMPRESSION to the value the caller should write for
+# default_toast_compression, or "" to leave the setting alone.
+#
+# <requested> is the administrator's explicit choice; "" takes the DocumentDB
+# default. Resolution order: <requested>, DOCUMENTDB_TOAST_COMPRESSION,
+# DOCUMENTDB_DEFAULT_TOAST_COMPRESSION. Accepted values:
+#   lz4     - write default_toast_compression = 'lz4'
+#   pglz    - write default_toast_compression = 'pglz'
+#   default - write nothing, the escape hatch for administrators who manage
+#             this setting themselves
+#
+# An explicit lz4 request on a "no" or "unknown" build is a hard error, because
+# a silent downgrade would hide that the choice was not applied. The lz4
+# DEFAULT on those builds degrades to writing nothing.
+# shellcheck disable=SC2034  # TOAST_COMPRESSION is read by the sourcing script, per the contract above
+documentdb_resolve_toast_compression() {
+    local requested="${1:-}"
+    local major="${2:-}"
+    local explicit=true
+
+    if [[ -z "${requested}" ]]; then
+        requested="${DOCUMENTDB_TOAST_COMPRESSION:-}"
+    fi
+    if [[ -z "${requested}" ]]; then
+        requested="${DOCUMENTDB_DEFAULT_TOAST_COMPRESSION}"
+        explicit=false
+    fi
+
+    case "${requested}" in
+        default)
+            TOAST_COMPRESSION=""
+            return 0 ;;
+        pglz)
+            TOAST_COMPRESSION="pglz"
+            return 0 ;;
+        lz4) ;;
+        *)
+            die "Invalid TOAST compression '${requested}'. Valid values are 'lz4', 'pglz', and 'default' (leave the server's own setting alone)." ;;
+    esac
+
+    documentdb_probe_lz4_support "${major}"
+    case "${LZ4_SUPPORT}" in
+        yes)
+            TOAST_COMPRESSION="lz4"
+            return 0 ;;
+        no)
+            if [[ "${explicit}" == "true" ]]; then
+                die "This PostgreSQL build has no lz4 support (pg_config --configure reports no --with-lz4), so default_toast_compression = 'lz4' would stop the server from starting. Re-run with 'pglz', or with 'default' to leave the setting alone."
+            fi
+            # Plain stderr, not log_verbose: silently downgrading a documented
+            # default is something the operator should see at default
+            # verbosity, and log_warn is not part of every host's contract.
+            echo "Warning: PostgreSQL was not built with lz4 support; leaving default_toast_compression unset." >&2
+            TOAST_COMPRESSION="" ;;
+        *)
+            if [[ "${explicit}" == "true" ]]; then
+                die "Cannot verify lz4 support for this PostgreSQL build (pg_config reports no configure flags - meson builds never do), and writing an unsupported value would stop the server from starting. If you know the build has lz4, set default_toast_compression = 'lz4' in your own configuration; otherwise re-run with 'pglz' or 'default'."
+            fi
+            echo "Warning: cannot verify lz4 support for this PostgreSQL build (no configure flags reported); leaving default_toast_compression unset. Set it manually if the build has lz4." >&2
+            TOAST_COMPRESSION="" ;;
+    esac
+}
+
+# documentdb_validate_gateway_username <username> [setup_configuration_json]
+#
+# Reject a username the GATEWAY would refuse at authentication time, before a
+# tool creates a role that can never log in. Returns 0 when the name is
+# allowed, 1 (with a diagnostic on stderr) when it is not.
+#
+# Why this exists: documentdb-setup and documentdb-gateway-admin created roles
+# without consulting the gateway's own policy, so
+# `documentdb-setup --admin-user pgadmin --yes` exited 0, printed
+# "SUCCESS: DocumentDB is ready" and a connect command, and left an install
+# whose only admin failed every login with "Username is invalid." The
+# equivalent check already guarded the container path
+# (documentdb_validate_username.sh); this is the packaged-CLI counterpart, so
+# both surfaces enforce one policy.
+#
+# The gateway's SetupConfiguration.json is the authority for
+# BlockedRolePrefixes (case-insensitive prefix match, e.g. documentdb / citus /
+# pg / internal_role). When that file is absent or unparseable we cannot know
+# the policy: warn and allow rather than block an install on a missing config,
+# since the gateway still enforces it at authentication time.
+documentdb_validate_gateway_username() {
+    local username="$1"
+    local config="${2:-/etc/documentdb/gateway/SetupConfiguration.json}"
+
+    [[ -n "${username}" ]] || return 0
+
+    if [[ ! -r "${config}" ]]; then
+        echo "Warning: gateway configuration '${config}' is not readable; skipping the reserved-prefix check for username '${username}'." >&2
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Warning: jq is unavailable; skipping the reserved-prefix check for username '${username}'." >&2
+        return 0
+    fi
+
+    local prefixes_type
+    prefixes_type="$(jq -r '.BlockedRolePrefixes | type' "${config}" 2>/dev/null || true)"
+    if [[ "${prefixes_type}" != "array" ]]; then
+        echo "Warning: BlockedRolePrefixes missing or malformed in '${config}'; skipping the reserved-prefix check for username '${username}'." >&2
+        return 0
+    fi
+
+    local -a blocked=()
+    mapfile -t blocked < <(jq -r '.BlockedRolePrefixes[]?' "${config}" 2>/dev/null)
+    (( ${#blocked[@]} > 0 )) || return 0
+
+    local blocked_list
+    blocked_list="$(printf '%s, ' "${blocked[@]}")"
+    blocked_list="${blocked_list%, }"
+
+    local username_lower="${username,,}"
+    local prefix prefix_lower
+    for prefix in "${blocked[@]}"; do
+        prefix_lower="${prefix,,}"
+        # An empty entry would match every name; the gateway treats it that
+        # way too, so surface it as a configuration error rather than
+        # silently rejecting every username.
+        if [[ -z "${prefix_lower}" ]]; then
+            echo "Warning: BlockedRolePrefixes in '${config}' contains an empty entry, which the gateway treats as blocking every username; skipping the check." >&2
+            return 0
+        fi
+        case "${username_lower}" in
+            "${prefix_lower}"*)
+                echo "Error: username '${username}' begins with the reserved prefix '${prefix}', which the gateway refuses at authentication ('Username is invalid'). Creating it would leave an account that can never log in." >&2
+                echo "Choose a username that does not begin with any of: ${blocked_list}." >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+# User names PostgreSQL (public, none) or the backend (its built-in roles,
+# IS_NATIVE_BUILTIN_ROLE in pg_documentdb/include/utils/role_utils.h) refuses,
+# but only once the cluster exists. Matched exactly, as they do. install.sh
+# carries a copy; a unit test keeps both equal to the header.
+DOCUMENTDB_RESERVED_USER_NAMES="public none
+    __system autoCompact backup backupAndRestore
+    clusterAdmin clusterManager clusterMonitor dbAdmin dbAdminAnyDatabase
+    dbOwner directShardOperations enableSharding killOpSession
+    manageShardBalancer MongodbAutomationAgentUserRole read readAnyDatabase
+    readWrite readWriteAnyDatabase restore root searchCoordinator userAdmin
+    userAdminAnyDatabase"
+
+# documentdb_validate_username <username> [setup_configuration_json]
+#
+# Refuse a name that would install fine and then never log in.
+documentdb_validate_username() {
+    local username="$1" bytes reserved
+    bytes=$(LC_ALL=C; echo "${#username}")
+
+    if [[ -z "${username}" || "${username}" == -* ]]; then
+        echo "Error: username '${username}' is empty or looks like an option; check that the option was given a value." >&2
+        return 1
+    fi
+    # Clients send these as SCRAM escapes (=2C, =3D) the gateway doesn't decode.
+    if [[ "${username}" == *[,=]* ]]; then
+        echo "Error: username '${username}' contains ',' or '=', which the gateway cannot match at login." >&2
+        return 1
+    fi
+    if (( bytes > 63 )); then
+        echo "Error: username '${username}' is ${bytes} bytes; PostgreSQL role names are at most 63." >&2
+        return 1
+    fi
+    for reserved in ${DOCUMENTDB_RESERVED_USER_NAMES}; do
+        if [[ "${username}" == "${reserved}" ]]; then
+            echo "Error: username '${username}' is reserved by PostgreSQL or DocumentDB." >&2
+            return 1
+        fi
+    done
+    documentdb_validate_gateway_username "$@"
+}
+
+DOCUMENTDB_PASSWORD_RULE="must be one non-empty line of printable ASCII; one trailing newline (LF or CRLF) is allowed."
+
+# documentdb_check_password <password> <label>
+#
+# Clients SASLprep a password before SCRAM and refuse control characters and
+# some non-ASCII, while the server stores the raw bytes, so such a password
+# never logs in. ASCII-only is a stopgap until the backend refuses SASLprep
+# failures (documentdb/documentdb#765).
+documentdb_check_password() {
+    local LC_ALL=C
+    [[ -n "$1" && "$1" != *[![:print:]]* ]] && return 0
+    echo "Error: $2 ${DOCUMENTDB_PASSWORD_RULE}" >&2
+    return 1
+}
+
+# documentdb_read_password <var> <label>
+#
+# Read a password file or pipe from stdin into <var>, dropping one trailing
+# LF and a CR before it.
+documentdb_read_password() {
+    # Prefixed locals so the nameref never resolves to one of them.
+    local -n _ddb_password_out="$1"
+    local _ddb_raw=""
+
+    # read -d '' succeeds only on a NUL, which would cut the password short.
+    if IFS= read -r -d '' _ddb_raw; then
+        echo "Error: $2 ${DOCUMENTDB_PASSWORD_RULE}" >&2
+        return 1
+    fi
+    if [[ "${_ddb_raw}" == *$'\n' ]]; then
+        _ddb_raw="${_ddb_raw%?}"
+        # Test first: a suffix strip that finds no match is quadratic in bash.
+        [[ "${_ddb_raw}" != *$'\r' ]] || _ddb_raw="${_ddb_raw%?}"
+    fi
+    documentdb_check_password "${_ddb_raw}" "$2" || return 1
+    _ddb_password_out="${_ddb_raw}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# port→PID identity primitives (root-capable, /proc-only)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Shared by documentdb-setup (find_listener_pid fallback, the nohup-record
+# reader, the ownership gates) and documentdb-local-reset (nohup gateway stop).
+# ONE definition of each so the two scripts cannot drift.
+#
+# HOST CONTRACT: a script sourcing these must provide `die` and `log_warn`
+# (nohup_gateway_pid_for_port calls log_warn on a reject). documentdb-setup and
+# documentdb-local-reset both do.
+#
+# The wizard historically could not map a port to its owning process without
+# lsof or ss, and papered over the gap with a "1" placeholder. Every mutating
+# path runs as root, and root can resolve the mapping from /proc: the port's
+# LISTEN-socket inode(s) from /proc/net/tcp{,6}, then the /proc/<pid>/fd table
+# that holds socket:[inode].
+
+# port_listen_inodes <port> — print the socket inode of every LISTEN socket on
+# the port (tcp and tcp6 union: a dual-stack listener holds one of each;
+# SO_REUSEPORT holds several). Prints nothing when the port has no listener or
+# /proc/net is unreadable. Always returns 0 — emptiness is the signal.
+port_listen_inodes() {
+    local port="$1" port_hex f
+    port_hex="$(printf '%04X' "${port}" 2>/dev/null || true)"
+    [[ -n "${port_hex}" ]] || return 0
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r "${f}" ]] || continue
+        awk -v p=":${port_hex}" \
+            'NR>1 && $4=="0A" && toupper($2) ~ p"$" {print $10}' \
+            "${f}" 2>/dev/null || true
+    done | sort -u
+}
+
+# pid_listens_on_port <pid> <port> → 0 the pid holds a LISTEN socket on the
+# port / 1 it definitely does not / 2 unknown (no inode visible, or the fd
+# targets could not be read). Callers MUST treat 2 as "no new information".
+#
+# A definite 1 requires that we actually RESOLVED at least one fd target and
+# none matched, OR that a readable fd dir globbed to zero entries (a zombie
+# holds nothing) — the readable-empty case is recorded IN the same scan pass,
+# never by a second stat at a later instant. In a container without
+# CAP_SYS_PTRACE — the very environment this fallback serves — root can list
+# another uid's /proc/<pid>/fd but every readlink is denied; inferring "no"
+# from all-denied returned a false definite-1, so all-denied is UNKNOWN.
+# fd tables are per thread-GROUP; /proc/<pid>/fd is the whole set (no task/
+# descent needed).
+pid_listens_on_port() {
+    local pid="$1" port="$2"
+    local inodes ino fd target
+    local resolved=0 readable_empty=0
+    inodes="$(port_listen_inodes "${port}")"
+    [[ -n "${inodes}" ]] || return 2
+    if [[ -d "/proc/${pid}/fd" && -r "/proc/${pid}/fd" ]]; then
+        local any_entry=0
+        for fd in "/proc/${pid}/fd"/*; do
+            [[ -e "${fd}" || -L "${fd}" ]] || continue
+            any_entry=1
+            target="$(readlink "${fd}" 2>/dev/null || true)"
+            [[ -n "${target}" ]] || continue
+            resolved=$(( resolved + 1 ))
+            for ino in ${inodes}; do
+                # EXACT match: socket:[12] must never match socket:[123].
+                [[ "${target}" == "socket:[${ino}]" ]] && return 0
+            done
+        done
+        (( any_entry == 0 )) && readable_empty=1
+    fi
+    (( resolved > 0 || readable_empty == 1 )) && return 1
+    return 2
+}
+
+# ── nohup gateway per-port record ──────────────────────────────────────
+#
+# The nohup launch (no working systemd) records the launched PID in a per-port
+# file, the only reliable port→process map on a host where ss/lsof cannot
+# report owners. Scoped by PORT: a host-wide name match also hits another
+# major's gateway, so a re-run for one major would collateral-kill another's.
+#
+# RECORD FORMAT: one line, space-separated: "PID [STARTTIME [BOOT_ID]]".
+# STARTTIME is /proc/<pid>/stat field 22 (clock ticks since boot); BOOT_ID is
+# /proc/sys/kernel/random/boot_id. The extra fields make a recycled PID
+# detectable WITHOUT CAP_SYS_PTRACE (stat is not ptrace-gated), which
+# pid_listens_on_port cannot do in the target container. A legacy one-field
+# record (PID only) is still honoured — no re-run bricks on an old record.
+nohup_gateway_pidfile() {
+    printf '/run/documentdb-gateway/gateway-%s.pid' "$1"
+}
+
+# proc_starttime <pid> — print /proc/<pid>/stat field 22, parsed robustly.
+# comm (field 2) can contain spaces and ')'; nothing after the LAST ')' can,
+# so split on ')' and take field 20 of the tail (overall field N = tail N-2;
+# starttime = overall 22 = tail 20). Prints nothing on any failure.
+proc_starttime() {
+    local pid="$1"
+    [[ -r "/proc/${pid}/stat" ]] || return 0
+    awk '{ n = split($0, a, ")"); split(a[n], f); print f[20] }' \
+        "/proc/${pid}/stat" 2>/dev/null | tr -dc '0-9' || true
+}
+
+# current_boot_id — the kernel's boot UUID, or nothing if unreadable.
+current_boot_id() {
+    [[ -r /proc/sys/kernel/random/boot_id ]] || return 0
+    tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+# nohup_gateway_record_pid <recordfile> — print the PID (first whitespace
+# field of line 1), validated numeric and > 1. Returns 1 (prints nothing)
+# otherwise. THE single record-PID parser: a bare `tr -dc 0-9` would
+# concatenate PID+STARTTIME+BOOT_ID digits into garbage.
+nohup_gateway_record_pid() {
+    # first/pid are initialised so a file unlinked BETWEEN the -r test and the
+    # open (a concurrent reset/setup rm) leaves them empty — a clean reject —
+    # rather than unset, which under the caller's `set -u` would abort the shell
+    # instead of returning 1.
+    local recordfile="$1" first="" pid=""
+    [[ -r "${recordfile}" ]] || return 1
+    # Non-blocking bounded read: the gateway user can fill this directory with FIFOs
+    # or /dev/zero links; a file unlinked since the -r test reads as empty.
+    IFS= read -r first <<< "$(dd if="${recordfile}" bs=256 count=1 iflag=nonblock 2>/dev/null | tr -d '\0')" || true
+    pid="${first%%[![:digit:]]*}"      # leading digit run of field 1
+    [[ -n "${pid}" ]] || return 1
+    (( 10#${pid} > 1 )) 2>/dev/null || return 1
+    printf '%s' "${pid}"
+}
+
+# True when <pid> is one of our gateway binaries, judged from the process
+# itself. Single definition of "this is our gateway".
+gateway_exe_matches() {
+    local pid="$1"
+    local exe_path="" exe_base="" command_line="" cmd_base=""
+    # /proc/PID/exe is preferred (never truncated) but is ptrace-gated.
+    if [[ -L "/proc/${pid}/exe" ]]; then
+        exe_path="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+        exe_base="$(basename "${exe_path}" 2>/dev/null || true)"
+    fi
+    # cargo build → documentdb_gateway (underscore); packaged →
+    # /usr/bin/documentdb-gateway (hyphen); wrapper/daemon split →
+    # documentdb-gateway-daemon. Accept all three.
+    case "${exe_base}" in
+        documentdb_gateway|documentdb-gateway|documentdb-gateway-daemon) return 0 ;;
+    esac
+    # Fall back to the command line — untruncated, and readable via ps/cmdline
+    # even where /proc/PID/exe is ptrace-denied (the no-CAP_SYS_PTRACE case).
+    command_line="$(ps -o args= -p "${pid}" 2>/dev/null || true)"
+    cmd_base="$(basename "${command_line%% *}" 2>/dev/null || true)"
+    case "${cmd_base}" in
+        documentdb_gateway|documentdb-gateway|documentdb-gateway-daemon) return 0 ;;
+    esac
+    return 1
+}
+
+# nohup_gateway_pid_for_port <port> — print the recorded PID for <port> only
+# when the record is still trustworthy; otherwise return 1 printing NOTHING to
+# stdout (callers key off stdout), logging the reason to stderr.
+#
+# Identity is confirmed WITHOUT relying on fd visibility:
+#   * BOOT_ID recorded and differs from now → the record is from a prior boot;
+#     any live PID with that number is a different process → reject.
+#   * STARTTIME recorded and differs from the live PID's current starttime →
+#     the PID was recycled (a dead gateway's number now on another process,
+#     possibly ANOTHER major's gateway that would exe-match) → reject. Within
+#     one boot this is DETERMINISTIC: a recycled PID's starttime is strictly
+#     later than the original's, so an exact match cannot false-accept.
+# pid_listens_on_port is then an ADDITIONAL check: a definite rc 1 rejects;
+# rc 0/2 do not override an already-confirmed identity. A legacy one-field
+# record keeps today's alive+exe+port behaviour (no new fail-closed brick).
+nohup_gateway_pid_for_port() {
+    local port="$1"
+    # rec_start/rec_boot are initialised to empty: the record read below
+    # re-opens the file after nohup_gateway_record_pid already read it, and if a
+    # concurrent reset/setup unlinks it in that window the redirection fails and
+    # `read` never runs. Empty ⇒ the boot/starttime guards are simply skipped
+    # (the pid is still alive+gateway+holds-the-port, i.e. the legacy path);
+    # leaving them UNSET would make the `[[ -n ]]` tests below a set -u abort of
+    # the whole wizard — silently, at the preflight if-condition call site.
+    local pidfile pid rec_start="" rec_boot="" cur_start cur_boot
+    pidfile="$(nohup_gateway_pidfile "${port}")"
+
+    pid="$(nohup_gateway_record_pid "${pidfile}")" || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    gateway_exe_matches "${pid}" || return 1
+
+    # Fields 2 (starttime) and 3 (boot_id) of the record, if present, read as in
+    # nohup_gateway_record_pid; empty (legacy) if the file is gone.
+    read -r _ rec_start rec_boot <<< "$(dd if="${pidfile}" bs=256 count=1 iflag=nonblock 2>/dev/null | tr -d '\0')" || true
+
+    if [[ -n "${rec_boot}" ]]; then
+        cur_boot="$(current_boot_id)"
+        if [[ -n "${cur_boot}" && "${rec_boot}" != "${cur_boot}" ]]; then
+            log_warn "Gateway record ${pidfile} is from a previous boot; PID ${pid} is a different process now — ignoring the stale record."
+            return 1
+        fi
+    fi
+    if [[ -n "${rec_start}" ]]; then
+        cur_start="$(proc_starttime "${pid}")"
+        if [[ -n "${cur_start}" && "${rec_start}" != "${cur_start}" ]]; then
+            log_warn "Gateway record ${pidfile} PID ${pid} has a different start time than recorded (recycled or restarted incarnation) — ignoring the stale record."
+            return 1
+        fi
+    fi
+
+    # Additional, when fd targets ARE visible: a definite non-owner rejects.
+    if pid_listens_on_port "${pid}" "${port}"; then
+        :
+    else
+        if (( $? == 1 )); then
+            log_warn "Recorded gateway PID ${pid} for port ${port} is alive and is a gateway binary but does not hold the port; treating the record as stale (recycled PID) and ignoring it."
+            return 1
+        fi
+    fi
+
+    printf '%s' "${pid}"
+}
+
+# postmaster_pid_owns_port <port> [data_dir] — true when <port> is served by
+# the PostgreSQL cluster in <data_dir> (default DATA_DIR), from that cluster's
+# own postmaster.pid (line 1 = PID, line 4 = port). Ownership by data
+# directory, not by "some postgres exists".
+postmaster_pid_owns_port() {
+    local port="$1"
+    local datadir="${2:-${DATA_DIR:-}}"
+    local pidfile pid recorded_port
+
+    [[ -n "${datadir}" ]] || return 1
+    pidfile="${datadir}/postmaster.pid"
+    [[ -r "${pidfile}" ]] || return 1
+
+    pid="$(sed -n '1p' "${pidfile}" 2>/dev/null | tr -dc '0-9')"
+    recorded_port="$(sed -n '4p' "${pidfile}" 2>/dev/null | tr -dc '0-9')"
+    [[ -n "${pid}" && -n "${recorded_port}" ]] || return 1
+    [[ "${recorded_port}" == "${port}" ]] || return 1
+    (( 10#${pid} > 1 )) || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+
+    # Staleness cross-check: a crashed postmaster leaves postmaster.pid; within
+    # one boot its PID can recycle. Only a DEFINITE "does not hold the port"
+    # (rc 1) rejects; unknown (rc 2) keeps degraded-host parity. (postmaster.pid
+    # carries no starttime field, so the fd check is the available guard here.)
+    if pid_listens_on_port "${pid}" "${port}"; then
+        :
+    else
+        (( $? == 1 )) && return 1
+    fi
+    return 0
+}
+
+# True when process 1 really IS a postmaster, not init/systemd. find_listener_pid
+# returns "1" both for the unknown-owner placeholder and for a genuine pid-1
+# listener (normal in a container). Reads /proc/1/comm (readable wherever the
+# /proc/net path that mints "1" is), falling back to ps; failing OPEN (ps
+# absent → "not postgres") is the wrong direction for a guard over someone
+# else's database, so /proc is preferred. comm caps at 15 chars; postgres(8)/
+# postmaster(10) fit.
+pid1_is_postgres() {
+    local comm=""
+    if [[ -r /proc/1/comm ]]; then
+        comm="$(tr -d '[:space:]' < /proc/1/comm 2>/dev/null || true)"
+    fi
+    if [[ -z "${comm}" ]]; then
+        comm="$(ps -o comm= -p 1 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    [[ "${comm}" == "postgres" || "${comm}" == "postmaster" ]]
+}
+
+# documentdb_pid_running <pid> — alive and not an unreaped zombie (a container
+# PID 1 may never reap an orphan, and kill -0 succeeds on a zombie).
+documentdb_pid_running() {
+    local stat=""
+    kill -0 "$1" 2>/dev/null || return 1
+    IFS= read -r stat 2>/dev/null < "/proc/$1/stat" || true
+    stat="${stat##*) }"
+    [[ "${stat:0:1}" != "Z" ]]
+}
+
+# documentdb_postmaster_pids <data_dir> [socket_lock] — print the PID of every
+# live postmaster serving <data_dir>, one per line. PIDs come only from this
+# install's own postmaster.pid or socket lock file (the lock outlives a deleted
+# data directory), never a /proc-wide scan that would reach other containers'
+# clusters; one counts only while that process still runs as
+# "postgres -D <data_dir>", so a recycled PID never matches. argv needs no ptrace.
+documentdb_postmaster_pids() {
+    local datadir="$1" lock="${2:-}" norm="$1" f pid i d
+    local -a argv
+    # Canonical, symlinks resolved: pg_ctl normalizes -D, and setup accepts a symlinked spelling.
+    [[ "${datadir}" == /* ]] && norm="$(realpath -m -- "${datadir}")"
+    for f in "${datadir}/postmaster.pid" "${lock}"; do
+        [[ -n "${f}" && -f "${f}" ]] || continue
+        pid=""
+        IFS= read -r pid 2>/dev/null < "${f}" || true
+        pid="${pid#-}"   # a single-user backend records -PID
+        [[ "${pid}" =~ ^[0-9]+$ ]] && (( 10#${pid} > 1 )) || continue
+        mapfile -d '' -t argv 2>/dev/null < "/proc/${pid}/cmdline" || continue
+        case "${argv[0]:-}" in */postgres|postgres|*/postmaster|postmaster) ;; *) continue ;; esac
+        for (( i = 1; i < ${#argv[@]}; i++ )); do
+            case "${argv[i]}" in
+                -D) d="${argv[i+1]:-}" ;;
+                -D?*) d="${argv[i]#-D}" ;;
+                *) continue ;;
+            esac
+            if [[ "${d}" == "${datadir}" || ( "${d}" == /* && "$(realpath -m -- "${d}")" == "${norm}" ) ]]; then
+                documentdb_pid_running "${pid}" && printf '%s\n' "${pid}"
+                break
+            fi
+        done
+    done | sort -u
+    return 0
+}
+
+# documentdb_stop_postmaster <data_dir> [socket_lock] — fast shutdown, then
+# immediate, of every postmaster serving <data_dir>, 30s each. Prints the PIDs
+# still running, if any.
+documentdb_stop_postmaster() {
+    local pids sig pid i
+    pids="$(documentdb_postmaster_pids "$@")"
+    for sig in INT QUIT; do
+        [[ -n "${pids}" ]] || break
+        for pid in ${pids}; do kill "-${sig}" "${pid}" 2>/dev/null || true; done
+        for (( i = 0; i < 150; i++ )); do
+            pids="$(documentdb_postmaster_pids "$@")"
+            [[ -n "${pids}" ]] || break
+            sleep 0.2
+        done
+    done
+    printf '%s' "${pids}"
+}
+
+# documentdb_stop_local_major <major> — stop what documentdb-setup started for
+# <major> when there was no systemd to do it: the nohup gateway recorded for the
+# major's port, then (greenfield only) its postmaster. For the package removal
+# scriptlets, which must not leave either serving from removed files. Returns 1
+# if anything is still running.
+documentdb_stop_local_major() {
+    local major="$1" conf_dir="/etc/documentdb/local/$1" conf port="" pid pids i rc=0
+    local data_dir="" pg_port="" lock managed=""
+    for conf in "${conf_dir}/setup.conf" "${conf_dir}/brownfield.conf"; do
+        [[ -r "${conf}" ]] || continue
+        port="$(grep -E '^GATEWAY_PORT=' "${conf}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        [[ -n "${port}" ]] && break
+    done
+    if [[ "${port}" =~ ^[0-9]+$ ]]; then
+        pid="$(nohup_gateway_pid_for_port "${port}" || true)"
+        if [[ -n "${pid}" ]]; then
+            echo "Stopping the DocumentDB gateway for PostgreSQL ${major} (pid ${pid})."
+            kill "${pid}" 2>/dev/null || true
+            for (( i = 0; i < 50; i++ )); do documentdb_pid_running "${pid}" || break; sleep 0.2; done
+            documentdb_pid_running "${pid}" && kill -KILL "${pid}" 2>/dev/null && sleep 1
+            if [[ -n "$(nohup_gateway_pid_for_port "${port}" 2>/dev/null || true)" ]]; then
+                echo "The DocumentDB gateway for PostgreSQL ${major} (pid ${pid}) did not stop." >&2
+                rc=1
+            fi
+        fi
+        (( rc )) || rm -f "$(nohup_gateway_pidfile "${port}")" 2>/dev/null || true
+    fi
+
+    # Brownfield PostgreSQL belongs to the operator; only a greenfield cluster is ours.
+    if [[ -r "${conf_dir}/setup.conf" ]]; then
+        managed="$(grep -E '^DOCUMENTDB_MANAGED_POSTGRES=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        data_dir="$(grep -E '^DATA_DIR=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        pg_port="$(grep -E '^PG_PORT=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+    fi
+    if [[ "${managed}" == "true" && -n "${data_dir}" ]]; then
+        lock="/run/documentdb-local/${major}/postgresql/.s.PGSQL.${pg_port:-0}.lock"
+        pids="$(documentdb_postmaster_pids "${data_dir}" "${lock}")"
+        if [[ -n "${pids}" ]]; then
+            echo "Stopping PostgreSQL ${major} (pid ${pids//$'\n'/ })."
+            pids="$(documentdb_stop_postmaster "${data_dir}" "${lock}")"
+            if [[ -n "${pids}" ]]; then
+                echo "PostgreSQL ${major} (pid ${pids//$'\n'/ }) did not stop." >&2
+                rc=1
+            fi
+        fi
+    fi
+    return "${rc}"
+}
+
+# resolve_uid_check_target <listener-pid> <port>
+#
+# Given the pid find_listener_pid reported for <port> (which may be empty, a
+# real pid, or the "1" placeholder that means "a listener exists but its owner
+# could not be resolved"), decide WHICH pid the caller should stat to compare
+# the port owner's UID against the documentdb runtime user. Prints that pid, or
+# nothing when there is no safe target (caller then skips the UID check).
+#
+# Extracted verbatim from two identical call sites — the live-cluster adoption
+# path and the greenfield PG-port preflight — so the security-critical "whose
+# process is this?" decision cannot drift between them: a future change to how a
+# pid-1-placeholder listener is attributed now updates both at once. The die
+# messages stay at the call sites because their remedy wording is
+# context-specific (adopt-vs-refuse vs pick-another-port).
+#
+#   real pid (not "1")  -> that pid (empty in -> empty out: no listener, no check)
+#   "1" placeholder:
+#     postmaster.pid on this port names pid 1 -> "" (it is our own postmaster,
+#         reached via the data-dir adoption path; a UID check on pid 1 is wrong)
+#     pid 1 definitely holds the port (rc 0)  -> "1"
+#     indeterminate (rc 2) AND pid 1 is postgres -> "1"
+#     otherwise                               -> "" (genuinely blind; caller
+#         keeps its legacy behaviour rather than stat the init process)
+resolve_uid_check_target() {
+    local pid="$1" port="$2" plp=0
+    if [[ "${pid}" != "1" ]]; then
+        printf '%s' "${pid}"
+        return 0
+    fi
+    if postmaster_pid_owns_port "${port}"; then
+        return 0
+    fi
+    pid_listens_on_port 1 "${port}" && plp=0 || plp=$?
+    if (( plp == 0 )); then
+        printf '1'
+    elif (( plp == 2 )) && pid1_is_postgres; then
+        printf '1'
+    fi
+    return 0
+}

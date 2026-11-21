@@ -1,0 +1,1595 @@
+SET search_path TO documentdb_core,documentdb_api,documentdb_api_catalog,documentdb_api_internal;
+SET citus.next_shard_id TO 95800000;
+SET documentdb.next_collection_id TO 95800;
+SET documentdb.next_collection_index_id TO 95800;
+SET documentdb_api.forceUseIndexIfAvailable TO on;
+SET documentdb.defaultUseCompositeOpClass TO on;
+-- Indexes are created AFTER each shard_collection call below so the collation-
+-- aware index propagates to every shard. Mirrors bson_collation_query_index_tests_dist.sql.
+-- ======================================================================
+-- SECTION 1: $lookup on sharded collection (collation aware)
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_lookup_d', '{"_id": "Cat", "a": { "b": "Cat" }}');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_lookup_d', '{"_id": "dog", "a": { "b": "dog" }}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_lookup_d', '{"_id": "DOG", "a": { "b": "DOG" }}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_lookup_d', '{"_id": "cAT", "a": { "b": "cAT" }}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_lookup_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_lookup_d",
+     "indexes": [{ "key": {"a.b": 1}, "name": "idx_ab_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('coll_q_idx_dist_explain_db',
+    '{ "aggregate": "coll_lookup_d", "pipeline": [ { "$lookup": { "from": "coll_lookup_d", "as": "matched_docs", "localField": "_id", "foreignField": "_id", "pipeline": [ { "$match": { "$or" : [ { "a.b": "cat" }, { "a.b": "dog" } ] } } ] } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }')
+$cmd$);
+                                                                                  run_explain_and_trim                                                                                  
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   ->  Distributed Subplan 41_1
+         ->  Custom Scan (Citus Adaptive)
+               Task Count: 8
+               Tasks Shown: One of 8
+               ->  Task
+                     Node: host=localhost port=58070 dbname=regression
+                     ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                           ->  Seq Scan on documents_95801_95800004 collection
+   ->  Distributed Subplan 41_2
+         ->  Custom Scan (Citus Adaptive)
+               Task Count: 8
+               Tasks Shown: One of 8
+               ->  Task
+                     Node: host=localhost port=58070 dbname=regression
+                     ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                           indexName: idx_ab_en_s1
+                           indexKey: {"a.b": 1}
+                           indexCollation: en-u-ks-level1
+                           isMultiKey: false
+                           indexBounds: ["a.b": ["cat", "cat"]], ["a.b": ["dog", "dog"]]
+                           ->  Bitmap Heap Scan on documents_95801_95800004 collection_0_1
+                                 Recheck Cond: (document OPERATOR(documentdb_api_catalog.@*=) '{ "a.b" : [ "cat", "dog" ], "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                 ->  Bitmap Index Scan on idx_ab_en_s1
+                                       Index Cond: (document OPERATOR(documentdb_api_catalog.@*=) '{ "a.b" : [ "cat", "dog" ], "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Nested Loop
+               ->  Function Scan on read_intermediate_result intermediate_result
+               ->  Aggregate
+                     ->  Function Scan on read_intermediate_result intermediate_result_1
+                           Filter: documentdb_api_internal.bson_dollar_lookup_join_filter(document_1, intermediate_result.lookup_filter, '_id'::text)
+(34 rows)
+
+END;
+-- ======================================================================
+-- SECTION 2: Aggregation pipeline routing on sharded collection
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_agg_d', '{ "_id": "cat", "a": "cat" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_agg_d', '{ "_id": "cAt", "a": "cAt" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_agg_d', '{ "_id": "dog", "a": "dog" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_agg_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_agg_d",
+     "indexes": [{ "key": {"a": 1}, "name": "idx_a_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('coll_q_idx_dist_explain_db', '{ "aggregate": "coll_agg_d", "pipeline": [ { "$match": { "_id": { "$eq": "CAT" } } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }')
+$cmd$);
+                                                                 run_explain_and_trim                                                                 
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               ->  Seq Scan on documents_95802_95800014 collection
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(8 rows)
+
+END;
+-- Count command fans out and uses the matching collation index on each shard.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_count('coll_q_idx_dist_explain_db', '{ "count": "coll_agg_d", "query": { "a": "CAT" }, "collation": { "locale": "en", "strength": 1 } }')
+$cmd$);
+                                                                           run_explain_and_trim                                                                           
+---------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (Citus Adaptive)
+         Task Count: 8
+         Tasks Shown: One of 8
+         ->  Task
+               Node: host=localhost port=58070 dbname=regression
+               ->  Aggregate
+                     ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                           indexName: idx_a_en_s1
+                           indexKey: {"a": 1}
+                           indexCollation: en-u-ks-level1
+                           isMultiKey: false
+                           indexBounds: ["a": ["CAT", "CAT"]]
+                           ->  Bitmap Heap Scan on documents_95802_95800014 collection
+                                 Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                 ->  Bitmap Index Scan on idx_a_en_s1
+                                       Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(17 rows)
+
+END;
+-- Numeric shard key value with collation: not collation-aware, single shard
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('coll_q_idx_dist_explain_db', '{ "find": "coll_agg_d", "filter": { "_id": { "$eq": 2 } }, "sort": { "_id": 1 }, "limit": 5, "collation": { "locale": "en", "strength" : 1} }')
+$cmd$);
+                                                                                         run_explain_and_trim                                                                                         
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Limit
+               ->  Sort
+                     Sort Key: (documentdb_api_internal.bson_orderby_index(document, '{ "_id" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)) NULLS FIRST
+                     ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                           indexName: _id_
+                           ->  Index Scan using _id_ on documents_95802_95800015 collection
+                                 Index Cond: ((shard_key_value = '-1389566185330078543'::bigint) AND (object_id OPERATOR(documentdb_core.=) '{ "" : { "$numberInt" : "2" } }'::documentdb_core.bson))
+                                 Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : { "$numberInt" : "2" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(13 rows)
+
+END;
+-- ======================================================================
+-- SECTION 3: Aggregation pipeline with collation on sharded single_field_d
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 1, "a": "apple"}', NULL);
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 2, "a": "Apple"}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 3, "a": "BANANA"}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 4, "a": "banana"}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 5, "a": "cherry"}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 6, "a": "Cherry"}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 7, "a": 42}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','single_field_d', '{"_id": 8, "a": null}', NULL);
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'single_field_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "single_field_d",
+     "indexes": [{ "key": {"a": 1}, "name": "idx_a_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('coll_q_idx_dist_explain_db', '{ "aggregate": "single_field_d", "pipeline": [ { "$sort": { "_id": 1 } }, { "$match": { "a": { "$eq": "cherry" } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }')
+$cmd$);
+                                                                      run_explain_and_trim                                                                       
+---------------------------------------------------------------------
+ Sort
+   Sort Key: remote_scan."?sort?" NULLS FIRST
+   ->  Custom Scan (Citus Adaptive)
+         Task Count: 8
+         Tasks Shown: One of 8
+         ->  Task
+               Node: host=localhost port=58070 dbname=regression
+               ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                     indexName: idx_a_en_s1
+                     indexKey: {"a": 1}
+                     indexCollation: en-u-ks-level1
+                     isMultiKey: false
+                     indexBounds: ["a": ["cherry", "cherry"]]
+                     ->  Index Scan using idx_a_en_s1 on documents_95803_95800024 collection
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "cherry", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(15 rows)
+
+END;
+-- ======================================================================
+-- SECTION 4: Predicate plans on sharded coll_delete_d with collation
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_delete_d', '{"_id": "dog", "a":"dog"}');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_delete_d', '{"_id": "DOG", "a":"DOG"}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_delete_d', '{"_id": "cat", "a":"cat"}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_delete_d', '{"_id": "CAT", "a":"CAT"}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_delete_d', '{ "a": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_delete_d",
+     "indexes": [{ "key": {"a": 1}, "name": "idx_a_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+-- Collation-aware shard-key predicate
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_delete_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"a": "CaT"}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                     run_explain_and_trim                                                                     
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["CaT", "CaT"]]
+               ->  Bitmap Heap Scan on documents_95804_95800034 documents_95804
+                     Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     ->  Bitmap Index Scan on idx_a_en_s1
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(15 rows)
+
+END;
+-- Predicate without an _id or shard-key filter
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_delete_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"b": "CaT"}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                run_explain_and_trim                                                                
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               ->  Seq Scan on documents_95804_95800034 documents_95804
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "b" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(8 rows)
+
+END;
+-- Collation-aware shard-key value predicate
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_delete_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"a": "CaT"}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                     run_explain_and_trim                                                                     
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["CaT", "CaT"]]
+               ->  Bitmap Heap Scan on documents_95804_95800034 documents_95804
+                     Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     ->  Bitmap Index Scan on idx_a_en_s1
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(15 rows)
+
+END;
+-- Predicate with both _id and shard-key filters
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_delete_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"_id": "CaT", "a": "CaT"}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                     run_explain_and_trim                                                                     
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["CaT", "CaT"]]
+               ->  Bitmap Heap Scan on documents_95804_95800034 documents_95804
+                     Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     ->  Bitmap Index Scan on idx_a_en_s1
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(16 rows)
+
+END;
+-- ======================================================================
+-- SECTION 5: Predicate plans on sharded single_field_d with collation
+-- ======================================================================
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'single_field_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"a": "apple"}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                   run_explain_and_trim                                                                   
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["apple", "apple"]]
+               ->  Index Scan using idx_a_en_s1 on documents_95803_95800024 documents_95803
+                     Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "apple", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(13 rows)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'single_field_d')
+  WHERE documentdb_api_internal.bson_query_match(document, '{"a": {"$gt": "cherry"}}'::bson, '{}'::bson, 'en-u-ks-level1')
+$cmd$);
+                                                                   run_explain_and_trim                                                                    
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ("cherry", { })]
+               ->  Index Scan using idx_a_en_s1 on documents_95803_95800024 documents_95803
+                     Index Cond: (document OPERATOR(documentdb_api_catalog.@>) '{ "a" : "cherry", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(13 rows)
+
+END;
+-- ======================================================================
+-- SECTION 6: bson_query_match on sharded collection — single shard key
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "cat", "a": "cat" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "dog", "a": "dog" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": 3, "a": "peacock" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_qm_d",
+     "indexes": [{ "key": {"a": 1}, "name": "idx_a_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+-- Distributed: shard key value is collation-aware (fans out to all shards)
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_qm_d') WHERE documentdb_api_internal.bson_query_match(document, '{ "_id": "CAT" }', '{}', 'en-u-ks-level1')
+$cmd$);
+                                                                 run_explain_and_trim                                                                 
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               ->  Seq Scan on documents_95805_95800044 documents_95805
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(8 rows)
+
+END;
+-- Not distributed: shard key value is not collation-aware (single shard)
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_qm_d') WHERE documentdb_api_internal.bson_query_match(document, '{ "_id": 3 }', '{}', 'en-u-ks-level1')
+$cmd$);
+                                                                                   run_explain_and_trim                                                                                   
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: _id_
+               ->  Index Scan using _id_ on documents_95805_95800045 collection
+                     Index Cond: ((shard_key_value = '-4918719581749358852'::bigint) AND (object_id OPERATOR(documentdb_core.=) '{ "" : { "$numberInt" : "3" } }'::documentdb_core.bson))
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : { "$numberInt" : "3" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(10 rows)
+
+END;
+-- ======================================================================
+-- SECTION 7: bson_query_match on sharded collection — compound shard key
+-- ======================================================================
+SELECT documentdb_api.drop_collection('coll_q_idx_dist_explain_db', 'coll_qm_d');
+ drop_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "cAt", "a": "cAt" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "doG", "a": "DOg" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": 3, "a": "doG" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_qm_d', '{ "_id": "hashed", "a": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'coll_q_idx_dist_explain_db',
+  '{
+    "createIndexes": "coll_qm_d",
+    "indexes": [{
+      "key": {"a": 1},
+      "name": "idx_a_en_s1",
+      "collation": {"locale": "en", "strength": 1}
+    }]
+  }',
+  TRUE
+);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+-- Distributed: shard key filter values are collation-aware
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_qm_d') WHERE documentdb_api_internal.bson_query_match(document, '{ "_id": "CAT", "a": "CAT" }', '{}', 'en-u-ks-level1')
+$cmd$);
+                                                                     run_explain_and_trim                                                                     
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["CAT", "CAT"]]
+               ->  Bitmap Heap Scan on documents_95806_95800054 documents_95806
+                     Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     ->  Bitmap Index Scan on idx_a_en_s1
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(16 rows)
+
+END;
+-- Mixed type filter: collation on string portion of compound shard key
+-- still prevents pruning, so the query fans out to all shards.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('coll_q_idx_dist_explain_db', 'coll_qm_d') WHERE documentdb_api_internal.bson_query_match(document, '{ "_id": 1, "a": "CAT" }', '{}', 'en-u-ks-level1')
+$cmd$);
+                                                                         run_explain_and_trim                                                                          
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Task Count: 8
+   Tasks Shown: One of 8
+   ->  Task
+         Node: host=localhost port=58070 dbname=regression
+         ->  Custom Scan (DocumentDBApiExplainQueryScan)
+               indexName: idx_a_en_s1
+               indexKey: {"a": 1}
+               indexCollation: en-u-ks-level1
+               isMultiKey: false
+               indexBounds: ["a": ["CAT", "CAT"]]
+               ->  Bitmap Heap Scan on documents_95806_95800054 documents_95806
+                     Recheck Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     Filter: (document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                     ->  Bitmap Index Scan on idx_a_en_s1
+                           Index Cond: (document OPERATOR(documentdb_api_catalog.@=) '{ "a" : "CAT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+(16 rows)
+
+END;
+-- Cleanup
+RESET documentdb_api.forceUseIndexIfAvailable;
+RESET documentdb.defaultUseCompositeOpClass;
+-- ======================================================================
+-- SECTION 12: $graphLookup on sharded collection (currently unsupported)
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_graph_src_d', '{"_id": "alice", "pet" : "dog" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_graph_dst_d', '{"_id": "DOG", "name" : "DOG" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db','coll_graph_dst_d', '{"_id": "dog", "name" : "dog" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_graph_src_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT documentdb_api.shard_collection('coll_q_idx_dist_explain_db', 'coll_graph_dst_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_graph_src_d",
+     "indexes": [{ "key": {"pet": 1}, "name": "idx_pet_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_graph_dst_d",
+     "indexes": [{ "key": {"name": 1}, "name": "idx_name_en_s1",
+                   "collation": {"locale": "en", "strength": 1} }] }', TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL enable_seqscan TO OFF;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('coll_q_idx_dist_explain_db',
+    '{ "aggregate": "coll_graph_src_d", "pipeline": [ { "$graphLookup": { "from": "coll_graph_dst_d", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 1} }')
+$cmd$);
+ERROR:  $graphLookup using 'from' on a sharded collection is currently unsupported
+CONTEXT:  PL/pgSQL function documentdb_distributed_test_helpers.run_explain_and_trim(text,boolean,boolean,boolean,boolean) line 5 at FOR over EXECUTE statement
+END;
+-- ======================================================================
+-- SECTION: distinct with a collation-aware index across shards
+-- ======================================================================
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_distinct_d', '{ "_id": 1, "a": "cafe" }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_distinct_d', '{ "_id": 2, "a": "CAFE" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one('coll_q_idx_dist_explain_db', 'coll_distinct_d', '{ "_id": 3, "a": "tea" }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection(
+  'coll_q_idx_dist_explain_db', 'coll_distinct_d', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_distinct_d", "indexes": [ { "key": { "a": 1 }, "name": "idx_a_en_s1", "collation": { "locale": "en", "strength": 1 } } ] }',
+  TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_distinct(
+  'coll_q_idx_dist_explain_db',
+  '{ "distinct": "coll_distinct_d", "key": "a", "collation": { "locale": "en", "strength": 1 } }')
+$cmd$);
+                                                                                                                                                                                                                                  run_explain_and_trim                                                                                                                                                                                                                                   
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 344_1
+         ->  Unique
+               Output: remote_scan.document
+               ->  Sort
+                     Output: remote_scan.document
+                     Sort Key: remote_scan.document USING <<<
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.document
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT DISTINCT documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level1'::text) AS document FROM documentdb_data.documents_95809_95800084 collection WHERE (documentdb_api_internal.bson_dollar_fullscan(document, '{ "a" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_distinct_exists(document, '{ "a" : true }'::documentdb_core.bson))
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Unique
+                                       Output: (documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level1'::text))
+                                       ->  Sort
+                                             Output: (documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level1'::text))
+                                             Sort Key: (documentdb_api_catalog.bson_distinct_unwind(collection.document, 'a'::text, 'en-u-ks-level1'::text)) USING <<<
+                                             ->  ProjectSet
+                                                   Output: documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level1'::text)
+                                                   ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                                         Output: document
+                                                         indexName: idx_a_en_s1
+                                                         ->  Bitmap Heap Scan on documentdb_data.documents_95809_95800084 collection
+                                                               Output: document
+                                                               Recheck Cond: (collection.document OPERATOR(documentdb_api_catalog.@>=) '{ "a" : { "$minKey" : 1 } }'::documentdb_core.bson)
+                                                               ->  Bitmap Index Scan on idx_a_en_s1
+                                                                     Index Cond: (collection.document OPERATOR(documentdb_api_catalog.@>=) '{ "a" : { "$minKey" : 1 } }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_api_catalog.bson_distinct_agg(document) AS document FROM (SELECT intermediate_result.document FROM read_intermediate_result('344_1'::text, 'binary'::citus_copy_format) intermediate_result(document documentdb_core.bson)) agg_stage_0
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_api_catalog.bson_distinct_agg(intermediate_result.document)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.document
+                     Function Call: read_intermediate_result('344_1'::text, 'binary'::citus_copy_format)
+(40 rows)
+
+END;
+-- An incompatible collation cannot borrow ordering from the strength-1 index.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL documentdb.enable_distinct_exists_filter_pushdown TO on;
+SET LOCAL enable_seqscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_distinct(
+  'coll_q_idx_dist_explain_db',
+  '{ "distinct": "coll_distinct_d", "key": "a", "collation": { "locale": "en", "strength": 2 } }')
+$cmd$);
+                                                                                                                                                                                                                                  run_explain_and_trim                                                                                                                                                                                                                                   
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 346_1
+         ->  Unique
+               Output: remote_scan.document
+               ->  Sort
+                     Output: remote_scan.document
+                     Sort Key: remote_scan.document USING <<<
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.document
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT DISTINCT documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level2'::text) AS document FROM documentdb_data.documents_95809_95800084 collection WHERE (documentdb_api_internal.bson_dollar_fullscan(document, '{ "a" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level2" }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_distinct_exists(document, '{ "a" : true }'::documentdb_core.bson))
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Unique
+                                       Output: (documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level2'::text))
+                                       ->  Sort
+                                             Output: (documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level2'::text))
+                                             Sort Key: (documentdb_api_catalog.bson_distinct_unwind(collection.document, 'a'::text, 'en-u-ks-level2'::text)) USING <<<
+                                             ->  ProjectSet
+                                                   Output: documentdb_api_catalog.bson_distinct_unwind(document, 'a'::text, 'en-u-ks-level2'::text)
+                                                   ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                                         Output: document
+                                                         indexName: idx_a_en_s1
+                                                         ->  Bitmap Heap Scan on documentdb_data.documents_95809_95800084 collection
+                                                               Output: document
+                                                               Recheck Cond: (collection.document OPERATOR(documentdb_api_catalog.@>=) '{ "a" : { "$minKey" : 1 } }'::documentdb_core.bson)
+                                                               ->  Bitmap Index Scan on idx_a_en_s1
+                                                                     Index Cond: (collection.document OPERATOR(documentdb_api_catalog.@>=) '{ "a" : { "$minKey" : 1 } }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_api_catalog.bson_distinct_agg(document) AS document FROM (SELECT intermediate_result.document FROM read_intermediate_result('346_1'::text, 'binary'::citus_copy_format) intermediate_result(document documentdb_core.bson)) agg_stage_0
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_api_catalog.bson_distinct_agg(intermediate_result.document)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.document
+                     Function Call: read_intermediate_result('346_1'::text, 'binary'::citus_copy_format)
+(40 rows)
+
+END;
+-- ======================================================================
+-- SECTION: sorted update routing uses the matching compound index
+-- ======================================================================
+SELECT documentdb_api.insert_one(
+  'coll_q_idx_dist_explain_db', 'coll_update_route_d',
+  '{ "_id": "cat", "name": "cat", "bucket": 1, "rank": 10 }');
+NOTICE:  creating collection
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.insert_one(
+  'coll_q_idx_dist_explain_db', 'coll_update_route_d',
+  '{ "_id": "CAT", "name": "CAT", "bucket": 1, "rank": 1 }');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api.shard_collection(
+  'coll_q_idx_dist_explain_db', 'coll_update_route_d',
+  '{ "name": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT pg_catalog.set_config(
+  'documentdb.alternate_index_handler_name', 'extended_rum', false), extname
+FROM pg_extension
+WHERE extname = 'documentdb_extended_rum';
+  set_config  |         extname         
+---------------------------------------------------------------------
+ extended_rum | documentdb_extended_rum
+(1 row)
+
+BEGIN;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.defaultUseCompositeOpClass TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'coll_q_idx_dist_explain_db',
+  '{ "createIndexes": "coll_update_route_d", "indexes": [
+     { "key": { "name": 1 },
+       "name": "idx_update_route_name_en_s1",
+       "collation": { "locale": "en", "strength": 1 } },
+     { "key": { "name": 1 },
+       "name": "idx_update_route_name_binary" },
+     { "key": { "_id": 1, "rank": 1 },
+       "name": "idx_update_route_id_rank_en_s1",
+       "collation": { "locale": "en", "strength": 1 } },
+     { "key": { "_id": 1, "bucket": 1, "rank": -1 },
+       "name": "idx_update_route_id_bucket_rank_en_s1",
+       "collation": { "locale": "en", "strength": 1 } }
+   ] }',
+  TRUE);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "5" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+END;
+RESET documentdb.alternate_index_handler_name;
+-- Generated update-many plans must fan out when a non-simple collation changes
+-- the meaning of the shard-key equality.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "name": "CaT" }, "u": { "$set": { "selected": "many" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                            run_explain_and_trim
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 395_1
+         ->  Custom Scan (Citus Adaptive)
+               Output: remote_scan.updated
+               Task Count: 8
+               Tasks Shown: One of 8
+               ->  Task
+                     Query: UPDATE documentdb_data.documents_95810_95800094 documents_95810 SET document = COALESCE(documentdb_api_internal.update_bson_document(document, ('\x2a000000030023000000032473657400180000000273656c656374656400050000006d616e7900000000'::bytea)::documentdb_core.bson, '{ "name" : "CaT" }'::documentdb_core.bson, (NULL::bytea)::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson, 'en-u-ks-level1'::text), document) WHERE (document OPERATOR(documentdb_api_catalog.#=) '{ "name" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) RETURNING documentdb_api_internal.bson_update_returned_value(shard_key_value) AS updated
+                     Node: host=localhost port=58070 dbname=regression
+                     ->  Update on documentdb_data.documents_95810_95800094 documents_95810
+                           Output: documentdb_api_internal.bson_update_returned_value(shard_key_value)
+                           ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                 Output: COALESCE(documentdb_api_internal.update_bson_document(document, '{ "" : { "$set" : { "selected" : "many" } } }'::documentdb_core.bson, '{ "name" : "CaT" }'::documentdb_core.bson, NULL::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson, 'en-u-ks-level1'::text), document), ctid
+                                 indexName: idx_update_route_name_en_s1
+                                 indexKey: {"name": 1}
+                                 indexCollation: en-u-ks-level1
+                                 isMultiKey: false
+                                 indexBounds: ["name": ["CaT", "CaT"]]
+                                 ->  Index Scan using idx_update_route_name_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                       Output: document, ctid
+                                       Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "name" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, sum(updated), 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.updated FROM read_intermediate_result('395_1'::text, 'binary'::citus_copy_format) intermediate_result(updated integer)) u WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, sum(intermediate_result.updated), 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.updated
+                     Function Call: read_intermediate_result('395_1'::text, 'binary'::citus_copy_format)
+(32 rows)
+
+END;
+-- Generated single-update plans use the same global sorted lookup as runtime.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "CaT" }, "u": { "$set": { "selected": "one" } }, "sort": { "rank": 1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                                      run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                      
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 397_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text) AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "rank" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)) ORDER BY (documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)) LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, (documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text))
+                                       ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                             Output: shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)
+                                             indexName: idx_update_route_id_rank_en_s1
+                                             indexKey: {"_id": 1,"rank": 1}
+                                             indexCollation: en-u-ks-level1
+                                             isMultiKey: false
+                                             indexBounds: ["_id": ["CaT", "CaT"], "rank": (MinKey, MaxKey)]
+                                             ->  Index Scan using idx_update_route_id_rank_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                                   Output: shard_key_value, document
+                                                   Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                                   Order By: (documents_95810.document OPERATOR(documentdb_api_internal.|<>) '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('397_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('397_1'::text, 'binary'::citus_copy_format)
+(38 rows)
+
+END;
+-- A non-string _id keeps the physical equality filter while allowing the
+-- matching collated compound index to provide the requested ordering.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": 1 }, "u": { "$set": { "selected": "numeric-id" } }, "sort": { "rank": 1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                                                                                                run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                 
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 399_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text) AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) AND (object_id OPERATOR(documentdb_core.=) '{ "" : { "$numberInt" : "1" } }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "rank" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)) ORDER BY (documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)) LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, (documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text))
+                                       ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                             Output: shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)
+                                             indexName: idx_update_route_id_rank_en_s1
+                                             indexKey: {"_id": 1,"rank": 1}
+                                             indexCollation: en-u-ks-level1
+                                             isMultiKey: false
+                                             indexBounds: ["_id": [1, 1], "rank": (MinKey, MaxKey)]
+                                             ->  Index Scan using idx_update_route_id_rank_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                                   Output: shard_key_value, document
+                                                   Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                                   Order By: (documents_95810.document OPERATOR(documentdb_api_internal.|<>) '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson)
+                                                   Filter: (documents_95810.object_id OPERATOR(documentdb_core.=) '{ "" : { "$numberInt" : "1" } }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('399_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('399_1'::text, 'binary'::citus_copy_format)
+(39 rows)
+
+END;
+-- Generated routing failures preserve the runtime SQLSTATE and message.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+DO $capture$
+BEGIN
+  EXECUTE $explain$
+    EXPLAIN (COSTS OFF)
+    SELECT document FROM bson_aggregation_update(
+      'coll_q_idx_dist_explain_db',
+      '{ "update": "coll_update_route_d", "updates": [ { "q": { "name": "CaT" }, "u": { "$set": { "selected": "one" } }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+  $explain$;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'SQLSTATE: %, MESSAGE: %', SQLSTATE, SQLERRM;
+END;
+$capture$;
+NOTICE:  SQLSTATE: M000P, MESSAGE: A {multi:false} update on a sharded collection cannot be routed to a single shard when the shard key value is collation-sensitive (string type).
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+DO $capture$
+BEGIN
+  EXECUTE $explain$
+    EXPLAIN (COSTS OFF)
+    SELECT document FROM bson_aggregation_update(
+      'coll_q_idx_dist_explain_db',
+      '{ "update": "coll_update_route_d", "updates": [ { "q": { "rank": 10 }, "u": { "$set": { "selected": "upsert" } }, "multi": false, "upsert": true, "collation": { "locale": "simple" } } ] }')
+  $explain$;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'SQLSTATE: %, MESSAGE: %', SQLSTATE, SQLERRM;
+END;
+$capture$;
+NOTICE:  SQLSTATE: 22023, MESSAGE: An {upsert:true} update on a sharded collection must target a single shard
+END;
+DO $capture$
+BEGIN
+  EXECUTE $explain$
+    EXPLAIN (COSTS OFF)
+    SELECT document FROM bson_aggregation_update(
+      'coll_q_idx_dist_explain_db',
+      '{ "update": "coll_update_route_d", "updates": [ { "q": { "rank": 10 }, "u": { "$set": { "selected": "one" } }, "multi": false } ] }')
+  $explain$;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'SQLSTATE: %, MESSAGE: %', SQLSTATE, SQLERRM;
+END;
+$capture$;
+NOTICE:  SQLSTATE: 22023, MESSAGE: A {multi:false} update on a sharded collection must contain an exact match on _id or target a single shard
+-- Simple collation preserves one-shard pruning for generated updates.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "name": "cat" }, "u": { "$set": { "selected": "simple-one" } }, "multi": false, "collation": { "locale": "simple" } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                      run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                       
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: WITH base AS (SELECT documents_95810.ctid, documents_95810.object_id, documents_95810.document, documents_95810.tableoid FROM documentdb_data.documents_95810_95800096 documents_95810 WHERE (((documents_95810.document OPERATOR(documentdb_api_catalog.#=) '{ "name" : "cat" }'::documentdb_core.bsonquery) AND (documents_95810.shard_key_value OPERATOR(pg_catalog.=) '6072023973012017567'::bigint)) AND (documents_95810.shard_key_value OPERATOR(pg_catalog.=) '6072023973012017567'::bigint)) LIMIT 1 FOR UPDATE OF documents_95810) SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM base WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               CTE base
+                 ->  Limit
+                       Output: documents_95810.ctid, documents_95810.object_id, documents_95810.document, documents_95810.tableoid, documents_95810.ctid
+                       ->  LockRows
+                             Output: documents_95810.ctid, documents_95810.object_id, documents_95810.document, documents_95810.tableoid, documents_95810.ctid
+                             ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                   Output: documents_95810.ctid, documents_95810.object_id, documents_95810.document, documents_95810.tableoid, documents_95810.ctid
+                                   indexName: idx_update_route_name_binary
+                                   indexKey: {"name": 1}
+                                   isMultiKey: false
+                                   indexBounds: ["name": ["cat", "cat"]]
+                                   ->  Index Scan using idx_update_route_name_binary on documentdb_data.documents_95810_95800096 documents_95810
+                                         Output: documents_95810.ctid, documents_95810.object_id, documents_95810.document, documents_95810.tableoid
+                                         Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "name" : "cat" }'::documentdb_core.bson)
+                                         Filter: (documents_95810.shard_key_value = '6072023973012017567'::bigint)
+               ->  CTE Scan on base
+                     Output: base.ctid, base.object_id, base.document, base.tableoid
+(26 rows)
+
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "name": "cat" }, "u": { "$set": { "selected": "simple-many" } }, "multi": true, "collation": { "locale": "simple" } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          run_explain_and_trim
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: WITH u AS (UPDATE documentdb_data.documents_95810_95800096 documents_95810 SET document = COALESCE(documentdb_api_internal.update_bson_document(documents_95810.document, ('\x3100000003002a0000000324736574001f0000000273656c6563746564000c00000073696d706c652d6d616e7900000000'::bytea)::documentdb_core.bson, '{ "name" : "cat" }'::documentdb_core.bson, (NULL::bytea)::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson, ''::text), documents_95810.document) WHERE (((documents_95810.document OPERATOR(documentdb_api_catalog.#=) '{ "name" : "cat" }'::documentdb_core.bsonquery) AND (documents_95810.shard_key_value OPERATOR(pg_catalog.=) '6072023973012017567'::bigint)) AND (documents_95810.shard_key_value OPERATOR(pg_catalog.=) '6072023973012017567'::bigint)) RETURNING documentdb_api_internal.bson_update_returned_value(documents_95810.shard_key_value) AS updated) SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, sum(updated), 'ok'::text, (1)::double precision) AS document FROM u WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
+               CTE u
+                 ->  Update on documentdb_data.documents_95810_95800096 documents_95810
+                       Output: documentdb_api_internal.bson_update_returned_value(documents_95810.shard_key_value)
+                       ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                             Output: COALESCE(documentdb_api_internal.update_bson_document(documents_95810.document, '{ "" : { "$set" : { "selected" : "simple-many" } } }'::documentdb_core.bson, '{ "name" : "cat" }'::documentdb_core.bson, NULL::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson, ''::text), documents_95810.document), documents_95810.ctid
+                             indexName: idx_update_route_name_binary
+                             indexKey: {"name": 1}
+                             isMultiKey: false
+                             indexBounds: ["name": ["cat", "cat"]]
+                             ->  Index Scan using idx_update_route_name_binary on documentdb_data.documents_95810_95800096 documents_95810
+                                   Output: documents_95810.document, documents_95810.ctid
+                                   Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "name" : "cat" }'::documentdb_core.bson)
+                                   Filter: (documents_95810.shard_key_value = '6072023973012017567'::bigint)
+               ->  CTE Scan on u
+                     Output: u.updated
+(24 rows)
+
+END;
+-- An exact _id lookup without a sort uses the physical index. The deterministic
+-- tie-break sorts only the bounded set of candidate rows.
+BEGIN;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "cat" }, "u": { "$set": { "selected": "binary-id" } }, "multi": false } ] }')
+$cmd$);
+                                                                                                                                                                                  run_explain_and_trim                                                                                                                                                                                   
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 403_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, object_id AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "cat" }'::documentdb_core.bsonquery) AND (object_id OPERATOR(documentdb_core.=) '{ "" : "cat" }'::documentdb_core.bson)) ORDER BY object_id LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, object_id
+                                       ->  Sort
+                                             Output: shard_key_value, object_id
+                                             Sort Key: documents_95810.object_id
+                                             ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                                   Output: shard_key_value, object_id
+                                                   indexName: _id_
+                                                   ->  Index Scan using _id_ on documentdb_data.documents_95810_95800094 documents_95810
+                                                         Output: shard_key_value, object_id
+                                                         Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "cat" }'::documentdb_core.bson)
+                                                         Filter: (documents_95810.object_id OPERATOR(documentdb_core.=) '{ "" : "cat" }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('403_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('403_1'::text, 'binary'::citus_copy_format)
+(37 rows)
+
+END;
+-- A collation-sensitive lookup without a sort uses the matching index prefix. The
+-- deterministic tie-break sorts only the bounded set of candidate rows.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "CaT" }, "u": { "$set": { "selected": "collated-id" } }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                     run_explain_and_trim                                                                                                                                                                      
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 405_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, object_id AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE (document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) ORDER BY object_id LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, object_id
+                                       ->  Sort
+                                             Output: shard_key_value, object_id
+                                             Sort Key: documents_95810.object_id
+                                             ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                                   Output: shard_key_value, object_id
+                                                   indexName: idx_update_route_id_rank_en_s1
+                                                   indexKey: {"_id": 1,"rank": 1}
+                                                   indexCollation: en-u-ks-level1
+                                                   isMultiKey: false
+                                                   indexBounds: ["_id": ["CaT", "CaT"], "rank": (MinKey, MaxKey)]
+                                                   ->  Index Scan using idx_update_route_id_rank_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                                         Output: shard_key_value, object_id
+                                                         Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('405_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('405_1'::text, 'binary'::citus_copy_format)
+(40 rows)
+
+END;
+-- A simple-collation _id lookup keeps the physical index and applies the
+-- requested sort globally.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "cat" }, "u": { "$set": { "selected": "simple-id" } }, "sort": { "rank": 1 }, "multi": false, "collation": { "locale": "simple" } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                    run_explain_and_trim                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 407_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, documentdb_api_catalog.bson_orderby(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson) AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "cat" }'::documentdb_core.bsonquery) AND (object_id OPERATOR(documentdb_core.=) '{ "" : "cat" }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson)) LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, (documentdb_api_catalog.bson_orderby(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson))
+                                       ->  Sort
+                                             Output: shard_key_value, (documentdb_api_catalog.bson_orderby(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson))
+                                             Sort Key: (documentdb_api_catalog.bson_orderby(documents_95810.document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson))
+                                             ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                                   Output: shard_key_value, documentdb_api_catalog.bson_orderby(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson)
+                                                   indexName: _id_
+                                                   ->  Index Scan using _id_ on documentdb_data.documents_95810_95800094 documents_95810
+                                                         Output: shard_key_value, document
+                                                         Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "cat" }'::documentdb_core.bson)
+                                                         Filter: (documents_95810.object_id OPERATOR(documentdb_core.=) '{ "" : "cat" }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('407_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('407_1'::text, 'binary'::citus_copy_format)
+(37 rows)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "CaT" }, "u": { "$set": { "selected": "compound" } }, "sort": { "bucket": 1, "rank": -1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 409_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2, remote_scan.worker_column_3
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2, remote_scan.worker_column_3
+                     Sort Key: remote_scan.worker_column_2, remote_scan.worker_column_3 DESC
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2, remote_scan.worker_column_3
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "bucket" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text) AS worker_column_2, documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text) AS worker_column_3 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "bucket" : { "$numberInt" : "1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "rank" : { "$numberInt" : "-1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)) ORDER BY (documentdb_api_internal.bson_orderby_index(document, '{ "bucket" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)), (documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)) DESC LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, (documentdb_api_internal.bson_orderby_index(document, '{ "bucket" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)), (documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text))
+                                       ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                             Output: shard_key_value, documentdb_api_internal.bson_orderby_index(document, '{ "bucket" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text), documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)
+                                             indexName: idx_update_route_id_bucket_rank_en_s1
+                                             indexKey: {"_id": 1,"bucket": 1,"rank": -1}
+                                             indexCollation: en-u-ks-level1
+                                             isMultiKey: false
+                                             indexBounds: ["_id": ["CaT", "CaT"], "bucket": (MinKey, MaxKey), "rank": DESC(MinKey, MaxKey)]
+                                             ->  Index Scan using idx_update_route_id_bucket_rank_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                                   Output: shard_key_value, document
+                                                   Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                                   Order By: ((documents_95810.document OPERATOR(documentdb_api_internal.|<>) '{ "bucket" : { "$numberInt" : "1" } }'::documentdb_core.bson) AND (documents_95810.document OPERATOR(documentdb_api_internal.|<>) '{ "rank" : { "$numberInt" : "-1" } }'::documentdb_core.bson))
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('409_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('409_1'::text, 'binary'::citus_copy_format)
+(38 rows)
+
+END;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET LOCAL documentdb.enableExtendedExplainPlans TO on;
+SET LOCAL enable_seqscan TO off;
+SET LOCAL enable_bitmapscan TO off;
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT document FROM bson_aggregation_update(
+  'coll_q_idx_dist_explain_db',
+  '{ "update": "coll_update_route_d", "updates": [ { "q": { "_id": "CaT" }, "u": { "$set": { "selected": "descending" } }, "sort": { "rank": -1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }')
+$cmd$);
+                                                                                                                                                                                                                                                                                                                                                                                 run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                 
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
+   Output: remote_scan.document
+   ->  Distributed Subplan 411_1
+         ->  Limit
+               Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+               ->  Sort
+                     Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                     Sort Key: remote_scan.worker_column_2 DESC
+                     ->  Custom Scan (Citus Adaptive)
+                           Output: remote_scan.shard_key_value, remote_scan.worker_column_2
+                           Task Count: 8
+                           Tasks Shown: One of 8
+                           ->  Task
+                                 Query: SELECT shard_key_value, documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text) AS worker_column_2 FROM documentdb_data.documents_95810_95800094 documents_95810 WHERE ((document OPERATOR(documentdb_api_catalog.#=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bsonquery) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "rank" : { "$numberInt" : "-1" }, "collation" : "en-u-ks-level1" }'::documentdb_core.bson)) ORDER BY (documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)) DESC LIMIT '1'::bigint
+                                 Node: host=localhost port=58070 dbname=regression
+                                 ->  Limit
+                                       Output: shard_key_value, (documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text))
+                                       ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                                             Output: shard_key_value, documentdb_api_internal.bson_orderby_index_reverse(document, '{ "rank" : { "$numberInt" : "1" } }'::documentdb_core.bson, 'en-u-ks-level1'::text)
+                                             indexName: idx_update_route_id_rank_en_s1
+                                             indexKey: {"_id": 1,"rank": 1}
+                                             indexCollation: en-u-ks-level1
+                                             isMultiKey: false
+                                             indexBounds: ["_id": ["CaT", "CaT"], "rank": (MinKey, MaxKey)]
+                                             ->  Index Scan using idx_update_route_id_rank_en_s1 on documentdb_data.documents_95810_95800094 documents_95810
+                                                   Output: shard_key_value, document
+                                                   Index Cond: (documents_95810.document OPERATOR(documentdb_api_catalog.@=) '{ "_id" : "CaT", "collation" : "en-u-ks-level1" }'::documentdb_core.bson)
+                                                   Order By: (documents_95810.document OPERATOR(documentdb_api_internal.|<>) '{ "rank" : { "$numberInt" : "-1" } }'::documentdb_core.bson)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Query: SELECT documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, (0)::bigint, 'ok'::text, (1)::double precision) AS document FROM (SELECT intermediate_result.shard_key_value FROM read_intermediate_result('411_1'::text, 'binary'::citus_copy_format) intermediate_result(shard_key_value bigint)) shard_lookup WHERE true
+         Node: host=localhost port=58070 dbname=regression
+         ->  Aggregate
+               Output: documentdb_core.bson_build_document('n'::text, count(*), 'nModified'::text, '0'::bigint, 'ok'::text, '1'::double precision)
+               ->  Function Scan on pg_catalog.read_intermediate_result intermediate_result
+                     Output: intermediate_result.shard_key_value
+                     Function Call: read_intermediate_result('411_1'::text, 'binary'::citus_copy_format)
+(38 rows)
+
+END;

@@ -1,0 +1,297 @@
+# ----------- Global build args -----------
+ARG BASE_IMAGE=ubuntu:22.04
+ARG DEBIAN_FRONTEND=noninteractive
+ARG POSTGRES_VERSION=16
+# REQUIRED: Path (relative to build context) to the pre-built DocumentDB .deb package.
+# Must be provided via --build-arg DEB_PACKAGE_REL_PATH=path/to/package.deb at docker build time.
+# No default is intentionally set to avoid accidentally picking a stale or wrong package.
+ARG DEB_PACKAGE_REL_PATH
+
+# ----------- Gateway Build Stage -----------
+# Builds only the Rust gateway binary. Based on ${BASE_IMAGE} directly rather
+# than on a stage that installs the freshly built .deb: the .deb changes on
+# every build and nothing in the cargo build depends on it or on the
+# PostgreSQL stack, so deriving from such a stage would invalidate the
+# toolchain layers on each run. LLVM is deliberately not installed: the
+# gateway has no bindgen/libclang dependency (the RPM gateway images build
+# the same binary without it).
+FROM ${BASE_IMAGE} AS stage
+ARG DEBIAN_FRONTEND
+
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl jq git make build-essential openssl pkg-config libssl-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo
+ENV PATH=$PATH:/opt/cargo/bin
+
+# Toolchain layer keyed only on the rustup script and the pinned toolchain
+# file (`rustup show` reads ./rust-toolchain.toml), not on the source tree.
+WORKDIR /build
+COPY scripts/install_rustup.sh scripts/
+COPY rust-toolchain.toml ./
+RUN bash scripts/install_rustup.sh --install-toolchain
+
+COPY . /build
+
+WORKDIR /build/pg_documentdb_gw
+
+# `documentdb-gateway --version` prints the Cargo version, so stamp it like the
+# package builds do (packaging/documentdb-version.sh). Unstamped local
+# builds keep 0.1.0. The ARG is declared here, not at the top of the stage, so
+# a version change does not invalidate the toolchain layers above.
+ARG DOCUMENTDB_VERSION=unknown
+RUN if [ -n "${DOCUMENTDB_VERSION}" ] && [ "${DOCUMENTDB_VERSION}" != "unknown" ]; then \
+        cargo_version="$(. ../packaging/documentdb-version.sh && documentdb_cargo_version "${DOCUMENTDB_VERSION}")" && \
+        echo "${cargo_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$' || { echo "ERROR: DOCUMENTDB_VERSION '${DOCUMENTDB_VERSION}' is not a release version Cargo can carry" >&2; exit 1; } && \
+        sed -i -E "s/^version = \".*\"/version = \"${cargo_version}\"/" Cargo.toml && \
+        grep -Eq "^version = \"${cargo_version}\"$" Cargo.toml; \
+    fi
+
+RUN CARGO_MANIFEST_DIR=/build/pg_documentdb_gw cargo build --profile=release-with-symbols -p documentdb_gateway
+
+# Install mongosh in a throwaway stage so the final image only copies the runtime files.
+FROM ${BASE_IMAGE} AS mongosh
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends wget ca-certificates && \
+    wget -qO- https://www.mongodb.org/static/pgp/server-8.0.asc | tee /etc/apt/trusted.gpg.d/server-8.0.asc >/dev/null && \
+    echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main" > /etc/apt/sources.list.d/mongodb-org-8.0.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends binutils mongodb-mongosh && \
+    strip --strip-debug /usr/bin/mongosh && \
+    rm -rf /var/lib/apt/lists/*
+
+# ----------- Runtime Base Stage -----------
+FROM ${BASE_IMAGE} AS runtime-base
+ARG DEBIAN_FRONTEND
+ARG POSTGRES_VERSION
+ARG DEB_PACKAGE_REL_PATH
+
+RUN [ -n "${DEB_PACKAGE_REL_PATH}" ] || (echo "ERROR: DEB_PACKAGE_REL_PATH build-arg is required. Example: --build-arg DEB_PACKAGE_REL_PATH=packaging/packages/ubuntu22.04-postgresql-16-documentdb_1.0.0_amd64.deb" >&2; exit 1)
+
+COPY ${DEB_PACKAGE_REL_PATH} /tmp/install_setup/
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates locales sudo wget gnupg2 lsb-release jq openssl lsof netcat-openbsd curl && \
+    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
+    locale-gen && \
+    install -d -m 0755 /etc/apt/keyrings && \
+    wget -qO /etc/apt/keyrings/pgdg.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc && \
+    echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main ${POSTGRES_VERSION}" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    RUM_PKG="" && \
+    if [ "${POSTGRES_VERSION}" -lt 18 ]; then RUM_PKG="postgresql-${POSTGRES_VERSION}-rum"; fi && \
+    apt-get install -y --no-install-recommends \
+    postgresql-${POSTGRES_VERSION} \
+    postgresql-${POSTGRES_VERSION}-cron \
+    postgresql-${POSTGRES_VERSION}-pgvector \
+    postgresql-${POSTGRES_VERSION}-postgis-3 \
+    $RUM_PKG && \
+    { gid_owner="$(getent group 103 | cut -d: -f1)"; uid_owner="$(getent passwd 105 | cut -d: -f1)"; \
+      if getent passwd postgres >/dev/null 2>&1 && { [ -z "$gid_owner" ] || [ "$gid_owner" = postgres ]; } && { [ -z "$uid_owner" ] || [ "$uid_owner" = postgres ]; }; then \
+          groupmod -g 103 postgres && usermod -u 105 -g 103 postgres; \
+      else echo "postgres uid/gid normalization skipped (uid 105 or gid 103 held by another account)"; fi; } && \
+    dpkg -i /tmp/install_setup/$(basename "$DEB_PACKAGE_REL_PATH") && \
+    useradd -ms /bin/bash documentdb -G sudo && \
+    echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/no-pass-ask && \
+    apt-get purge -y wget gnupg2 lsb-release && \
+    apt-get autoremove -y && \
+    # Date operators accept EST, MST, ...; Debian 13 / Ubuntu 26.04 moved them to tzdata-legacy.
+    if [ ! -e /usr/share/zoneinfo/EST ]; then \
+        apt-get install -y --no-install-recommends tzdata-legacy; \
+    fi && \
+    test -e /usr/share/zoneinfo/EST && \
+    rm -rf \
+    /etc/apt/keyrings/pgdg.asc \
+    /etc/apt/sources.list.d/pgdg.list \
+    /tmp/install_setup \
+    /usr/lib/postgresql/${POSTGRES_VERSION}/lib/bitcode \
+    /usr/share/doc/* \
+    /usr/share/man/* \
+    /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# ----------- Final Gateway Image -----------
+FROM runtime-base AS final
+ARG POSTGRES_VERSION
+ARG DOCUMENTDB_VERSION=unknown
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=""
+ARG IMAGE_SOURCE="https://github.com/documentdb/documentdb"
+
+# Identity labels so tooling can discover the container by label alone, without
+# relying on its name/port or inspecting logs/env (which hold credentials).
+LABEL org.opencontainers.image.title="DocumentDB Local" \
+      org.opencontainers.image.description="DocumentDB with its MongoDB-compatible gateway. Sends anonymous usage telemetry by default; set DOCUMENTDB_USAGE_TELEMETRY=false to turn it off. See /home/documentdb/PRIVACY.md." \
+      com.documentdb.documentdb.local="true" \
+      org.opencontainers.image.version="${DOCUMENTDB_VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}"
+
+ENV LANGUAGE=en_US.UTF-8 \
+    TERM=xterm-256color
+
+# Mirror of documentdb-local/scripts/documentdb_local_settings.sh, the table
+# the in-image scripts read. Kept as ENV because the bake step below reads
+# DATA_PATH and POSTGRESQL_PORT at build time, and so `docker inspect` shows
+# the defaults. ImageDefaultPinTests holds it equal to the table. OWNER,
+# PG_VERSION_USED and PATH are image facts, not table rows.
+ENV CERT_PATH="" \
+    KEY_FILE="" \
+    DATA_PATH="/data" \
+    DOCUMENTDB_PORT="10260" \
+    ENABLE_TELEMETRY="false" \
+    DOCUMENTDB_USAGE_TELEMETRY="true" \
+    LOG_LEVEL="info" \
+    USERNAME="default_user" \
+    CREATE_USER="true" \
+    START_POSTGRESQL="true" \
+    POSTGRESQL_PORT="9712" \
+    OWNER="documentdb" \
+    PG_VERSION_USED="${POSTGRES_VERSION}" \
+    ALLOW_EXTERNAL_CONNECTIONS="false" \
+    TLS_MODE="allowTLS" \
+    INIT_DATA="" \
+    INIT_DATA_PATH="/init_doc_db.d" \
+    PATH=/usr/lib/postgresql/${POSTGRES_VERSION}/bin:$PATH
+
+RUN sudo mkdir /home/documentdb/gateway
+
+# Create /var/run/postgresql directory with proper permissions
+RUN sudo mkdir -p /var/run/postgresql && \
+    sudo chown -R documentdb:documentdb /var/run/postgresql && \
+    sudo chmod 755 /var/run/postgresql
+    
+COPY --from=stage /build/pg_documentdb_gw/target/release-with-symbols/documentdb_gateway \
+                  /home/documentdb/gateway/pg_documentdb_gw/target/release-with-symbols/documentdb_gateway
+COPY --from=mongosh /usr/bin/mongosh /usr/bin/mongosh
+# Plain source files come straight from the build context; only the compiled
+# gateway binary and mongosh need their build stages.
+COPY pg_documentdb_gw/SetupConfiguration.json /home/documentdb/gateway/pg_documentdb_gw/SetupConfiguration.json
+COPY scripts/start_oss_server.sh /home/documentdb/gateway/scripts/start_oss_server.sh
+COPY scripts/build_and_start_gateway.sh /home/documentdb/gateway/scripts/build_and_start_gateway.sh
+COPY documentdb-local/scripts/emulator_entrypoint.sh /home/documentdb/gateway/scripts/emulator_entrypoint.sh
+COPY documentdb-local/scripts/lib/ /home/documentdb/gateway/scripts/lib/
+COPY documentdb-local/scripts/documentdb_claim_data_directory.sh /home/documentdb/gateway/scripts/documentdb_claim_data_directory.sh
+COPY documentdb-local/scripts/documentdb_local_settings.sh /home/documentdb/gateway/scripts/documentdb_local_settings.sh
+COPY documentdb-local/scripts/documentdb_validate_username.sh /home/documentdb/gateway/scripts/documentdb_validate_username.sh
+COPY documentdb-local/scripts/documentdb_install_getparameter_stub.sh /home/documentdb/gateway/scripts/documentdb_install_getparameter_stub.sh
+COPY documentdb-local/scripts/documentdb_prepare_data_directory.sh /home/documentdb/gateway/scripts/documentdb_prepare_data_directory.sh
+COPY documentdb-local/scripts/documentdb_report_extended_rum.sh /home/documentdb/gateway/scripts/documentdb_report_extended_rum.sh
+COPY documentdb-local/scripts/usage_telemetry.sh /home/documentdb/gateway/scripts/usage_telemetry.sh
+COPY documentdb-local/scripts/healthcheck.sh /home/documentdb/gateway/scripts/healthcheck.sh
+# The usage-telemetry disclosure ships inside the image. Telemetry is on by
+# default, so the document describing it has to be readable from the container
+# itself rather than only from a URL: an air-gapped or offline deployment
+# cannot fetch the GitHub copy, and that is exactly where an operator is most
+# likely to want to read it before deciding whether to opt out.
+COPY documentdb-local/PRIVACY.md /home/documentdb/PRIVACY.md
+COPY scripts/utils.sh /home/documentdb/gateway/scripts/utils.sh
+COPY scripts/preload_libraries.sh /home/documentdb/gateway/scripts/preload_libraries.sh
+COPY scripts/setup_psqlrc.sh /home/documentdb/gateway/scripts/setup_psqlrc.sh
+# Copy initialization scripts
+COPY documentdb-local/scripts/init_documentdb_data.sh /home/documentdb/gateway/scripts/init_documentdb_data.sh
+
+# Copy sample data for built-in initialization
+COPY documentdb-local/sample-data /home/documentdb/gateway/sample-data
+
+# Create default initialization directory for user-provided scripts
+RUN sudo mkdir -p "$INIT_DATA_PATH"
+
+USER documentdb
+RUN sudo chown -R documentdb:documentdb /home/documentdb/gateway
+
+# Make initialization script executable
+RUN sudo chmod +x /home/documentdb/gateway/scripts/init_documentdb_data.sh
+
+# Expose the health probe on a stable path that stays valid if the scripts
+# directory ever moves, so compose files can rely on
+# `test: ["CMD", "/usr/local/bin/documentdb-healthcheck"]` across releases.
+RUN sudo chmod +x /home/documentdb/gateway/scripts/healthcheck.sh && \
+    sudo ln -s /home/documentdb/gateway/scripts/healthcheck.sh /usr/local/bin/documentdb-healthcheck
+
+# Pre-initialize the PostgreSQL data directory at image build time (issue
+# #480). initdb and CREATE EXTENSION dominate first-boot latency (both are
+# fsync- and I/O-heavy, which makes them painfully slow on Docker Desktop
+# filesystems), so run them once here. The entrypoint adopts this ready-made
+# cluster on first boot instead of initializing from scratch, and Docker
+# populates the /data volume (anonymous or named) from this image content at
+# container create, so every run gets the fast path. The marker file records
+# the cluster's control-data fingerprint -- system identifier, cluster state,
+# and latest checkpoint location; the entrypoint recomputes the same three
+# lines from live pg_controldata at boot and only byte-equality proves the
+# template pristine (the cluster never ran, so no user data exists and it is
+# safe to re-initialize when the image's PostgreSQL major differs from the
+# template's). No single field covers every "the cluster ran" case -- a clean
+# startup does not advance the checkpoint -- but together they do: a killed
+# cluster reads "in production" (state mismatch) and a cleanly stopped one
+# wrote a shutdown checkpoint (checkpoint mismatch). Known accepted tradeoff:
+# every first-boot volume shares this template's database system identifier,
+# which disables PostgreSQL's cross-cluster identity check (replication /
+# backup tooling keyed on the identifier); acceptable for a local emulator.
+# MUST stay above the VOLUME declaration: build steps that touch /data after
+# VOLUME is declared are discarded.
+RUN sudo install -d -o documentdb -g documentdb "$DATA_PATH" && \
+    /home/documentdb/gateway/scripts/start_oss_server.sh -u "" -d "$DATA_PATH" -p "$POSTGRESQL_PORT" && \
+    bash /home/documentdb/gateway/scripts/documentdb_install_getparameter_stub.sh "$POSTGRESQL_PORT" && \
+    pg_ctl stop -D "$DATA_PATH" -m fast && \
+    rm -f "$DATA_PATH/pglog.log" && \
+    mkdir -p "$DATA_PATH/.documentdb-local" && \
+    LC_ALL=C pg_controldata "$DATA_PATH" | sed -E 's/[[:space:]]+/ /g; s/ $//' | \
+        grep -E '^(Database system identifier|Database cluster state|Latest checkpoint location): ' | \
+        sed -E 's|^(Latest checkpoint location: [0-9A-F]+/)0*([0-9A-F])|\1\2|' \
+        > "$DATA_PATH/.documentdb-local/baked_template" && \
+    [ "$(wc -l < "$DATA_PATH/.documentdb-local/baked_template")" -eq 3 ] && \
+    grep -q '^Database cluster state: shut down$' "$DATA_PATH/.documentdb-local/baked_template"
+
+WORKDIR /home/documentdb/gateway/scripts
+# Declare /data as a volume mount point for the PostgreSQL data directory.
+# This does NOT persist by itself: without an explicit `-v host_path:/data`
+# (or a named volume), each `docker run` gets a fresh anonymous volume and
+# `docker rm` can strand it. Its purpose is to (a) follow the official
+# postgres/mysql image convention so `-v` mounts land on the right path and
+# (b) keep the heavy data dir out of the container's writable layer. The
+# pre-initialized template is baked BEFORE this declaration, so Docker copies
+# it into each fresh /data volume at container create. See the container's
+# "ready" banner (printed by the entrypoint) for the `-v` guidance users must
+# follow to persist.
+VOLUME ["$DATA_PATH"]
+
+RUN v="$(dpkg-query -W -f='${Version}' "postgresql-${POSTGRES_VERSION}-documentdb")" \
+        && [ -n "$v" ] \
+        || { echo "ERROR: cannot resolve the installed postgresql-${POSTGRES_VERSION}-documentdb version; /version.txt would misreport this build" >&2; exit 1; }; \
+    if [ "${DOCUMENTDB_VERSION}" != "unknown" ] \
+        && [ "$(printf '%s' "${DOCUMENTDB_VERSION}" | tr '~-' '..')" != "$(printf '%s' "$v" | tr '~-' '..')" ]; then \
+        echo "ERROR: DOCUMENTDB_VERSION build arg '${DOCUMENTDB_VERSION}' does not match the installed package version '$v'" >&2; exit 1; \
+    fi; \
+    # A release candidate's package is 1.0~rc2; users see 1.0-rc2.
+    printf '%s (commit %s, built %s, postgresql %s)\n' \
+        "$(printf '%s' "$v" | tr '~' '-')" "${GIT_COMMIT}" "${BUILD_DATE:-unknown}" "${POSTGRES_VERSION}" \
+    | sudo tee /version.txt >/dev/null
+
+# Built-in health probe: healthy once the entrypoint finished initialization,
+# PostgreSQL accepts connections, and the gateway answers a TLS handshake
+# (see healthcheck.sh). It tracks the configured DocumentDB port
+# automatically — including one set via the --documentdb-port CLI flag — so
+# `docker run` users and docker-compose `depends_on: condition:
+# service_healthy` need no extra configuration.
+# The 600s start period absorbs a slow first boot (initdb on a cold volume,
+# plus the entrypoint's own up-to-600s wait for PostgreSQL): failing probes
+# during it do not count toward `retries`, and a probe that succeeds during it
+# marks the container healthy without waiting it out. It is a budget, not a
+# guarantee — a boot that takes longer (very large custom seed scripts, or a
+# DOCUMENTDB_PG_READY_TIMEOUT raised past 600s, which this build-time value
+# cannot track) can outrun it; such workloads should override the timings at
+# the `docker run` / compose level.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD ["/usr/local/bin/documentdb-healthcheck"]
+# The default port only; --documentdb-port / DOCUMENTDB_PORT can move it.
+EXPOSE ${DOCUMENTDB_PORT}
+ENTRYPOINT ["/bin/bash", "-c", "/home/documentdb/gateway/scripts/emulator_entrypoint.sh \"$@\"", "--"]

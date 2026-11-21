@@ -1,0 +1,5442 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+import fcntl
+import getpass
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+
+# Test-only password, generated at runtime so no credential literal lives in
+# source (the entrypoint tests assert on return codes / config, never the value).
+_TEST_PW = secrets.token_hex(8) + "Aa1!"
+
+# Emitted when an explicit TOAST compression request cannot be applied because
+# this container is not the one starting PostgreSQL.
+_TOAST_IGNORED_MARKER = "is ignored because this container is not starting PostgreSQL"
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ENTRYPOINT = REPO_ROOT / "documentdb-local" / "scripts" / "emulator_entrypoint.sh"
+CLAIM_HELPER = ENTRYPOINT.with_name("documentdb_claim_data_directory.sh")
+LIB_DIR = ENTRYPOINT.with_name("lib")
+
+
+def _lib_text(name):
+    return (LIB_DIR / name).read_text(encoding="utf-8")
+
+
+def _entrypoint_sources():
+    """The entrypoint and every lib/ file it sources, as {path: text}."""
+    paths = [ENTRYPOINT, *sorted(LIB_DIR.glob("*.sh"))]
+    return {path: path.read_text(encoding="utf-8") for path in paths}
+
+
+def _function_body(text, name):
+    """Body of a top-level shell function `name() {` ... `}`."""
+    start = text.index(f"\n{name}() {{\n")
+    return text[start:text.index("\n}\n", start)]
+
+
+def _boot_sequence():
+    """The entrypoint's top-level boot sequence, after its function definitions."""
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+    return text[text.index("\n# The boot sequence.\n"):]
+
+# Control-data fingerprint for the baked-template pristineness proof
+# (documentdb_prepare_data_directory.sh): the marker records these normalized
+# lines at image build time and the script recomputes them from live
+# pg_controldata at boot; only byte-equality proves the template pristine.
+# Three fields because no single one covers every "the cluster ran" case: a
+# clean startup does not advance the checkpoint (only the state changes), and
+# a later checkpoint restores neither.
+BAKED_FINGERPRINT = (
+    "Database system identifier: 1234567890123456789\n"
+    "Database cluster state: shut down\n"
+    "Latest checkpoint location: 0/1000028\n"
+)
+MISMATCHED_FINGERPRINT = (
+    "Database system identifier: 9876543210987654321\n"
+    "Database cluster state: shut down\n"
+    "Latest checkpoint location: 0/DEADBEE\n"
+)
+# Default stub output, mimicking the real tool: column-padded (exercises the
+# script's whitespace normalization), real field order, and including the
+# neighbouring REDO field (exercises the fingerprint's exact-prefix
+# anchoring -- "Latest checkpoint's REDO location" must NOT match).
+PG_CONTROLDATA_FIELD_LINES = (
+    "pg_control version number:            1700",
+    "Database system identifier:           1234567890123456789",
+    "Database cluster state:               shut down",
+    "Latest checkpoint location:           0/1000028",
+    "Latest checkpoint's REDO location:    0/1000028",
+)
+# A cluster that started, took writes, and was SIGKILLed before its first
+# checkpoint: identifier and checkpoint location still equal the baked
+# values; only the state ("in production") betrays that it ran.
+RAN_AND_KILLED_FIELD_LINES = (
+    "pg_control version number:            1700",
+    "Database system identifier:           1234567890123456789",
+    "Database cluster state:               in production",
+    "Latest checkpoint location:           0/1000028",
+    "Latest checkpoint's REDO location:    0/1000028",
+)
+# Arg-aware pg_controldata stand-in: `--version` reports the image tooling
+# version (the prepare script's PG-major guard parses it); otherwise control
+# data for the directory in $1 is printed -- from $1/.control_stub when a test
+# planted one, else the default baked values.
+PG_CONTROLDATA_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "--version" ]; then\n'
+    '    echo "pg_controldata (PostgreSQL) 17.5"\n'
+    "    exit 0\n"
+    "fi\n"
+    'if [ -f "$1/.control_stub" ]; then\n'
+    '    cat "$1/.control_stub"\n'
+    "    exit 0\n"
+    "fi\n"
+    + "".join(f'echo "{line}"\n' for line in PG_CONTROLDATA_FIELD_LINES)
+)
+
+
+class EmulatorEntrypointTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.gateway_home = self.root / "gateway"
+        self.gateway_scripts = self.gateway_home / "scripts"
+        self.gateway_config_dir = self.gateway_home / "pg_documentdb_gw"
+        self.gateway_target_dir = self.gateway_config_dir / "target"
+        self.sample_data_dir = self.gateway_home / "sample-data"
+        self.bin_dir = self.root / "bin"
+        self.logs_dir = self.root / "logs"
+        self.data_dir = self.root / "data"
+
+        self.gateway_scripts.mkdir(parents=True)
+        self.gateway_target_dir.mkdir(parents=True)
+        self.sample_data_dir.mkdir(parents=True)
+        self.bin_dir.mkdir(parents=True)
+        self.logs_dir.mkdir(parents=True)
+        self.data_dir.mkdir(parents=True)
+
+        (self.gateway_config_dir / "SetupConfiguration.json").write_text(
+            json.dumps(
+                {
+                    "NodeHostName": "localhost",
+                    "BlockedRolePrefixes": ["documentdb"],
+                    "PostgresPort": 9712,
+                    "GatewayListenPort": 10260,
+                    "HostConfigurationWatchIntervalMs": 1000,
+                    "CertificateOptions": {"CertType": "PemAutoGenerated"},
+                    "UseLocalHost": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self._write_exec(
+            self.bin_dir / "sudo",
+            """#!/bin/sh
+if [ "$1" = "chown" ]; then
+  exit 0
+fi
+if [ "$1" = "-E" ]; then
+  exec /usr/bin/sudo "$@"
+fi
+exec "$@"
+""",
+        )
+        self._write_exec(self.bin_dir / "nc", "#!/bin/sh\nexit 0\n")
+        self._write_exec(self.bin_dir / "tail", "#!/bin/sh\nexit 0\n")
+        # Deterministic pg_config for the TOAST lz4 probe. Without a stub,
+        # any test that starts the (stubbed) server consults whatever
+        # pg_config the HOST has -- PG_VERSION_USED=999 only bypasses the
+        # versioned bindirs, not the PATH fallback -- so the code path taken
+        # would vary with the runner's PostgreSQL installation. Reports major
+        # 999 (matching PG_VERSION_USED, so the entrypoint's foreign-binary
+        # gate trusts it) and --with-lz4, like the shipped image's build.
+        self._write_exec(
+            self.bin_dir / "pg_config",
+            """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "PostgreSQL 999.0"
+fi
+if [ "$1" = "--configure" ]; then
+  echo "'--with-openssl' '--with-lz4'"
+fi
+exit 0
+""",
+        )
+        # Default readiness probe reports "ready" immediately so the admin-user
+        # wait (CREATE_USER=true path) does not block; individual tests override
+        # this to exercise the timeout path.
+        self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 0\n")
+        self._write_exec(
+            self.bin_dir / "jq",
+            """#!/usr/bin/env python3
+import json
+import sys
+args = sys.argv[1:]
+raw = False
+vars = {}
+while args and args[0].startswith('-'):
+    if args[0] in ('--arg', '--argjson'):
+        flag, name, value, *args = args
+        vars[name] = json.loads(value) if flag == '--argjson' else value
+    elif args[0] in ('-r', '--raw-output'):
+        raw = True
+        args = args[1:]
+    else:
+        args = args[1:]
+expr, file_path = args
+with open(file_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+expr = expr.strip()
+if expr == '.BlockedRolePrefixes | type':
+    v = data.get('BlockedRolePrefixes')
+    if v is None:
+        print('null')
+    elif isinstance(v, bool):
+        print('boolean')
+    elif isinstance(v, list):
+        print('array')
+    elif isinstance(v, str):
+        print('string')
+    elif isinstance(v, (int, float)):
+        print('number')
+    else:
+        print('object')
+    raise SystemExit(0)
+if expr == 'all(.BlockedRolePrefixes[]; type == "string")':
+    arr = data.get('BlockedRolePrefixes') or []
+    ok = isinstance(arr, list) and all(isinstance(x, str) for x in arr)
+    raise SystemExit(0 if ok else 1)
+if expr in ('.BlockedRolePrefixes[]', '.BlockedRolePrefixes[]?'):
+    for item in data.get('BlockedRolePrefixes', []):
+        print(item)
+    raise SystemExit(0)
+if expr.startswith('.GatewayListenPort = '):
+    data['GatewayListenPort'] = int(expr.split('=', 1)[1].strip())
+elif expr.startswith('.PostgresPort = '):
+    data['PostgresPort'] = int(expr.split('=', 1)[1].strip())
+elif expr.startswith('.TlsMode = '):
+    data['TlsMode'] = vars.get('tlsMode', expr.split('=', 1)[1].strip().strip('"'))
+elif expr.startswith('.EnforceTls = '):
+    data['EnforceTls'] = vars['enforceTls']
+elif expr.startswith('.DynamicConfigurationFile = '):
+    data['DynamicConfigurationFile'] = vars['hostConfig']
+elif expr.startswith('.CertificateOptions = '):
+    data['CertificateOptions'] = {
+        'CertType': 'PemFile',
+        'FilePath': vars['certPath'],
+        'KeyFilePath': vars['keyFilePath'],
+    }
+else:
+    raise SystemExit(f'Unsupported jq expression: {expr}')
+json.dump(data, sys.stdout)
+""",
+        )
+
+        self._write_exec(
+            self.gateway_scripts / "build_and_start_gateway.sh",
+            "#!/bin/sh\necho gateway-stub-started\n",
+        )
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            '#!/bin/sh\nSetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            "#!/bin/sh\necho oss-server-stub-started\n",
+        )
+        self._write_exec(
+            self.gateway_scripts / "init_documentdb_data.sh",
+            "#!/bin/sh\necho init-script-stub-started\n",
+        )
+        # Stub the gateway binary so the entrypoint can exec it.
+        #
+        # The entrypoint invokes an ABSOLUTE path -- /usr/bin/documentdb-gateway
+        # when the package is installed, else the staged
+        # $GATEWAY_HOME/pg_documentdb_gw/target/release-with-symbols/... binary
+        # -- so a stub on PATH alone is never reached. It has to live at the
+        # staged path for the launch to actually happen. This was masked until
+        # the launch stopped going through `| tee`: with a pipeline, $! (and so
+        # the script's final `wait`) referred to tee rather than the gateway, so
+        # the gateway failing with 127 "No such file or directory" was silently
+        # discarded and every test here passed without ever running a gateway.
+        # Keep the PATH copy too, for anything that resolves it by name.
+        self.gateway_release_dir = self.gateway_target_dir / "release-with-symbols"
+        self.gateway_release_dir.mkdir(parents=True, exist_ok=True)
+        # Exits immediately: the entrypoint ends with `wait $gateway_pid`, which
+        # now genuinely waits on the gateway, so a long-lived stub would hang
+        # the test until its subprocess timeout.
+        gateway_stub = "#!/bin/sh\necho gateway-daemon-stub-started\nexit 0\n"
+        self._write_exec(self.bin_dir / "documentdb_gateway", gateway_stub)
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway", gateway_stub
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_exec(self, path: Path, content: str):
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        path.chmod(0o755)
+
+    def _record_sleeps(self):
+        """An instant sleep that logs each interval it was asked for."""
+        log = self.root / "sleeps"
+        self._write_exec(self.bin_dir / "sleep", f'#!/bin/sh\necho "$*" >> "{log}"\nexit 0\n')
+        return lambda: log.read_text(encoding="utf-8").split() if log.exists() else []
+
+    def _entrypoint_env(self, extra_env=None):
+        env = os.environ.copy()
+        # Hermeticity: an ambient template override on the dev machine must
+        # not leak into the entrypoint under test.
+        env.pop("DOCUMENTDB_PGDATA_TEMPLATE", None)
+        env.pop("TLS_MODE", None)
+        env.pop("DOCUMENTDB_ALLOW_DEFAULT_PASSWORD", None)
+        env.update(
+            {
+                "PATH": f"{self.bin_dir}:{env['PATH']}",
+                "GATEWAY_HOME": str(self.gateway_home),
+                "DOCUMENTDB_LOG_DIR": str(self.logs_dir),
+                "SYSTEM_POSTGRES_LOG": str(self.root / "postgres-system.log"),
+                # The lz4 probe checks /usr/lib/postgresql/<V>/bin and
+                # /usr/pgsql-<V>/bin BEFORE PATH (provenance: that is where
+                # start_oss_server launches the postmaster from). Pin a major
+                # that has no packaged bindir so the probe always falls
+                # through to the PATH stubs, keeping these tests independent
+                # of any PostgreSQL installed on the host.
+                "PG_VERSION_USED": "999",
+                "START_POSTGRESQL": "false",
+                "SKIP_INIT_DATA": "true",
+                "CREATE_USER": "false",
+                "PASSWORD": _TEST_PW,
+                "DATA_PATH": str(self.data_dir),
+                "USERNAME": "default_user",
+                "OWNER": "documentdb",
+                "DOCUMENTDB_CONFIG_FILE": str(
+                    self.gateway_target_dir / "test_config.json"
+                ),
+                # Per-test path so runs never touch (or race over) the
+                # runner's real /tmp/documentdb-local-runtime.env default.
+                "DOCUMENTDB_RUNTIME_STATE_FILE": str(
+                    self.root / "runtime-state.env"
+                ),
+            }
+        )
+        if extra_env:
+            env.update(extra_env)
+        # None in extra_env means "unset this variable".
+        for key in [k for k, v in env.items() if v is None]:
+            del env[key]
+        return env
+
+    def _run_entrypoint(self, *args, extra_env=None):
+        return subprocess.run(
+            ["bash", str(ENTRYPOINT), *args],
+            cwd=REPO_ROOT,
+            env=self._entrypoint_env(extra_env),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            # Deterministic EOF stdin, modelling how Docker runs the real
+            # entrypoint (no -i => /dev/null). Without this the suite's
+            # behavior depends on the RUNNER's stdin: the stub psql drains
+            # stdin, and a held-open pipe (Azure DevOps agents) never EOFs,
+            # hanging every test whose scenario reaches a psql call.
+            stdin=subprocess.DEVNULL,
+        )
+
+    def _read_config(self):
+        config_path = self.gateway_target_dir / "test_config.json"
+        with config_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _configure_toast_stubs(self, lz4_supported=True, lz4_runtime="t"):
+        """Stub start_oss_server.sh so it records the arguments it was given,
+        and pg_config so the entrypoint's lz4 build probe is deterministic
+        regardless of how the host's PostgreSQL was compiled. lz4_runtime is
+        what the psql stub answers to the entrypoint's post-start pg_settings
+        enumvals probe: "t" (a capable build, the realistic default), "f",
+        or None for an EMPTY answer (the stub psql exits 0 printing
+        nothing -- the unanswered-probe outcome; a genuinely FAILING psql
+        is modelled only in test_toast_probe_is_retried_when_psql_fails).
+        The pg_config stub reports
+        major 999 to match PG_VERSION_USED so the foreign-binary gate
+        trusts it."""
+        args_capture = self.root / "start-oss-server-args"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        # The entrypoint refuses to fabricate a postgresql.conf (a data dir
+        # without one is not a server it booted), so give the stubbed server
+        # the minimal conf initdb would have left behind. Tests that need
+        # specific pre-existing contents write the file BEFORE calling this.
+        pg_conf = self.data_dir / "postgresql.conf"
+        if not pg_conf.exists():
+            pg_conf.write_text("port = 9712\n", encoding="utf-8")
+            pg_conf.chmod(0o600)
+        # The stub server is never stopped, so a previous boot's pidfile would
+        # make the next boot refuse the data directory as possibly in use.
+        (self.data_dir / "postmaster.pid").unlink(missing_ok=True)
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"""#!/bin/sh
+printf '%s\\n' "$@" > "{args_capture}"
+touch "{self.data_dir / 'postmaster.pid'}" "{self.data_dir / 'pglog.log'}"
+echo oss-server-stub-started
+""",
+        )
+        configure_line = (
+            "'--with-openssl' '--with-lz4'" if lz4_supported else "'--with-openssl'"
+        )
+        self._write_exec(
+            self.bin_dir / "pg_config",
+            f"""#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "PostgreSQL 999.0"
+fi
+if [ "$1" = "--configure" ]; then
+  echo "{configure_line}"
+fi
+exit 0
+""",
+        )
+        self.toast_psql_args = self.root / "toast-psql-args"
+        runtime_answer = "" if lz4_runtime is None else lz4_runtime
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+printf '%s\\n' "$@" >> "{self.toast_psql_args}"
+case "$*" in
+  *pg_available_extensions*) printf '%s\\n' "1,1" ;;
+  *enumvals*) printf '%s\\n' "{runtime_answer}" ;;
+esac
+cat > /dev/null
+exit 0
+""",
+        )
+        return args_capture
+
+    def _stub_empty_pg_config(self):
+        """Overwrite the pg_config stub with one reporting NO configure flags,
+        the way meson builds do (CONFIGURE_ARGS is compiled in empty). Still
+        reports major 999 so the gate consults it -- what is under test is
+        the empty --configure answer, not the foreign-binary rejection."""
+        self._write_exec(
+            self.bin_dir / "pg_config",
+            """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "PostgreSQL 999.0"
+fi
+if [ "$1" = "--configure" ]; then
+  echo ""
+fi
+exit 0
+""",
+        )
+
+    def _run_with_toast(self, lz4_supported=True, extra_env=None, extra_args=()):
+        args_capture = self._configure_toast_stubs(lz4_supported=lz4_supported)
+        conf = self.root / "toast.conf"
+        env = {"START_POSTGRESQL": "true", "TOAST_COMPRESSION_CONF": str(conf)}
+        if extra_env:
+            env.update(extra_env)
+        result = self._run_entrypoint(*extra_args, extra_env=env)
+        return result, conf, args_capture
+
+    def _start_postmaster_stub(self, directory):
+        executable = self.root / "postgres"
+        shutil.copy2(shutil.which("sleep"), executable)
+        process = subprocess.Popen([str(executable), "30"], cwd=directory)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.terminate)
+        return process
+
+    def _run_postmaster_watch(self, pid, recovery_pid=None):
+        self._configure_toast_stubs()
+        pidfile = self.data_dir / "postmaster.pid"
+        (self.gateway_scripts / "start_oss_server.sh").write_text(
+            f"#!/bin/sh\necho {pid} > '{pidfile}'\n"
+            f"touch '{self.data_dir / 'pglog.log'}'\n"
+        )
+        record = self.root / "send-shutdown-responses"
+        recover = (
+            f'if [ "$attempt" = 4 ]; then echo {recovery_pid} > "{pidfile}"; fi'
+            if recovery_pid is not None else ""
+        )
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            f"""#!/bin/sh
+host_config=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["DynamicConfigurationFile"])' "$1")
+for attempt in 1 2 3 4 5 6 7; do
+    cat "$host_config" >> "{record}"
+    {recover}
+    sleep 1
+done
+exit 7
+""",
+        )
+        self._write_exec(self.bin_dir / "pg_ctl", "#!/bin/sh\nexit 0\n")
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(self.root / "toast.conf"),
+                "DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT": "5",
+            }
+        )
+        return result, record.read_text()
+
+    def test_postmaster_watch_exits_when_postmaster_is_gone(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        result, record = self._run_postmaster_watch(dead.pid)
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, msg=output)
+        self.assertIn('"SendShutdownResponses": "false"', record)
+        self.assertIn('"SendShutdownResponses": "true"', record)
+        self.assertIn("PostgreSQL has not been running for 5 seconds", output)
+
+    def test_postmaster_watch_rejects_unrelated_live_pid(self):
+        unrelated = subprocess.Popen(["sleep", "30"], cwd=self.data_dir)
+        self.addCleanup(unrelated.wait)
+        self.addCleanup(unrelated.terminate)
+        result, record = self._run_postmaster_watch(unrelated.pid)
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, msg=output)
+        self.assertIn('"SendShutdownResponses": "true"', record)
+        self.assertIn("PostgreSQL has not been running for 5 seconds", output)
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_postmaster_watch_rejects_zombie_pid(self):
+        zombie = subprocess.Popen(["true"])
+        self.addCleanup(zombie.wait)
+        os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)
+        result, record = self._run_postmaster_watch(zombie.pid)
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn('"SendShutdownResponses": "true"', record)
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_postmaster_watch_accepts_matching_process_without_listener(self):
+        postmaster = self._start_postmaster_stub(self.data_dir)
+        result, record = self._run_postmaster_watch(postmaster.pid)
+
+        self.assertEqual(result.returncode, 7, msg=result.stdout + result.stderr)
+        self.assertIn('"SendShutdownResponses": "false"', record)
+        self.assertNotIn('"SendShutdownResponses": "true"', record)
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_postmaster_watch_rejects_other_data_directory(self):
+        postmaster = self._start_postmaster_stub(self.root)
+        result, record = self._run_postmaster_watch(postmaster.pid)
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn('"SendShutdownResponses": "true"', record)
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_postmaster_watch_resumes_for_restarted_postmaster(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        postmaster = self._start_postmaster_stub(self.data_dir)
+        result, record = self._run_postmaster_watch(dead.pid, postmaster.pid)
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 7, msg=output)
+        flags = [json.loads(line)["SendShutdownResponses"] for line in record.splitlines()]
+        self.assertIn("true", flags)
+        self.assertEqual(flags[0], "false")
+        self.assertEqual(flags[-1], "false")
+        self.assertIn("PostgreSQL is accepting connections again", output)
+
+    # Shutdown: the paths that run cleanup() fast-stop the PostgreSQL this
+    # container started, keep the exit status, and leave other servers alone.
+
+    def _configure_lifecycle_stubs(self, start_rc=0, gateway_body="exit 0", pg_ctl_body="exit 0"):
+        """A stubbed START_POSTGRESQL=true boot that records every pg_ctl call."""
+        self._configure_toast_stubs()
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"#!/bin/sh\ntouch '{self.data_dir / 'postmaster.pid'}' '{self.data_dir / 'pglog.log'}'\n"
+            f"exit {start_rc}\n",
+        )
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway", f"#!/bin/sh\n{gateway_body}\n"
+        )
+        self.pg_ctl_calls = self.root / "pg-ctl-calls"
+        self._write_exec(
+            self.bin_dir / "pg_ctl",
+            f'#!/bin/sh\necho "$*" >> "{self.pg_ctl_calls}"\n{pg_ctl_body}\n',
+        )
+
+    def _lifecycle_env(self, extra_env=None):
+        env = {
+            "START_POSTGRESQL": "true",
+            "TOAST_COMPRESSION_CONF": str(self.root / "toast.conf"),
+            # The stub postmaster.pid names no live process; keep the watch
+            # from ending the run before the test does.
+            "DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT": "60",
+        }
+        env.update(extra_env or {})
+        return env
+
+    def _recorded_pg_ctl_calls(self):
+        try:
+            return self.pg_ctl_calls.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
+    def _fast_stop(self):
+        return f"stop -D {self.data_dir} -m fast"
+
+    def _spawn_entrypoint(self, extra_env):
+        """Start the entrypoint in the background; output goes to files so a
+        lingering tee can never block the test."""
+        out = (self.root / "entrypoint.out").open("w")
+        err = (self.root / "entrypoint.err").open("w")
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        proc = subprocess.Popen(
+            ["bash", str(ENTRYPOINT)],
+            cwd=REPO_ROOT,
+            env=self._entrypoint_env(extra_env),
+            text=True,
+            stdout=out,
+            stderr=err,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(self._kill_process_group, proc)
+        return proc
+
+    def _kill_process_group(self, proc):
+        # A failed assertion leaves the gateway stub, tee and log tails running.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=10)
+
+    def _spawned_output(self):
+        return (self.root / "entrypoint.out").read_text() + (self.root / "entrypoint.err").read_text()
+
+    def _wait_for_path(self, proc, path, timeout=20):
+        deadline = time.monotonic() + timeout
+        while not path.exists():
+            if proc.poll() is not None or time.monotonic() > deadline:
+                self.fail(f"{path.name} never appeared:\n{self._spawned_output()}")
+            time.sleep(0.05)
+
+    def _use_shared_utils(self):
+        """The real utils.sh turns on set -eu and an ERR trap for the rest of
+        the run; the setUp stub does not. Its admin-user path needs real jq."""
+        (self.bin_dir / "jq").unlink(missing_ok=True)
+        if shutil.which("jq", path=self._entrypoint_env()["PATH"]) is None:
+            self.skipTest("jq not available; the hardened admin-user path needs real jq")
+        shutil.copy2(REPO_ROOT / "scripts" / "utils.sh", self.gateway_scripts / "utils.sh")
+
+    def _assert_docker_stop_fast_stops_postgresql(self, extra_env=None):
+        self._configure_lifecycle_stubs(gateway_body="exec sleep 60")
+        if extra_env:
+            self._use_shared_utils()
+        proc = self._spawn_entrypoint(self._lifecycle_env(extra_env))
+        self._wait_for_path(proc, self.root / "runtime-state.env")
+
+        proc.terminate()
+        proc.wait(timeout=30)
+
+        self.assertEqual(proc.returncode, 0, msg=self._spawned_output())
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_docker_stop_fast_stops_postgresql_and_exits_zero(self):
+        self._assert_docker_stop_fast_stops_postgresql()
+
+    def test_docker_stop_fast_stops_postgresql_with_the_shared_utils_shell_options(self):
+        self._assert_docker_stop_fast_stops_postgresql({"CREATE_USER": "true"})
+
+    def test_gateway_exit_status_survives_the_postgresql_stop(self):
+        for create_user in ("false", "true"):
+            with self.subTest(create_user=create_user):
+                self._configure_lifecycle_stubs(gateway_body="exit 7")
+                self.pg_ctl_calls.unlink(missing_ok=True)
+                result = self._run_entrypoint(
+                    extra_env=self._lifecycle_env({"CREATE_USER": create_user})
+                )
+                self.assertEqual(result.returncode, 7, msg=result.stdout + result.stderr)
+                self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_gateway_exit_status_survives_with_the_shared_utils_shell_options(self):
+        # The tail stub exits at once, so every log streamer is already gone
+        # and the kills that precede the PostgreSQL stop fail under errexit.
+        self._configure_lifecycle_stubs(gateway_body="exit 7")
+        self._use_shared_utils()
+        result = self._run_entrypoint(extra_env=self._lifecycle_env({"CREATE_USER": "true"}))
+
+        self.assertEqual(result.returncode, 7, msg=result.stdout + result.stderr)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_a_failure_after_the_admin_user_reports_through_the_utils_error_trap(self):
+        # The code after the admin user runs at script scope with utils.sh's
+        # errexit and ERR trap: an unguarded failure prints the trap's message
+        # and exits 1, whatever status the failing command had.
+        self._use_shared_utils()
+        self._write_exec(self.bin_dir / "psql", "#!/bin/sh\ncat > /dev/null\nexit 0\n")
+        self._write_exec(
+            self.bin_dir / "chmod",
+            f"""#!/bin/sh
+case "$*" in *test_config.json*) exit 42 ;; esac
+exec {shutil.which("chmod")} "$@"
+""",
+        )
+        result = self._run_entrypoint(extra_env={"CREATE_USER": "true"})
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, msg=output)
+        self.assertIn("Error on or near line", result.stdout)
+        self.assertNotIn("gateway-daemon-stub-started", output)
+
+    def test_variables_declared_by_utils_reach_the_gateway(self):
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            '#!/bin/sh\ndeclare -x DOCUMENTDB_TEST_DECLARED=from-utils\n'
+            'SetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            '#!/bin/sh\necho "gateway-sees=${DOCUMENTDB_TEST_DECLARED:-unset}"\n',
+        )
+        # An ambient value, so a declaration that does not reach the gateway
+        # cannot pass by coincidence.
+        result = self._run_entrypoint(
+            extra_env={"CREATE_USER": "true", "DOCUMENTDB_TEST_DECLARED": "ambient"}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("gateway-sees=from-utils", result.stdout)
+
+    def test_utils_sees_no_command_line_arguments(self):
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            '#!/bin/sh\nif [ "$#" -ne 0 ]; then echo "utils saw $# arguments" >&2; exit 64; fi\n'
+            'SetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        result = self._run_entrypoint(
+            "--create-user", "true", "--skip-init-data", "--password", _TEST_PW
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("stub-user-created", result.stdout)
+
+    def _stage_entrypoint(self, staged, skip=None):
+        (staged / "lib").mkdir(parents=True)
+        for script in ENTRYPOINT.parent.glob("*.sh"):
+            shutil.copy2(script, staged / script.name)
+        for lib in LIB_DIR.glob("*.sh"):
+            if lib.name != skip:
+                shutil.copy2(lib, staged / "lib" / lib.name)
+
+    def test_an_unusable_library_stops_the_boot_before_anything_starts(self):
+        self._configure_lifecycle_stubs()
+        for lib in sorted(p.name for p in LIB_DIR.glob("*.sh")):
+            with self.subTest(lib=lib):
+                staged = self.root / f"staged-{lib}"
+                self._stage_entrypoint(staged, skip=lib)
+                (staged / "lib" / lib).mkdir()
+                result = subprocess.run(
+                    ["bash", str(staged / "emulator_entrypoint.sh")],
+                    cwd=REPO_ROOT, env=self._entrypoint_env(self._lifecycle_env()),
+                    text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+                )
+
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn(f"cannot load lib/{lib}", result.stderr)
+                self.assertFalse((self.data_dir / "postmaster.pid").exists(),
+                                 "PostgreSQL was started")
+                self.assertEqual(self._recorded_pg_ctl_calls(), "")
+
+    def test_a_serve_script_lost_after_start_still_stops_postgres(self):
+        staged = self.root / "staged-scripts"
+        self._stage_entrypoint(staged)
+        self._configure_lifecycle_stubs()
+        # PostgreSQL starts, then serve.sh goes away before it is sourced.
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"#!/bin/sh\ntouch '{self.data_dir / 'postmaster.pid'}' '{self.data_dir / 'pglog.log'}'\n"
+            f"rm -f '{staged / 'lib' / 'serve.sh'}'\n",
+        )
+        result = subprocess.run(
+            ["bash", str(staged / "emulator_entrypoint.sh")],
+            cwd=REPO_ROOT, env=self._entrypoint_env(self._lifecycle_env()),
+            text=True, capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("cannot run lib/serve.sh", result.stderr)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_entrypoint_helpers_win_over_same_named_utils_functions(self):
+        # The marker helpers are defined after utils.sh is sourced, so a
+        # utils.sh function of the same name cannot replace them.
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            "#!/bin/sh\ninit_marker_present() { return 0; }\nwrite_init_marker() { :; }\n"
+            'SetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        result = self._run_entrypoint(extra_env={"CREATE_USER": "true", "INIT_DATA": "true"})
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("init-script-stub-started", result.stdout)
+        self.assertTrue(
+            (self.data_dir / ".documentdb-local" / "sample_data_initialized").exists()
+        )
+
+    def test_postmaster_watch_is_not_replaced_by_a_utils_function(self):
+        self._configure_lifecycle_stubs(gateway_body="exec sleep 20")
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            "#!/bin/sh\npostmaster_running() { return 0; }\n"
+            'SetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        result = self._run_entrypoint(
+            extra_env=self._lifecycle_env(
+                {"CREATE_USER": "true", "DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT": "1"}
+            )
+        )
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("PostgreSQL has not been running for 1 seconds", result.stderr)
+
+    def test_a_failing_stop_keeps_the_original_exit_status(self):
+        self._configure_lifecycle_stubs(gateway_body="exit 7", pg_ctl_body="exit 1")
+        result = self._run_entrypoint(extra_env=self._lifecycle_env())
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 7, msg=output)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+        # Cleanup after the failed stop still ran.
+        host_config = Path(self._read_config()["DynamicConfigurationFile"])
+        self.assertFalse(host_config.exists(), msg=output)
+
+    def test_a_signal_during_shutdown_keeps_the_original_exit_status(self):
+        # pg_ctl holds until the test has sent the signal, so it always lands
+        # while shutdown is running.
+        stopping = self.root / "pg-ctl-running"
+        release = self.root / "pg-ctl-release"
+        released = self.root / "pg-ctl-released"
+        self._configure_lifecycle_stubs(
+            gateway_body="exit 7",
+            pg_ctl_body=(
+                f"touch '{stopping}'\ni=0\n"
+                f"while [ ! -e '{release}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\n"
+                f"[ -e '{release}' ] && touch '{released}'\nexit 0"
+            ),
+        )
+        proc = self._spawn_entrypoint(self._lifecycle_env())
+        self._wait_for_path(proc, stopping)
+
+        proc.terminate()
+        release.touch()
+        proc.wait(timeout=30)
+
+        self.assertTrue(released.exists(), "pg_ctl gave up before the signal was sent")
+        self.assertEqual(proc.returncode, 7, msg=self._spawned_output())
+        self.assertEqual(self._recorded_pg_ctl_calls().count("stop"), 1)
+
+    def test_a_failure_after_startup_stops_postgresql(self):
+        self._configure_lifecycle_stubs()
+        # Fail only the getParameter stub install; the probes stay healthy.
+        self._write_exec(
+            self.bin_dir / "psql",
+            """#!/bin/sh
+case "$*" in
+  *pg_available_extensions*) echo "1,1"; exit 0 ;;
+  *enumvals*) echo t; exit 0 ;;
+esac
+if grep -q get_parameter; then exit 1; fi
+exit 0
+""",
+        )
+        result = self._run_entrypoint(extra_env=self._lifecycle_env())
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("getParameter rejection stub", result.stderr)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def _run_extension_update(self, rows, query_rc=0, alter_rc=0):
+        """Boot with a catalog whose out-of-date extensions are `rows`
+        (name|installed|default); returns the run and every SQL text psql read."""
+        self._configure_lifecycle_stubs()
+        sql_log = self.root / "psql-sql"
+        answer = "".join(f"{row}\\n" for row in rows)
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+case "$*" in
+  *pg_available_extensions*) echo "1,1"; exit 0 ;;
+  *enumvals*) echo t; exit 0 ;;
+esac
+sql="$(cat)"
+printf '%s\\n' "$sql" >> "{sql_log}"
+case "$sql" in
+  *"<> a.default_version"*) printf '{answer}'; exit {query_rc} ;;
+  *"ALTER EXTENSION"*) exit {alter_rc} ;;
+esac
+exit 0
+""",
+        )
+        result = self._run_entrypoint(extra_env=self._lifecycle_env())
+        sql = sql_log.read_text(encoding="utf-8") if sql_log.exists() else ""
+        return result, sql
+
+    def test_an_older_extension_catalog_is_updated_before_the_gateway_starts(self):
+        result, sql = self._run_extension_update(
+            [
+                "documentdb_core|1.0-0|1.2-0",
+                "documentdb|1.0-0|1.2-0",
+                "documentdb_extended_rum|1.0-0|1.2-0",
+            ]
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "Updating the DocumentDB extensions on this data volume: "
+            "documentdb_core 1.0-0 -> 1.2-0, documentdb 1.0-0 -> 1.2-0, "
+            "documentdb_extended_rum 1.0-0 -> 1.2-0",
+            result.stdout,
+        )
+        self.assertIn("DocumentDB extensions updated.", result.stdout)
+        # One transaction, core first: documentdb is built against it.
+        self.assertIn(
+            "BEGIN;\nALTER EXTENSION documentdb_core UPDATE;\n"
+            "ALTER EXTENSION documentdb UPDATE;\n"
+            "ALTER EXTENSION documentdb_extended_rum UPDATE;\nCOMMIT;\n",
+            sql,
+        )
+        self.assertLess(sql.index("ALTER EXTENSION"), sql.index("get_parameter"))
+        self.assertLess(
+            result.stdout.index("DocumentDB extensions updated."),
+            result.stdout.index("Starting gateway in the background"),
+        )
+
+    def test_a_current_extension_catalog_is_left_alone(self):
+        result, sql = self._run_extension_update([])
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("ALTER EXTENSION", sql)
+        self.assertNotIn("Updating the DocumentDB extensions", result.stdout)
+
+    def test_a_newer_extension_catalog_is_not_downgraded(self):
+        # 1.10-0 is newer than 1.9-0; a text comparison would say otherwise.
+        result, sql = self._run_extension_update(["documentdb_core|1.10-0|1.9-0"])
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("ALTER EXTENSION", sql)
+        self.assertIn(
+            "documentdb_core on this data volume is at version 1.10-0, newer than "
+            "this image's 1.9-0. Downgrading is not supported",
+            result.stderr,
+        )
+
+    def test_a_failed_extension_update_stops_the_boot(self):
+        for name, kwargs, message in (
+            ("update", {"alter_rc": 3}, "updating the DocumentDB extensions failed and was rolled back"),
+            ("version query", {"query_rc": 2}, "could not read the DocumentDB extension versions"),
+        ):
+            with self.subTest(name):
+                result, _ = self._run_extension_update(
+                    ["documentdb_core|1.0-0|1.2-0"], **kwargs
+                )
+
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("Starting gateway in the background", result.stdout)
+                self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_a_signal_during_exit_trap_shutdown_keeps_the_failure_status(self):
+        # A bare exit stops PostgreSQL from the EXIT trap; docker stop lands meanwhile.
+        stopping = self.root / "pg-ctl-running"
+        release = self.root / "pg-ctl-release"
+        self._configure_lifecycle_stubs(
+            start_rc=3,
+            pg_ctl_body=(
+                f"touch '{stopping}'\ni=0\n"
+                f"while [ ! -e '{release}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\nexit 0"
+            ),
+        )
+        proc = self._spawn_entrypoint(self._lifecycle_env())
+        self._wait_for_path(proc, stopping)
+
+        proc.terminate()
+        release.touch()
+        proc.wait(timeout=30)
+
+        self.assertEqual(proc.returncode, 3, msg=self._spawned_output())
+        self.assertEqual(self._recorded_pg_ctl_calls().count("stop"), 1)
+
+    def test_the_readiness_wait_counts_time_spent_in_the_probe(self):
+        # A probe that blocks past the timeout ends the wait after one try; a
+        # sleep counter would keep probing.
+        probes = self.root / "probes"
+        self._write_exec(
+            self.bin_dir / "pg_isready",
+            f"#!/bin/sh\necho x >> '{probes}'\n/bin/sleep 3\nexit 1\n",
+        )
+        script = (
+            f'. "{LIB_DIR / "runtime.sh"}"\n'
+            "POSTGRESQL_PORT=9712 DOCUMENTDB_PG_READY_TIMEOUT=2 DOCUMENTDB_PG_READY_INTERVAL=1\n"
+            'wait_for_pg_ready 60; echo "rc=$? timeout=$pg_ready_timeout"\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], env=self._entrypoint_env(),
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        self.assertIn("rc=1 timeout=2", result.stdout, msg=result.stdout + result.stderr)
+        self.assertEqual(probes.read_text().count("x"), 1)
+
+    def test_a_bare_exit_after_server_setup_fails_stops_postgresql(self):
+        # The postmaster is up when start_oss_server.sh fails; only the EXIT trap runs.
+        self._configure_lifecycle_stubs(start_rc=3)
+        result = self._run_entrypoint(extra_env=self._lifecycle_env())
+
+        self.assertEqual(result.returncode, 3, msg=result.stdout + result.stderr)
+        self.assertIn("start_oss_server.sh failed", result.stderr)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_a_bare_exit_when_the_admin_user_fails_stops_postgresql(self):
+        self._configure_lifecycle_stubs()
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            "#!/bin/sh\nSetupCustomAdminUser() { return 1; }\n",
+        )
+        result = self._run_entrypoint(extra_env=self._lifecycle_env({"CREATE_USER": "true"}))
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("failed to create the admin user", result.stderr)
+        self.assertEqual(self._recorded_pg_ctl_calls().count("stop"), 1)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_an_errexit_failure_after_startup_stops_postgresql(self):
+        # utils.sh's errexit and ERR trap exit directly, past cleanup().
+        self._configure_lifecycle_stubs()
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            "#!/bin/sh\nset -e\ntrap 'exit 1' ERR\n"
+            "SetupCustomAdminUser() { :; }\n",
+        )
+        self._write_exec(
+            self.bin_dir / "chmod",
+            f"""#!/bin/sh
+case "$*" in *test_config.json*) exit 42 ;; esac
+exec {shutil.which("chmod")} "$@"
+""",
+        )
+        result = self._run_entrypoint(extra_env=self._lifecycle_env({"CREATE_USER": "true"}))
+
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(self._fast_stop(), self._recorded_pg_ctl_calls())
+
+    def test_a_refused_claim_never_stops_postgresql(self):
+        self._configure_lifecycle_stubs()
+        (self.data_dir / "postmaster.pid").write_text(
+            f"999999\n{self.data_dir}\n1700000000\n9712\n", encoding="utf-8"
+        )
+        result = self._run_entrypoint(extra_env=self._lifecycle_env())
+
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+        self.assertEqual(self._recorded_pg_ctl_calls(), "")
+
+    def test_an_external_postgresql_is_never_stopped(self):
+        self._configure_lifecycle_stubs()
+        (self.data_dir / "postmaster.pid").write_text("4242\n", encoding="utf-8")
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "false"})
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertEqual(self._recorded_pg_ctl_calls(), "")
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_shutdown_stops_the_usage_telemetry_emitter(self):
+        pid_file = self.root / "telemetry.pid"
+        self._write_exec(
+            self.gateway_scripts / "usage_telemetry.sh",
+            f"#!/bin/bash\necho $$ > '{pid_file}'\nexec sleep 60 >/dev/null 2>&1\n",
+        )
+        # The gateway stays up until the emitter, which starts after readiness, runs.
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            f"#!/bin/sh\ni=0\nwhile [ ! -s '{pid_file}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\nexit 0\n",
+        )
+        result = self._run_entrypoint()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 5
+        while self._pid_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self._pid_running(pid), "the telemetry emitter outlived the entrypoint")
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_a_bare_exit_after_the_gateway_starts_stops_the_gateway(self):
+        # The readiness timeout is a plain `exit 1`, not a signal.
+        pid_file = self.root / "gateway.pid"
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            f"#!/bin/sh\necho $$ > '{pid_file}'\nexec {shutil.which('sleep')} 60\n",
+        )
+        self._write_exec(self.bin_dir / "nc", "#!/bin/sh\nexit 1\n")
+        self._write_exec(self.bin_dir / "sleep", "#!/bin/sh\nexit 0\n")
+        result = self._run_entrypoint()
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("Gateway failed to start within 60 seconds", result.stdout)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 5
+        while self._pid_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self._pid_running(pid), "the gateway outlived the entrypoint")
+
+    @staticmethod
+    def _pid_running(pid):
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return False
+        return stat_line.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+
+    def test_toast_compression_defaults_to_lz4(self):
+        result, conf, args_capture = self._run_with_toast()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+        # Registered as include_if_exists appended AFTER the server is up —
+        # never as a hard include via start_oss_server -f, which would record
+        # a fatal dependency on the /tmp fragment in the persistent volume
+        # (an older image that never writes the fragment could not boot it).
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-f", args)
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertIn(f"include_if_exists = '{conf}'", pg_conf)
+        self.assertNotIn(f"include '{conf}'", pg_conf)
+        # The boot that first adds the include must reload the config so the
+        # fragment applies immediately (default_toast_compression is not
+        # startup-only).
+        self.assertIn(
+            "SELECT pg_reload_conf()",
+            self.toast_psql_args.read_text(encoding="utf-8"),
+        )
+
+    def test_toast_compression_can_be_set_to_pglz(self):
+        result, conf, _ = self._run_with_toast(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "pglz"}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'pglz'", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_default_leaves_server_setting_alone(self):
+        result, conf, _ = self._run_with_toast(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "default"}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_rejects_invalid_value(self):
+        result, _, _ = self._run_with_toast(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "zstd"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Invalid TOAST compression value 'zstd'",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_compression_flag_sets_method(self):
+        # The CLI flag mirrors the environment variable, matching every other
+        # knob in usage() (e.g. --tlsMode / TLS_MODE).
+        result, conf, _ = self._run_with_toast(
+            extra_args=("--toast-compression", "pglz")
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'pglz'", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_flag_beats_environment(self):
+        result, conf, _ = self._run_with_toast(
+            extra_args=("--toast-compression", "lz4"),
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "pglz"},
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_flag_rejects_invalid_value(self):
+        result, _, _ = self._run_with_toast(
+            extra_args=("--toast-compression", "snappy")
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Invalid TOAST compression value 'snappy'",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_compression_flag_requires_a_value(self):
+        # A trailing flag with no value must fail loudly: an empty value
+        # would read as "no explicit choice" and silently take the
+        # quiet-degradation path reserved for the built-in default.
+        result, _, _ = self._run_with_toast(extra_args=("--toast-compression",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--toast-compression requires a value", result.stderr)
+
+    def test_toast_compression_flag_rejects_empty_value(self):
+        # Same hazard as the missing value: --toast-compression "" would
+        # otherwise silently become the implicit default.
+        result, _, _ = self._run_with_toast(
+            extra_args=("--toast-compression", "")
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--toast-compression requires a value", result.stderr)
+
+    # The knob only takes effect when this container starts PostgreSQL, but
+    # "does not take effect" must never mean "is not even looked at": a bad
+    # value used to be accepted silently here while being fatal in the
+    # default mode, and an honored-looking request used to vanish without a
+    # word. START_POSTGRESQL="false" is the harness default, so these run in
+    # the caller-managed-PostgreSQL mode.
+    def test_toast_compression_flag_rejects_invalid_value_with_external_postgres(self):
+        result = self._run_entrypoint("--toast-compression", "snappy")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Invalid TOAST compression value 'snappy'",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_compression_env_rejects_invalid_value_with_external_postgres(self):
+        result = self._run_entrypoint(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "snappy"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Invalid TOAST compression value 'snappy'",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_compression_explicit_request_warns_with_external_postgres(self):
+        result = self._run_entrypoint("--toast-compression", "pglz")
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(_TOAST_IGNORED_MARKER, result.stderr)
+        self.assertIn("pglz", result.stderr)
+
+    def test_toast_compression_explicit_lz4_warns_with_external_postgres(self):
+        # Explicitly naming the built-in default still warns: what matters is
+        # that the operator ASKED, not whether the value happens to match the
+        # value this container would have chosen for a server it owns.
+        result = self._run_entrypoint(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "lz4"}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(_TOAST_IGNORED_MARKER, result.stderr)
+
+    def test_toast_compression_explicit_default_is_silent_with_external_postgres(self):
+        # "default" means leave the server's own setting alone, which is
+        # precisely what happens here, so there is nothing to warn about.
+        result = self._run_entrypoint("--toast-compression", "default")
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(_TOAST_IGNORED_MARKER, result.stdout + result.stderr)
+
+    def test_toast_compression_implicit_default_is_silent_with_external_postgres(self):
+        # The overwhelmingly common case: nobody asked for anything. Warning
+        # here would put a permanent scary line in every such boot's log.
+        result = self._run_entrypoint()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(_TOAST_IGNORED_MARKER, result.stdout + result.stderr)
+
+    def test_toast_compression_conf_rejects_relative_path(self):
+        # The entrypoint writes the fragment relative to its own CWD while
+        # PostgreSQL resolves a relative include against the data directory,
+        # so a relative path would silently never apply.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": "toast.conf",
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be an absolute path", result.stderr)
+
+    def test_toast_compression_conf_rejects_data_dir_path(self):
+        # A fragment inside the data volume outlives the container: it
+        # defeats the rollback-safety design (older images would keep
+        # applying it) and a stale persistent fragment behind a dangling
+        # include from an earlier path can shadow the current boot's choice.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(self.data_dir / "toast.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not point inside the data directory", result.stderr)
+
+    def test_toast_compression_conf_rejects_data_dir_path_with_trailing_slash(self):
+        # DATA_PATH is operator-settable and never normalized, so a trailing
+        # slash made the containment pattern "/data//*", which matches nothing:
+        # the guard silently passed and the fragment was persisted inside the
+        # data volume, defeating the rollback design.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DATA_PATH": f"{self.data_dir}/",
+                "TOAST_COMPRESSION_CONF": str(self.data_dir / "toast.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not point inside the data directory", result.stderr)
+
+    def test_toast_compression_conf_rejects_data_dir_path_via_dotdot(self):
+        # A purely lexical compare is also defeated by ".." in DATA_PATH:
+        # "<data>/../<data>" makes the pattern miss, and the fragment lands
+        # inside the data volume. Canonical paths are compared too.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DATA_PATH": f"{self.data_dir}/../{self.data_dir.name}",
+                "TOAST_COMPRESSION_CONF": str(self.data_dir / "toast.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not point inside the data directory", result.stderr)
+
+    def test_toast_compression_conf_rejects_data_dir_reached_by_symlink(self):
+        # Same hole via a symlinked DATA_PATH: the lexical forms differ while
+        # both resolve to the same directory.
+        self._configure_toast_stubs()
+        link = self.root / "data-link"
+        link.symlink_to(self.data_dir)
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DATA_PATH": str(link),
+                "TOAST_COMPRESSION_CONF": str(self.data_dir / "toast.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not point inside the data directory", result.stderr)
+
+    def test_toast_compression_conf_rejects_the_data_dir_itself(self):
+        # Containment checked descendants but not equality, so CONF == DATA_PATH
+        # passed. That is the worst shape: `mv tmp "$DATA_PATH"` SUCCEEDS
+        # against a directory by moving the temp file into it, so the write
+        # reported success while stranding the fragment in the persistent
+        # volume and registering an include pointing at a directory.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(self.data_dir),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not point inside the data directory", result.stderr)
+        # Nothing may be left behind in the volume by the rejected run.
+        self.assertEqual(
+            [p.name for p in self.data_dir.glob("*documentdb-tmp*")], []
+        )
+
+    def test_toast_compression_conf_rejects_a_directory_outside_the_data_dir(self):
+        # Same mv-into-a-directory hazard, just not in the data volume.
+        self._configure_toast_stubs()
+        target = self.root / "somedir"
+        target.mkdir()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(target),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must name a file", result.stderr)
+        self.assertEqual([p.name for p in target.iterdir()], [])
+
+    def test_toast_compression_conf_allows_sibling_of_data_dir(self):
+        # Guards against over-correcting the trailing-slash fix into a plain
+        # prefix match: "<data_dir>-sibling" starts with the data dir's text
+        # but is not inside it.
+        self._configure_toast_stubs()
+        conf = Path(f"{self.data_dir}-sibling") / "toast.conf"
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DATA_PATH": f"{self.data_dir}/",
+                "TOAST_COMPRESSION_CONF": str(conf),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_conf_rejects_single_quote(self):
+        # The path is embedded in a single-quoted include line; a quote in
+        # it would produce a malformed postgresql.conf.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(self.root / "to'ast.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not contain single quotes", result.stderr)
+
+    def test_toast_compression_conf_rejects_backslash(self):
+        # A trailing backslash would escape the include line's closing quote.
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(self.root / "toast\\.conf"),
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not contain single quotes", result.stderr)
+
+    def test_toast_compression_probe_prefers_versioned_bindir(self):
+        # Provenance pin: start_oss_server launches the postmaster from the
+        # versioned bindir (GetPostgresPath in utils.sh), never from PATH, so
+        # the lz4 probe must consult those binaries first and use PATH only
+        # as a fallback — a foreign pg_config earlier on PATH must not answer
+        # for the server's build.
+        toast = _lib_text("toast.sh")
+        versioned = toast.index('/usr/lib/postgresql/${PG_MAJOR_ASSUMED}/bin')
+        self.assertIn('/usr/pgsql-${PG_MAJOR_ASSUMED}/bin', toast)
+        path_fallback = toast.index("command -v pg_config")
+        self.assertLess(versioned, path_fallback)
+
+    def test_toast_compression_fragment_write_failure_degrades_default(self):
+        # The BUILT-IN default is a performance optimization: when its
+        # fragment cannot be written (and no stale fragment is left behind --
+        # the failed write removes it, so the include_if_exists dangles and
+        # the server default applies), the boot must continue with a warning
+        # rather than turn a previously bootable volume into a failed boot.
+        self._configure_toast_stubs()
+        conf = self.root / "no-such-dir" / "toast.conf"
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(conf),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "Warning: could not write the TOAST compression fragment",
+            result.stderr,
+        )
+        self.assertNotIn(
+            "Error: could not write the TOAST compression fragment",
+            result.stderr,
+        )
+        self.assertFalse(conf.exists())
+
+    def test_toast_compression_fragment_write_failure_fails_explicit(self):
+        # An EXPLICIT choice that cannot be honored must fail loudly
+        # (documentdb-tune contract) -- silent degradation would hide that
+        # the requested compression is not in effect. Parametrized over both
+        # explicit values because they abort in DIFFERENT branches: pglz is
+        # written pre-start (bare exit), lz4 is deferred and its write
+        # failure surfaces in the post-start upgrade (through cleanup).
+        for value in ("pglz", "lz4"):
+            with self.subTest(value=value):
+                self._configure_toast_stubs()
+                conf = self.root / "no-such-dir" / "toast.conf"
+                result = self._run_entrypoint(
+                    extra_env={
+                        "START_POSTGRESQL": "true",
+                        "TOAST_COMPRESSION_CONF": str(conf),
+                        "DOCUMENTDB_TOAST_COMPRESSION": value,
+                    }
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "Error: could not write the TOAST compression fragment",
+                    result.stderr,
+                )
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "chmod-based read-only dir is a no-op for root",
+    )
+    def test_toast_compression_stale_fragment_that_cannot_be_replaced_aborts(self):
+        # The one write-failure case that must ALWAYS abort: a previous
+        # boot's fragment exists, the rewrite fails, and the stale file
+        # cannot be removed either -- continuing would leave the include
+        # applying a value this boot did not choose. Simulated by making the
+        # fragment's directory read-only (the file survives rm -f).
+        self._configure_toast_stubs()
+        frag_dir = self.root / "toast-frag-dir"
+        frag_dir.mkdir()
+        conf = frag_dir / "toast.conf"
+        conf.write_text("default_toast_compression = 'pglz'\n", encoding="utf-8")
+        frag_dir.chmod(0o555)
+        try:
+            result = self._run_entrypoint(
+                extra_env={
+                    "START_POSTGRESQL": "true",
+                    "TOAST_COMPRESSION_CONF": str(conf),
+                }
+            )
+        finally:
+            frag_dir.chmod(0o755)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("possibly stale default_toast_compression", result.stderr)
+        # The stale value must still be on disk untouched (nothing worse
+        # happened), which is exactly why the boot had to stop.
+        self.assertIn("pglz", conf.read_text(encoding="utf-8"))
+
+    def test_toast_path_pg_config_major_mismatch_defers_to_runtime_probe(self):
+        # A pg_config on PATH speaking for a DIFFERENT major must not
+        # authorize lz4 offline: its --with-lz4 says nothing about the server
+        # this entrypoint starts. The verdict must fall through to the
+        # runtime probe. Discriminating setup (mutation-tested): the server
+        # DENIES lz4, so a gate-respecting implementation lands in the
+        # offline-unknown denial path ("was not built with lz4 support")
+        # while a gate-less one would have taken the offline "yes" at face
+        # value and reported the wrong-offline-verdict message instead.
+        self._configure_toast_stubs(lz4_runtime="f")
+        self._write_exec(
+            self.bin_dir / "pg_config",
+            """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "PostgreSQL 16.4"
+fi
+if [ "$1" = "--configure" ]; then
+  echo "'--with-openssl' '--with-lz4'"
+fi
+exit 0
+""",
+        )
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "was not built with lz4 support", result.stdout + result.stderr
+        )
+        self.assertNotIn(
+            "offline pg_config verdict was wrong", result.stdout + result.stderr
+        )
+
+    def test_toast_offline_yes_but_server_denies_stays_inert(self):
+        # THE crash-loop guard: pg_config approved lz4 offline, but the live
+        # server has no lz4 enum entry (repackaged image, wrong binary). lz4
+        # must never reach the fragment -- with the include registered in
+        # the persistent volume, an unaccepted value would be FATAL at every
+        # later boot.
+        self._configure_toast_stubs(lz4_runtime="f")
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "offline pg_config verdict was wrong",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_offline_yes_but_server_denies_fails_explicit(self):
+        self._configure_toast_stubs(lz4_runtime="f")
+        result, conf, _ = self._run_with_toast_existing_stubs(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "lz4"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was requested, but", result.stderr)
+        # Post-start failure: must exit through cleanup(), not a bare exit.
+        self.assertIn("Shutting down DocumentDB components", result.stdout)
+        # lz4 must never have reached the fragment, so the volume boots
+        # cleanly once the operator fixes the request.
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_offline_yes_unconfirmed_by_server_stays_inert(self):
+        # Probe failure with the server ACCEPTING connections (the stubbed
+        # pg_isready gate passes): the offline "yes" stays UNCONFIRMED, so
+        # lz4 must not reach the fragment this boot; the built-in default
+        # keeps the container running and retries at the next start.
+        self._configure_toast_stubs(lz4_runtime=None)
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "could not confirm lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_offline_yes_unconfirmed_by_server_fails_explicit(self):
+        # Same probe failure, but with an EXPLICIT lz4 request: the server
+        # accepts connections yet the probe query failed -- a genuine
+        # anomaly, and the explicit contract is uniform: the value either
+        # verifiably applies or the boot fails saying why (through cleanup;
+        # the server is running).
+        self._configure_toast_stubs(lz4_runtime=None)
+        result, conf, _ = self._run_with_toast_existing_stubs(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "lz4"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not confirm lz4 support", result.stderr)
+        self.assertIn("Shutting down DocumentDB components", result.stdout)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_commented_out_include_is_respected_not_silently(self):
+        # A commented-out copy of the include is an operator's deliberate
+        # disable: the entrypoint must not re-add an active line over it --
+        # but never silently. The built-in default warns and continues; an
+        # explicit non-default request fails loudly, because it can never
+        # take effect on any boot while the include is disabled.
+        expected_conf = self.root / "toast.conf"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "postgresql.conf").write_text(
+            f"port = 9712\n# include_if_exists = '{expected_conf}'\n",
+            encoding="utf-8",
+        )
+
+        with self.subTest(mode="default"):
+            result, conf, _ = self._run_with_toast()
+            self.assertEqual(
+                result.returncode, 0, msg=result.stdout + result.stderr
+            )
+            pg_conf = (self.data_dir / "postgresql.conf").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(f"\ninclude_if_exists = '{conf}'", pg_conf)
+            self.assertIn(
+                "commented-out form", result.stdout + result.stderr
+            )
+
+        with self.subTest(mode="explicit"):
+            result, conf, _ = self._run_with_toast(
+                extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "pglz"}
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot take effect", result.stderr)
+            self.assertIn("commented-out form", result.stdout + result.stderr)
+            pg_conf = (self.data_dir / "postgresql.conf").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(f"\ninclude_if_exists = '{conf}'", pg_conf)
+
+    def test_post_start_readiness_gate_precedes_lz4_probe(self):
+        # postmaster.pid appears before crash recovery finishes; the boot
+        # must wait for the server to ACCEPT connections (pg_isready) before
+        # the lz4 probe and the getParameter stub run, or slow-recovering
+        # volumes read as probe anomalies. The gate's verdict is covered by
+        # test_unready_server_stays_inert_and_boots.
+        # The pidfile wait before the gate is covered by
+        # test_startup_waits_for_the_pidfile_before_the_readiness_gate.
+        self._configure_toast_stubs()
+        calls = self.root / "call-order"
+        self._write_exec(
+            self.bin_dir / "pg_isready", f'#!/bin/sh\necho gate >> "{calls}"\nexit 0\n'
+        )
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+case "$*" in
+  *pg_available_extensions*) echo rum >> "{calls}"; echo "1,1"; exit 0 ;;
+  *enumvals*) echo probe >> "{calls}"; echo t; exit 0 ;;
+esac
+if grep -q get_parameter; then echo stub >> "{calls}"; fi
+exit 0
+""",
+        )
+        result, _, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        order = calls.read_text(encoding="utf-8").split()
+        positions = [order.index(step) for step in ("gate", "rum", "probe", "stub")]
+        self.assertEqual(positions, sorted(positions), msg=order)
+
+    def test_startup_waits_for_the_pidfile_before_the_readiness_gate(self):
+        # The real wait runs; the pidfile appears only after the server launch returns.
+        pidfile = self.data_dir / "postmaster.pid"
+        script = (
+            f'. "{LIB_DIR / "postgres.sh"}"\n'
+            "toast_prepare_fragment() { :; }\n"
+            "stream_postgresql_logs() { :; }\n"
+            "record_postmaster_owner() { :; }\n"
+            f"run_start_oss_server() {{ (sleep 2; touch '{pidfile}') & }}\n"
+            "wait_until_accepting_connections() {\n"
+            f"    if [ -f '{pidfile}' ]; then echo gate-after-pidfile; else echo gate-before-pidfile; fi\n"
+            "}\n"
+            f"DATA_PATH='{self.data_dir}' ALLOW_EXTERNAL_CONNECTIONS=false start_postgresql\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("gate-after-pidfile", result.stdout.split())
+        self.assertNotIn("gate-before-pidfile", result.stdout.split())
+
+    def test_unready_server_stays_inert_and_boots(self):
+        # Behavioral half of the readiness gate: pg_isready never reports
+        # ready (WAL recovery that outlasts the bounded gate), the probe
+        # gets no answer -- the boot must NOT fail on that weak evidence,
+        # for the default and for an explicit request alike: warn, leave
+        # the fragment inert, and retry at the next start. The gate honors
+        # DOCUMENTDB_PG_READY_TIMEOUT, which also keeps this test fast.
+        for env, expected in (
+            ({}, "leaving the server default in effect"),
+            (
+                {"DOCUMENTDB_TOAST_COMPRESSION": "lz4"},
+                "NOT in effect this boot",
+            ),
+        ):
+            with self.subTest(env=env):
+                self._configure_toast_stubs(lz4_runtime=None)
+                self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 1\n")
+                run_env = {
+                    "DOCUMENTDB_PG_READY_TIMEOUT": "2",
+                    "DOCUMENTDB_PG_READY_INTERVAL": "1",
+                }
+                run_env.update(env)
+                result, conf, _ = self._run_with_toast_existing_stubs(
+                    extra_env=run_env
+                )
+
+                self.assertEqual(
+                    result.returncode, 0, msg=result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    "default_toast_compression = ",
+                    conf.read_text(encoding="utf-8"),
+                )
+                self.assertIn(
+                    "readiness could not be confirmed",
+                    result.stdout + result.stderr,
+                )
+                self.assertIn(expected, result.stdout + result.stderr)
+
+    def test_readiness_gate_handles_zero_padded_interval(self):
+        # sanitize_uint passes "08"/"09" through; the gate's elapsed-time
+        # arithmetic must normalize to base 10 first or $(( )) aborts with
+        # "value too great for base" -- with no set -e that abandons the
+        # whole post-start block (probe, stub install, reload) while still
+        # exiting 0: a silent skip. Mirrors the admin-wait pin
+        # (test_admin_user_wait_handles_zero_padded_interval); the instant
+        # sleep stub keeps the 8-second interval from slowing the test.
+        self._configure_toast_stubs()
+        self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 1\n")
+        sleeps = self._record_sleeps()
+        result, conf, _ = self._run_with_toast_existing_stubs(
+            extra_env={
+                "DOCUMENTDB_PG_READY_INTERVAL": "08",
+                "DOCUMENTDB_PG_READY_TIMEOUT": "2",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("8", sleeps())
+        self.assertNotIn(
+            "value too great for base", result.stdout + result.stderr
+        )
+        # The post-start block must actually have run: the gate timed out
+        # (bounded), the unanswered probe stayed lenient, and registration
+        # still happened.
+        self.assertIn(
+            "not accepting connections after", result.stdout + result.stderr
+        )
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertIn(f"include_if_exists = '{conf}'", pg_conf)
+
+    def test_missing_pg_isready_is_no_evidence_for_the_gate(self):
+        # With pg_isready absent, the gate's verdict must be "unknown" --
+        # which the severity selection treats EXACTLY like not-accepting
+        # (lenient), never like confirmed-accepting: no hard failure may be
+        # built on the absence of a probe binary. A behavioral test cannot
+        # portably remove pg_isready (the host's own copy sits later on
+        # PATH), so pin the two halves structurally: the unknown default
+        # before the command -v guard, and the severity condition that
+        # groups unknown with not-accepting.
+        gate = _function_body(_lib_text("postgres.sh"), "wait_until_accepting_connections")
+        unknown = gate.index("toast_pg_accepting=unknown")
+        guard = gate.index("command -v pg_isready", unknown)
+        self.assertLess(unknown, guard)
+        self.assertIn('[ "$toast_pg_accepting" != "true" ]', _lib_text("toast.sh"))
+
+    def test_toast_registration_skipped_when_postgresql_conf_missing(self):
+        # The entrypoint must never fabricate a postgresql.conf consisting
+        # only of its include line (wrong ownership story, wrong mode, and a
+        # data dir without a conf is not a server it booted).
+        self._configure_toast_stubs()
+        (self.data_dir / "postgresql.conf").unlink()
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertFalse((self.data_dir / "postgresql.conf").exists())
+        self.assertIn(
+            "cannot register the TOAST compression fragment",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_registration_follows_postgresql_conf_symlink(self):
+        # Split layouts symlink postgresql.conf out of the data directory.
+        # The maintenance must FOLLOW the link and rewrite the TARGET (the
+        # parent's plain `>>` did so implicitly) -- an atomic temp+mv on the
+        # link path would replace the link with a regular file, silently
+        # detaching the operator's layout.
+        self._configure_toast_stubs()
+        real_conf = self.root / "real-postgresql.conf"
+        real_conf.write_text("port = 9712\n", encoding="utf-8")
+        (self.data_dir / "postgresql.conf").unlink()
+        os.symlink(real_conf, self.data_dir / "postgresql.conf")
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue((self.data_dir / "postgresql.conf").is_symlink())
+        self.assertIn(
+            f"include_if_exists = '{conf}'",
+            real_conf.read_text(encoding="utf-8"),
+        )
+
+    def test_toast_registration_skipped_when_conf_symlink_is_dangling(self):
+        # A link that cannot be resolved is skipped with a warning rather
+        # than replaced or fabricated.
+        self._configure_toast_stubs()
+        (self.data_dir / "postgresql.conf").unlink()
+        os.symlink(self.root / "no-such-target.conf", self.data_dir / "postgresql.conf")
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue((self.data_dir / "postgresql.conf").is_symlink())
+        self.assertFalse((self.root / "no-such-target.conf").exists())
+        self.assertIn(
+            "symlink that cannot be resolved", result.stdout + result.stderr
+        )
+
+    def test_toast_registration_newline_terminates_unterminated_conf(self):
+        # A postgresql.conf whose last line has NO trailing newline must not
+        # swallow the appended include into that line (`port = 9712include_
+        # if_exists = ...` is a syntax error in the persistent volume). The
+        # rewrite normalizes the final newline (awk '1') before appending.
+        self._configure_toast_stubs()
+        (self.data_dir / "postgresql.conf").write_text(
+            "port = 9712", encoding="utf-8"
+        )
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        lines = (
+            (self.data_dir / "postgresql.conf")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(lines[0], "port = 9712")
+        self.assertIn(f"include_if_exists = '{conf}'", lines)
+
+    def test_toast_probe_is_retried_when_psql_fails(self):
+        # The enumvals probe retries briefly (bounded) when psql itself
+        # FAILS -- pin the budget: too few retries loses the tolerance, too
+        # many risks the boot stalling. The stub fails every PROBE attempt
+        # (other psql uses, e.g. the getParameter stub install, keep
+        # succeeding so the boot itself completes) and records each one.
+        self._configure_toast_stubs()
+        psql_args = self.root / "failing-psql-args"
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+case "$*" in
+  *enumvals*)
+    printf '%s\\n' "$*" >> "{psql_args}"
+    cat > /dev/null
+    exit 1
+    ;;
+esac
+cat > /dev/null
+exit 0
+""",
+        )
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        attempts = [
+            line
+            for line in psql_args.read_text(encoding="utf-8").splitlines()
+            if "enumvals" in line
+        ]
+        self.assertEqual(len(attempts), 5, msg="\n".join(attempts))
+        self.assertIn(
+            "could not confirm lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_registration_failure_leaves_conf_untouched(self):
+        # The registration rewrite must be atomic and non-destructive: when
+        # it cannot complete, postgresql.conf must be byte-identical to what
+        # it was -- a plain `>>` append (the parent's approach) can leave a
+        # truncated include line in the persistent volume on a short write.
+        # Failure injection: the temp path the rewrite must create already
+        # exists as a DIRECTORY, so the redirection fails for root and
+        # non-root alike; a `>>`-style implementation would not touch the
+        # temp path and would mutate the conf, failing this test.
+        self._configure_toast_stubs()
+        original = "port = 9712\n"
+        (self.data_dir / "postgresql.conf").write_text(original, encoding="utf-8")
+        (self.data_dir / "postgresql.conf.documentdb-tmp").mkdir()
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertEqual(
+            (self.data_dir / "postgresql.conf").read_text(encoding="utf-8"),
+            original,
+        )
+        self.assertIn(
+            "Warning: could not register the TOAST compression fragment",
+            result.stdout + result.stderr,
+        )
+
+    def test_toast_registration_failure_fails_explicit_request(self):
+        # Uniform contract: an explicit non-default request whose include
+        # cannot be put in place can never take effect, on any boot -- that
+        # must be a loud post-start failure through cleanup(), not an exit-0
+        # boot that silently runs with the server default.
+        self._configure_toast_stubs()
+        (self.data_dir / "postgresql.conf").unlink()
+        result, conf, _ = self._run_with_toast_existing_stubs(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "pglz"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot take effect", result.stderr)
+        self.assertIn("Shutting down DocumentDB components", result.stdout)
+
+    def _psql_stdin_offenders(self, path):
+        """psql commands in `path` that would inherit the caller's stdin."""
+        return self._psql_stdin_offenders_in_text(
+            path.read_text(encoding="utf-8")
+        )
+
+    @classmethod
+    def _psql_stdin_offenders_in_text(cls, text):
+        """psql commands in shell source that would inherit stdin.
+
+        Joins backslash continuations, blanks out quoted spans and trailing
+        comments (so SQL containing ||, |, ; or the word psql cannot skew
+        the split -- redirections never live inside quotes), then splits
+        every line into its individual commands (on |, ||, &&, ;) so one
+        redirected psql cannot whitelist a sibling on the same line. A
+        command is stdin-controlled when it redirects from /dev/null, feeds
+        a heredoc (<<), or is the consumer of a pipe."""
+        joined = text.replace("\\\n", " ")
+        offenders = []
+        for line in joined.splitlines():
+            if line.strip().startswith("#"):
+                continue
+            masked = cls._mask_shell_strings(line)
+            comment = masked.find(" #")
+            if comment != -1:
+                masked = masked[:comment]
+            parts = re.split(r"(\|\||&&|;|\|)", masked)
+            for k in range(0, len(parts), 2):
+                part = parts[k]
+                if not re.search(r"\bpsql\b", part):
+                    continue
+                piped_in = k > 0 and parts[k - 1] == "|"
+                if not (
+                    "< /dev/null" in part
+                    or "</dev/null" in part
+                    or "<<" in part
+                    or piped_in
+                ):
+                    offenders.append(part.strip())
+        return offenders
+
+    @staticmethod
+    def _mask_shell_strings(line):
+        """Blank string-literal characters in a line of bash (length kept).
+
+        Unlike a flat quote regex, this follows bash semantics for the one
+        nesting that matters here: $( ... ) inside double quotes is CODE
+        again, so v="$(psql -p "$VAR" ...)" keeps its psql word and its
+        redirections visible while the -c "SQL" payload (where |, ;, || and
+        stray psql mentions can legally appear) is blanked."""
+        out = []
+        mode = ["code"]
+        i = 0
+        while i < len(line):
+            c = line[i]
+            top = mode[-1]
+            if top == "squote":
+                if c == "'":
+                    mode.pop()
+                    out.append(c)
+                else:
+                    out.append("x")
+            elif top == "dquote":
+                if c == '"':
+                    mode.pop()
+                    out.append(c)
+                elif line.startswith("$(", i):
+                    mode.append("code")
+                    out.append("$(")
+                    i += 1
+                else:
+                    out.append("x")
+            else:
+                if c == "'":
+                    mode.append("squote")
+                    out.append(c)
+                elif c == '"':
+                    mode.append("dquote")
+                    out.append(c)
+                elif line.startswith("$(", i):
+                    mode.append("code")
+                    out.append("$(")
+                    i += 1
+                elif c == ")" and len(mode) > 1:
+                    mode.pop()
+                    out.append(c)
+                else:
+                    out.append(c)
+            i += 1
+        return "".join(out)
+
+    def test_psql_stdin_pin_sees_command_substitution_invocations(self):
+        # Self-test for the REAL detector (not a re-implementation, which
+        # drifted once already): the enumvals-probe SHAPE -- psql inside
+        # $( ... ) with nested double quotes -- must stay visible (a flat
+        # quote-pairing mask mis-pairs and swallows it), quoted mentions,
+        # SQL operators, and trailing comments must stay hidden, and an
+        # uncontrolled substitution psql must be flagged.
+        flagged = 'v="$(psql -p "$PORT" -c "SELECT 1")"'
+        controlled = flagged.replace(
+            '"SELECT 1")"', '"SELECT a || b" < /dev/null)"'
+        )
+        fixture = "\n".join(
+            [
+                flagged,
+                controlled,
+                'echo "waiting for psql to answer"',
+                'true  # psql without stdin control, but in a comment',
+                "printf 'x' | psql -X",
+            ]
+        )
+        offenders = self._psql_stdin_offenders_in_text(fixture)
+        # Offenders are reported in masked form (string payloads blanked);
+        # assert the shape, not the raw text.
+        self.assertEqual(len(offenders), 1, msg=offenders)
+        self.assertTrue(offenders[0].startswith('v="$(psql'), msg=offenders)
+        # And the whitelist genuinely gates: the same fixture minus the
+        # redirect must flag the controlled line too.
+        offenders = self._psql_stdin_offenders_in_text(
+            fixture.replace(" < /dev/null", "")
+        )
+        self.assertEqual(len(offenders), 2, msg=offenders)
+
+    def test_entrypoint_psql_invocations_control_stdin(self):
+        # Every psql the entrypoint (or a script it drives) runs must feed
+        # SQL via a pipe/heredoc or redirect stdin from /dev/null. A psql
+        # inheriting the container's stdin leaks fd 0 to a child that never
+        # needs it -- and hangs the stub psql these tests use on any runner
+        # whose stdin never EOFs (the exact CI failure that motivated this
+        # pin).
+        for script in (
+            *_entrypoint_sources(),
+            ENTRYPOINT.parent / "documentdb_install_getparameter_stub.sh",
+        ):
+            with self.subTest(script=script.name):
+                offenders = self._psql_stdin_offenders(script)
+                self.assertEqual(offenders, [], msg="\n".join(offenders))
+
+    def test_usage_documents_toast_compression(self):
+        result = self._run_entrypoint("--help")
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("--toast-compression", result.stdout)
+        self.assertIn("DOCUMENTDB_TOAST_COMPRESSION", result.stdout)
+        # The knob is scoped to the PostgreSQL this container starts; saying so
+        # is what keeps the ignored-with-a-warning behavior from reading like a
+        # bug to anyone running a caller-managed server.
+        self.assertIn("--start-pg false", result.stdout)
+
+    def test_usage_documents_the_external_postgres_mode(self):
+        # --start-pg false silently changes two contracts (no server
+        # configuration is written, and no compatibility stub is installed
+        # into a database this entrypoint does not own). Undocumented, it
+        # invites users to build on behavior that was never intended to be
+        # supported.
+        result = self._run_entrypoint("--help")
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        usage = result.stdout
+        self.assertIn("--start-pg", usage)
+        self.assertIn("Advanced/test use only", usage)
+        self.assertIn("listening", usage)
+        self.assertIn("getParameter", usage)
+
+    def test_toast_compression_omitted_when_build_lacks_lz4(self):
+        # PostgreSQL refuses to start when the value names a method the build
+        # does not have, so the default must degrade to writing nothing.
+        result, conf, _ = self._run_with_toast(lz4_supported=False)
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "was not built with lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_compression_empty_configure_output_degrades_default(self):
+        # meson builds compile CONFIGURE_ARGS in as an EMPTY string (verified
+        # against PostgreSQL 17/master meson.build), so lz4 support cannot be
+        # verified offline for them. When the runtime probe cannot answer
+        # either, the built-in default must degrade to writing nothing -
+        # never write unverified lz4, which would be fatal at the next
+        # restart once the fragment is included.
+        self._configure_toast_stubs(lz4_runtime=None)
+        self._stub_empty_pg_config()
+        result, conf, _ = self._run_with_toast_existing_stubs()
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "Cannot verify lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_compression_explicit_lz4_fails_when_unverifiable(self):
+        # An explicit choice must fail loudly - with a message blaming the
+        # verification gap, not the build - instead of being silently
+        # downgraded (matching the documentdb-tune contract).
+        self._configure_toast_stubs(lz4_runtime=None)
+        self._stub_empty_pg_config()
+        conf = self.root / "toast.conf"
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(conf),
+                "DOCUMENTDB_TOAST_COMPRESSION": "lz4",
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be verified", result.stderr)
+
+    def test_toast_compression_failing_pg_config_is_not_trusted(self):
+        # Output printed by a FAILING pg_config must be discarded: a partial
+        # --with-lz4 print from a dying command must not authorize lz4. The
+        # probe then treats support as unverifiable and (with no runtime
+        # answer either) the default degrades to writing nothing.
+        self._configure_toast_stubs(lz4_runtime=None)
+        # Reports a MATCHING major (999) so the gate consults it -- what is
+        # under test is that a failing --configure's output is discarded,
+        # which requires getting past the foreign-binary gate first.
+        self._write_exec(
+            self.bin_dir / "pg_config",
+            """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "PostgreSQL 999.0"
+fi
+if [ "$1" = "--configure" ]; then
+  echo "'--with-openssl' '--with-lz4'"
+  exit 1
+fi
+exit 0
+""",
+        )
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "Cannot verify lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_compression_runtime_probe_promotes_unknown_to_lz4(self):
+        # meson builds leave the offline probe at "unknown", but the live
+        # server can answer authoritatively: pg_settings lists lz4 among
+        # default_toast_compression's enum values exactly when the build has
+        # lz4 (USE_LZ4). Verdict t -> the default applies after all, and the
+        # config is reloaded so the upgraded fragment takes effect now.
+        self._configure_toast_stubs(lz4_runtime="t")
+        self._stub_empty_pg_config()
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "SELECT pg_reload_conf()",
+            self.toast_psql_args.read_text(encoding="utf-8"),
+        )
+
+    def test_toast_compression_runtime_probe_allows_explicit_lz4(self):
+        # The whole point of the runtime probe: an explicit lz4 request on a
+        # capable meson build must succeed, not die on the offline
+        # verification gap.
+        self._configure_toast_stubs(lz4_runtime="t")
+        self._stub_empty_pg_config()
+        result, conf, _ = self._run_with_toast_existing_stubs(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "lz4"}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+
+    def test_toast_compression_runtime_probe_definitive_no_degrades_default(self):
+        self._configure_toast_stubs(lz4_runtime="f")
+        self._stub_empty_pg_config()
+        result, conf, _ = self._run_with_toast_existing_stubs()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn(
+            "default_toast_compression = ", conf.read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "was not built with lz4 support", result.stdout + result.stderr
+        )
+
+    def test_toast_compression_runtime_probe_definitive_no_fails_explicit(self):
+        self._configure_toast_stubs(lz4_runtime="f")
+        self._stub_empty_pg_config()
+        result, _, _ = self._run_with_toast_existing_stubs(
+            extra_env={"DOCUMENTDB_TOAST_COMPRESSION": "lz4"}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no lz4 support", result.stderr)
+        # The failure happens after PostgreSQL is up, so it exits through cleanup().
+        self.assertIn("Shutting down DocumentDB components", result.stdout)
+
+    def test_toast_compression_explicit_lz4_fails_on_build_without_lz4(self):
+        self._configure_toast_stubs(lz4_supported=False)
+        conf = self.root / "toast.conf"
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(conf),
+                "DOCUMENTDB_TOAST_COMPRESSION": "lz4",
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no lz4 support", result.stderr)
+
+    def test_toast_compression_repairs_legacy_hard_include(self):
+        # An earlier iteration registered the fragment as a HARD include via
+        # start_oss_server -f; a hard include of a missing file is fatal at
+        # startup, so such a volume could not boot on an older image
+        # (rollback) or after the fragment path changed. The entrypoint must
+        # convert it to the tolerant form.
+        conf = self.root / "toast.conf"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "postgresql.conf").write_text(
+            f"port = 9712\ninclude '{conf}'\n", encoding="utf-8"
+        )
+        # initdb creates postgresql.conf 0600; the rewrite must not widen it
+        # to the boot umask (the grep > tmp; mv tmp pattern otherwise would).
+        (self.data_dir / "postgresql.conf").chmod(0o600)
+
+        result, conf, _ = self._run_with_toast()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertNotIn(f"include '{conf}'\n", pg_conf)
+        self.assertEqual(pg_conf.count(f"include_if_exists = '{conf}'"), 1)
+        # The entrypoint's own recursive data-dir chmod normalizes the file
+        # to 0750 BEFORE the repair runs, so 0750 is what the rewrite must
+        # preserve today (0600 accepted so this pin survives a future
+        # narrowing of that blanket chmod). The failure modes this catches:
+        # a temp left at the boot umask (0644 — world-readable) or the
+        # chmod --reference fallback misfiring.
+        self.assertIn(
+            stat.S_IMODE((self.data_dir / "postgresql.conf").stat().st_mode),
+            (0o600, 0o750),
+        )
+
+    def test_toast_compression_repairs_old_path_hard_include_before_start(self):
+        # A stale hard include may name the legacy iteration's DEFAULT
+        # fragment location while TOAST_COMPRESSION_CONF now points
+        # elsewhere; /tmp is fresh in a new container, so PostgreSQL would
+        # refuse to boot on it. The repair must therefore run BEFORE the
+        # server starts and must match the old path, not just the current
+        # one. The start stub simulates PostgreSQL's fatal hard-include
+        # behavior by refusing to start while any hard include remains.
+        legacy_conf = "/tmp/documentdb_toast_compression.conf"
+        self._configure_toast_stubs()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        pg_conf_path = self.data_dir / "postgresql.conf"
+        pg_conf_path.write_text(
+            f"port = 9712\ninclude '{legacy_conf}'\n", encoding="utf-8"
+        )
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"""#!/bin/sh
+if grep -q "^include '" "{pg_conf_path}"; then
+  echo "postgres: could not open configuration file" >&2
+  exit 1
+fi
+touch "{self.data_dir / 'postmaster.pid'}" "{self.data_dir / 'pglog.log'}"
+echo oss-server-stub-started
+""",
+        )
+
+        conf = self.root / "toast.conf"
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "TOAST_COMPRESSION_CONF": str(conf),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        pg_conf = pg_conf_path.read_text(encoding="utf-8")
+        self.assertNotIn(f"include '{legacy_conf}'", pg_conf)
+        self.assertEqual(pg_conf.count(f"include_if_exists = '{conf}'"), 1)
+
+    def test_toast_compression_fragment_defaults_under_gateway_home(self):
+        # The fragment must not default to a fixed path in world-writable
+        # /tmp: the volume's include_if_exists line outlives the container,
+        # so another uid in a later container could pre-create the /tmp path
+        # and inject arbitrary GUCs. GATEWAY_HOME is owned by the
+        # entrypoint's user and still image-ephemeral (rollback stays safe).
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        fragment = self.gateway_home / "documentdb_toast_compression.conf"
+        self.assertTrue(fragment.exists(), msg=result.stdout + result.stderr)
+        self.assertIn(
+            "default_toast_compression = 'lz4'",
+            fragment.read_text(encoding="utf-8"),
+        )
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertIn(f"include_if_exists = '{fragment}'", pg_conf)
+
+    def test_toast_compression_removes_stale_tmp_soft_include(self):
+        # A volume stamped with include_if_exists for the old /tmp default
+        # would keep reading a world-writable location on every future boot;
+        # the entrypoint must drop that line once the fragment lives
+        # elsewhere.
+        legacy_line = "include_if_exists = '/tmp/documentdb_toast_compression.conf'"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "postgresql.conf").write_text(
+            f"port = 9712\n{legacy_line}\n", encoding="utf-8"
+        )
+
+        result, conf, _ = self._run_with_toast()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertNotIn(legacy_line, pg_conf)
+        self.assertEqual(pg_conf.count(f"include_if_exists = '{conf}'"), 1)
+
+    def _run_with_toast_existing_stubs(self, extra_env=None):
+        conf = self.root / "toast.conf"
+        env = {"START_POSTGRESQL": "true", "TOAST_COMPRESSION_CONF": str(conf)}
+        if extra_env:
+            env.update(extra_env)
+        result = self._run_entrypoint(extra_env=env)
+        return result, conf, None
+
+    def test_toast_compression_include_is_not_duplicated_on_restart(self):
+        # The entrypoint appends the include_if_exists line only when it is
+        # not already present, so a restarted container must not accumulate
+        # duplicates.
+        conf = self.root / "toast.conf"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "postgresql.conf").write_text(
+            f"port = 9712\ninclude_if_exists = '{conf}'\n", encoding="utf-8"
+        )
+
+        result, conf, _ = self._run_with_toast()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        pg_conf = (self.data_dir / "postgresql.conf").read_text(encoding="utf-8")
+        self.assertEqual(
+            pg_conf.count(f"include_if_exists = '{conf}'"),
+            1,
+            msg=pg_conf,
+        )
+        # The fragment is still refreshed so the value stays in effect.
+        self.assertIn(
+            "default_toast_compression = 'lz4'", conf.read_text(encoding="utf-8")
+        )
+
+    def _configure_postgres_stubs(self, psql_exit_code=0):
+        (self.data_dir / "postmaster.pid").unlink(missing_ok=True)
+        sql_capture = self.root / "psql-input.sql"
+        # Append, never truncate: any earlier psql call the entrypoint makes
+        # (e.g. TOAST maintenance) must not wipe the SQL a later call piped
+        # in, or the assertions below would depend on invocation order.
+        sql_capture.write_text("", encoding="utf-8")
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"""#!/bin/sh
+touch "{self.data_dir / 'postmaster.pid'}" "{self.data_dir / 'pglog.log'}"
+echo oss-server-stub-started
+""",
+        )
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+cat >> "{sql_capture}"
+exit {psql_exit_code}
+""",
+        )
+        return sql_capture
+
+    def _configure_start_oss_args_capture(self, data_dir=None):
+        """Replace the start_oss_server.sh stub with one that records its
+        argv (one argument per line) and still creates the files the
+        entrypoint waits on. Call AFTER _configure_postgres_stubs so the psql
+        stub stays in place."""
+        data_dir = Path(data_dir) if data_dir else self.data_dir
+        args_capture = self.root / "start-oss-args.txt"
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            f"""#!/bin/sh
+printf '%s\\n' "$@" > "{args_capture}"
+touch "{data_dir / 'postmaster.pid'}" "{data_dir / 'pglog.log'}"
+echo oss-server-stub-started
+""",
+        )
+        return args_capture
+
+    def _configure_extended_rum_stubs(self, answer="1,1"):
+        """`answer` is the probe's created,available reply."""
+        args_capture = self._configure_start_oss_args_capture()
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+case "$*" in
+  *pg_available_extensions*) printf '%s\\n' {json.dumps(answer)}; exit 0 ;;
+  *enumvals*) printf '%s\\n' "t"; exit 0 ;;
+  *) cat > /dev/null 2>&1; exit 0 ;;
+esac
+""",
+        )
+        return args_capture
+
+    def _run_extended_rum_case(self, *args, extra_env=None, existing_volume=False):
+        self._configure_postgres_stubs()
+        args_capture = self._configure_extended_rum_stubs()
+        if existing_volume:
+            (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        env = {"START_POSTGRESQL": "true"}
+        if extra_env:
+            env.update(extra_env)
+        return self._run_entrypoint(*args, extra_env=env), args_capture
+
+    def _assert_extended_rum_not_disabled(self, args_capture):
+        """No -r: start_oss_server.sh defaults to enabled; test_image.py checks the rest."""
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-r", args, msg=f"start_oss_server argv was {args}")
+
+    def _seed_baked_template(self, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        marker_dir = directory / ".documentdb-local"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / "baked_template").write_text(
+            BAKED_FINGERPRINT, encoding="utf-8"
+        )
+        # The prepare script proves pristineness by matching the marker's
+        # fingerprint against live pg_controldata output; stub the tool so the
+        # proof succeeds for this seeded template.
+        self._write_exec(self.bin_dir / "pg_controldata", PG_CONTROLDATA_STUB)
+
+    def test_baked_template_is_adopted_and_marker_consumed(self):
+        """Issue #480: a data directory carrying the image's baked-template
+        marker is adopted as-is (no forced re-initialization) and the marker
+        is consumed so later boots treat the directory as ordinary user
+        data."""
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture()
+        self._seed_baked_template(self.data_dir)
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "Adopting pre-initialized data directory template", result.stdout
+        )
+        self.assertFalse(
+            (self.data_dir / ".documentdb-local" / "baked_template").exists(),
+            "the baked-template marker must be consumed on adoption",
+        )
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-c", args)
+        self.assertNotIn("-r", args)
+
+    def test_deprecated_disable_extended_rum_flag_is_ignored(self):
+        self._configure_postgres_stubs()
+        args_capture = self._configure_extended_rum_stubs()
+        self._seed_baked_template(self.data_dir)
+
+        result = self._run_entrypoint(
+            "--disable-extended-rum", extra_env={"START_POSTGRESQL": "true"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "--disable-extended-rum (DISABLE_EXTENDED_RUM) is deprecated and has no effect",
+            result.stderr,
+        )
+        self.assertIn(
+            "Adopting pre-initialized data directory template", result.stdout
+        )
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-c", args)
+        self._assert_extended_rum_not_disabled(args_capture)
+
+    def test_deprecated_disable_extended_rum_env_is_ignored(self):
+        result, args_capture = self._run_extended_rum_case(
+            extra_env={"DISABLE_EXTENDED_RUM": "true"},
+            existing_volume=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("is deprecated and has no effect", result.stderr)
+        self.assertNotIn("ALTER ROLE", result.stderr)
+        self._assert_extended_rum_not_disabled(args_capture)
+
+    def test_disable_extended_rum_not_true_is_quiet(self):
+        """Only the value that used to disable it earns the warning; "0" or
+        "false" never asked for anything and must not be told it was ignored."""
+        for value in ("false", "0", "FALSE", ""):
+            with self.subTest(value=value):
+                result, args_capture = self._run_extended_rum_case(
+                    extra_env={"DISABLE_EXTENDED_RUM": value},
+                    existing_volume=True,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("is deprecated and has no effect", result.stderr)
+                self._assert_extended_rum_not_disabled(args_capture)
+
+    def test_extended_rum_state_is_logged(self):
+        """Wiring only: the outcomes live in ReportExtendedRumScriptTests."""
+        result, args_capture = self._run_extended_rum_case()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._assert_extended_rum_not_disabled(args_capture)
+        self.assertIn("documentdb_extended_rum is created on this data volume", result.stdout)
+
+    def test_ambient_pgoptions_never_reaches_start_oss_server(self):
+        """PGOPTIONS is a standard libpq CLIENT env var; splicing the ambient
+        value into start_oss_server.sh's argv let unrelated content reach its
+        getopts, where `-c` means force-cleanup and destroys the data
+        directory."""
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "PGOPTIONS": "-c statement_timeout=0",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-c", args)
+        self.assertNotIn("statement_timeout=0", args)
+
+    def test_allow_external_connections_still_passes_dash_e(self):
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "ALLOW_EXTERNAL_CONNECTIONS": "true",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertIn("-e", args)
+
+    def test_ownership_repair_runs_when_data_dir_foreign_owned(self):
+        """The default runtime user (documentdb) never owns the test temp
+        dir, so the repair branch must run."""
+        self._configure_postgres_stubs()
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Setting ownership of", result.stdout)
+        self.assertEqual(
+            self.data_dir.stat().st_mode & 0o777, 0o750,
+            "the repair branch must leave the data directory at 0750 "
+            "(PostgreSQL refuses anything more permissive)",
+        )
+
+    def test_ownership_repair_skipped_when_already_owned(self):
+        """Issue #480: when the data directory and PG_VERSION are already
+        owned by the runtime user, the recursive chown/chmod (which forces an
+        overlayfs copy-up of the whole cluster) must be skipped."""
+        self._configure_postgres_stubs()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        self.data_dir.chmod(0o700)
+        user = getpass.getuser()
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DOCUMENTDB_RUNTIME_USER": user,
+                "DOCUMENTDB_RUNTIME_GROUP": user,
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Setting ownership of", result.stdout)
+        self.assertEqual(
+            self.data_dir.stat().st_mode & 0o777, 0o750,
+            "the fast path must still pin the data directory itself to 0750",
+        )
+
+    def test_refused_start_preserves_data_directory_metadata(self):
+        self._configure_postgres_stubs()
+        pg_version = self.data_dir / "PG_VERSION"
+        pg_version.write_text("17\n", encoding="utf-8")
+        pg_version.chmod(0o600)
+        pidfile = self.data_dir / "postmaster.pid"
+        pidfile.write_text("999999\n", encoding="utf-8")
+        user = getpass.getuser()
+
+        def metadata():
+            return [
+                (s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode))
+                for s in (path.stat() for path in (self.data_dir, pg_version))
+            ]
+
+        for held_lock in (False, True):
+            for force_repair in ("false", "true"):
+                with self.subTest(held_lock=held_lock, force_repair=force_repair):
+                    self.data_dir.chmod(0o700)
+                    before = metadata()
+                    fd = os.open(self.data_dir, os.O_RDONLY)
+                    try:
+                        if held_lock:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        result = self._run_entrypoint(extra_env={
+                            "START_POSTGRESQL": "true",
+                            "DOCUMENTDB_RUNTIME_USER": user,
+                            "DOCUMENTDB_RUNTIME_GROUP": user,
+                            "DOCUMENTDB_FORCE_OWNERSHIP_REPAIR": force_repair,
+                        })
+                    finally:
+                        os.close(fd)
+
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(
+                        "already using the data directory" if held_lock
+                        else "DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID",
+                        result.stderr,
+                    )
+                    self.assertEqual(metadata(), before)
+                    self.assertEqual(pidfile.read_text(encoding="utf-8"), "999999\n")
+                    self.assertNotIn("oss-server-stub-started", result.stdout)
+
+    def test_missing_owner_access_is_repaired_before_claim(self):
+        self._configure_postgres_stubs()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        user = getpass.getuser()
+
+        for mode in (0o000, 0o300, 0o400):
+            with self.subTest(mode=oct(mode)):
+                (self.data_dir / "postmaster.pid").unlink(missing_ok=True)
+                self.data_dir.chmod(mode)
+                try:
+                    result = self._run_entrypoint(extra_env={
+                        "START_POSTGRESQL": "true",
+                        "DOCUMENTDB_RUNTIME_USER": user,
+                        "DOCUMENTDB_RUNTIME_GROUP": user,
+                    })
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(stat.S_IMODE(self.data_dir.stat().st_mode), 0o750)
+                finally:
+                    self.data_dir.chmod(0o700)
+
+    @unittest.skipIf(os.geteuid() == 0, "directory access permissions do not restrict root")
+    def test_directory_permission_repair_failure_aborts_startup(self):
+        self._configure_postgres_stubs()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        self._write_exec(
+            self.bin_dir / "chmod",
+            f"""#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "{self.data_dir}" ]; then exit 1; fi
+done
+exec /bin/chmod "$@"
+""",
+        )
+        user = getpass.getuser()
+        for mode, message in (
+            (0o300, "cannot set permissions on data directory"),
+            (0o700, "cannot set permissions on data directory"),
+        ):
+            with self.subTest(mode=oct(mode)):
+                self.data_dir.chmod(mode)
+                try:
+                    result = self._run_entrypoint(extra_env={
+                        "START_POSTGRESQL": "true",
+                        "DOCUMENTDB_RUNTIME_USER": user,
+                        "DOCUMENTDB_RUNTIME_GROUP": user,
+                    })
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("oss-server-stub-started", result.stdout)
+                finally:
+                    self.data_dir.chmod(0o700)
+
+    def test_failed_oss_server_bootstrap_aborts_immediately(self):
+        """A failing start_oss_server.sh must abort the entrypoint with its
+        own status and message, not surface a postmaster timeout a minute
+        later. Kills the PIPESTATUS mutant that survived round 2's mutation
+        testing."""
+        self._configure_postgres_stubs()
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            "#!/bin/sh\necho bootstrap-dying\nexit 3\n",
+        )
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("start_oss_server.sh failed (status 3)", result.stderr)
+        self.assertIn(
+            "pglog.log", result.stderr,
+            "the error must point at the PostgreSQL server log, where the "
+            "actual FATAL lands",
+        )
+
+    def test_force_ownership_repair_env_overrides_fast_path(self):
+        """DOCUMENTDB_FORCE_OWNERSHIP_REPAIR=true is the escape hatch for
+        interior files a previously interrupted repair left foreign-owned
+        (which the cheap two-sample probe cannot see)."""
+        self._configure_postgres_stubs()
+        (self.data_dir / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        user = getpass.getuser()
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DOCUMENTDB_RUNTIME_USER": user,
+                "DOCUMENTDB_RUNTIME_GROUP": user,
+                "DOCUMENTDB_FORCE_OWNERSHIP_REPAIR": "true",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Setting ownership of", result.stdout)
+
+    def test_custom_empty_data_path_is_populated_from_template(self):
+        """Issue #480: an empty custom --data-path is instantiated by copying
+        the pristine baked template instead of running full initialization;
+        the copied marker must not survive into the new data directory."""
+        template_dir = self.root / "template"
+        self._seed_baked_template(template_dir)
+        (template_dir / "postgresql.conf").write_text(
+            "shared_preload_libraries = 'stub'\n", encoding="utf-8"
+        )
+        custom_data = self.root / "custom-data"
+        custom_data.mkdir()
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture(custom_data)
+
+        result = self._run_entrypoint(
+            extra_env={
+                "START_POSTGRESQL": "true",
+                "DATA_PATH": str(custom_data),
+                "DOCUMENTDB_PGDATA_TEMPLATE": str(template_dir),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Populating empty data directory", result.stdout)
+        self.assertTrue((custom_data / "PG_VERSION").is_file())
+        self.assertTrue((custom_data / "postgresql.conf").is_file())
+        self.assertFalse(
+            (custom_data / ".documentdb-local" / "baked_template").exists(),
+            "the copied template marker must be consumed in the new data "
+            "directory",
+        )
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("-c", args)
+
+    def test_get_parameter_stub_returns_command_not_supported(self):
+        sql_capture = self._configure_postgres_stubs()
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        sql = sql_capture.read_text(encoding="utf-8")
+        self.assertIn(
+            "to_regprocedure('documentdb_api.get_parameter(boolean,boolean,text[])') IS NULL",
+            sql,
+        )
+        self.assertIn(
+            "CREATE FUNCTION documentdb_api.get_parameter(boolean, boolean, text[])",
+            sql,
+        )
+        self.assertIn('"code": 115', sql)
+        self.assertIn('"codeName": "CommandNotSupported"', sql)
+        self.assertIn('"ok": 0.0', sql)
+        self.assertIn(
+            "documentdb-local temporary CommandNotSupported stub for issue #650",
+            sql,
+        )
+        self.assertNotIn("CREATE OR REPLACE FUNCTION", sql)
+        self.assertNotIn("featureCompatibilityVersion", sql)
+        self.assertNotIn("'7.0'", sql)
+        self.assertIn(
+            "Ensuring unsupported getParameter returns CommandNotSupported",
+            result.stdout,
+        )
+
+    def test_get_parameter_stub_install_failure_aborts_startup(self):
+        self._configure_postgres_stubs()
+        self._write_exec(
+            self.bin_dir / "psql",
+            "#!/bin/sh\nif grep -q get_parameter; then exit 1; fi\nexit 0\n",
+        )
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "could not install the documentdb-local getParameter rejection stub",
+            result.stdout + result.stderr,
+        )
+        self.assertNotIn("Starting gateway in the background", result.stdout)
+
+    def test_get_parameter_stub_is_not_installed_in_external_postgres(self):
+        psql_called = self.root / "psql-called"
+        self._write_exec(
+            self.bin_dir / "psql",
+            f"""#!/bin/sh
+touch "{psql_called}"
+exit 1
+""",
+        )
+
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "false"})
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertFalse(psql_called.exists())
+        self.assertIn("Skipping PostgreSQL server start", result.stdout)
+
+    def test_admin_user_is_created_after_waiting_for_postgres(self):
+        # CREATE_USER=true against an external PostgreSQL: the entrypoint must
+        # wait for pg_isready to report ready, then create the admin user
+        # (regression: the inlined gateway launch previously dropped the
+        # readiness wait, so the admin user could silently never be created).
+        result = self._run_entrypoint(extra_env={"CREATE_USER": "true"})
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("PostgreSQL is ready", result.stdout)
+        self.assertIn("stub-user-created", result.stdout)
+
+    def test_admin_user_creation_times_out_when_postgres_never_ready(self):
+        # If PostgreSQL never accepts connections the entrypoint must fail
+        # loudly rather than launch the gateway with no admin user.
+        self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 1\n")
+        result = self._run_entrypoint(
+            extra_env={
+                "CREATE_USER": "true",
+                "DOCUMENTDB_PG_READY_TIMEOUT": "0",
+                "DOCUMENTDB_PG_READY_INTERVAL": "1",
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not become ready", result.stdout + result.stderr)
+        self.assertNotIn("stub-user-created", result.stdout)
+
+    def test_password_never_passed_to_start_oss_server(self):
+        # The child's stock helper would put the password in psql argv, so the
+        # entrypoint hands it -u "" and creates the admin user itself.
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture()
+        result = self._run_entrypoint(
+            extra_env={"START_POSTGRESQL": "true", "CREATE_USER": "true"}
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn(_TEST_PW, args)
+        self.assertNotIn("-a", args)
+        self.assertEqual(args[args.index("-u") + 1], "")
+        self.assertIn("stub-user-created", result.stdout)
+
+    @unittest.skipUnless(Path("/proc/self/exe").is_symlink(), "requires Linux procfs")
+    def test_password_flag_does_not_stay_in_any_process_argv(self):
+        secret = "argv" + secrets.token_hex(12)
+        pattern = self.root / "argv-pattern"
+        pattern.write_text(secret + "\n", encoding="utf-8")
+        report = self.root / "argv-report"
+        received = self.root / "argv-received"
+        # From the long-lived gateway, grep every argv; the pattern file keeps grep's own argv clean.
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            f"""#!/bin/sh
+grep -l -a -F -f "{pattern}" /proc/[0-9]*/cmdline > "{report}.matches" 2>/dev/null
+echo "$PPID" > "{report}.ppid"
+tr '\\0' ' ' < /proc/$PPID/cmdline > "{report}.parent"
+exit 0
+""",
+        )
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            f'#!/bin/sh\nSetupCustomAdminUser() {{ printf "%s" "$2" > "{received}"; }}\n',
+        )
+        proc = subprocess.Popen(
+            ["bash", str(ENTRYPOINT), "--username", "argvuser", "--password", secret,
+             "--documentdb-port", "10261"],
+            cwd=REPO_ROOT,
+            env=self._entrypoint_env({"PASSWORD": None, "CREATE_USER": "true"}),
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        stdout, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, msg=stdout + stderr)
+        self.assertEqual(
+            (self.root / "argv-report.matches").read_text(encoding="utf-8"), "",
+            "the password is still in some process's argv",
+        )
+        # Re-exec, not a child: same PID.
+        self.assertEqual(int((self.root / "argv-report.ppid").read_text()), proc.pid)
+        parent = (self.root / "argv-report.parent").read_text(encoding="utf-8")
+        self.assertIn("emulator_entrypoint.sh", parent)
+        self.assertNotIn("--password", parent)
+        self.assertEqual(received.read_text(encoding="utf-8"), secret)
+        self.assertEqual(self._read_config()["GatewayListenPort"], 10261)
+        self.assertIn("Using username: argvuser", stdout)
+        self.assertEqual(stdout.count("DocumentDB container starting"), 1)
+
+    def test_create_user_false_still_skips_child_user_step(self):
+        self._configure_postgres_stubs()
+        args_capture = self._configure_start_oss_args_capture()
+        result = self._run_entrypoint(extra_env={"START_POSTGRESQL": "true"})
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        args = args_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn(_TEST_PW, args)
+        self.assertEqual(args[args.index("-u") + 1], "")
+        self.assertNotIn("stub-user-created", result.stdout)
+
+    def test_admin_user_creation_failure_aborts_startup(self):
+        # A SetupCustomAdminUser failure must abort the entrypoint instead of
+        # being silently swallowed.
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            "#!/bin/sh\nSetupCustomAdminUser() { echo boom >&2; return 1; }\n",
+        )
+        result = self._run_entrypoint(extra_env={"CREATE_USER": "true"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "failed to create the admin user", result.stdout + result.stderr
+        )
+
+    def test_a_utils_sh_failing_while_sourced_aborts_startup(self):
+        # utils.sh runs under its own set -e: a failure while it is sourced
+        # stops the boot before the admin user is created.
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            '#!/bin/sh\nset -e\nfalse\nSetupCustomAdminUser() { echo "stub-user-created"; }\n',
+        )
+        result = self._run_entrypoint(extra_env={"CREATE_USER": "true"})
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("stub-user-created", result.stdout)
+        self.assertNotIn("gateway-daemon-stub-started", result.stdout)
+
+    def test_admin_user_wait_rejects_invalid_readiness_overrides(self):
+        # Non-integer DOCUMENTDB_PG_READY_TIMEOUT/_INTERVAL overrides must fall
+        # back to the defaults (with a warning) rather than making the wait loop
+        # error out or busy-spin -- the entrypoint has no `set -e`. pg_isready
+        # reports ready immediately (setUp stub) so the flow still completes.
+        result = self._run_entrypoint(
+            extra_env={
+                "CREATE_USER": "true",
+                "DOCUMENTDB_PG_READY_TIMEOUT": "foo",
+                "DOCUMENTDB_PG_READY_INTERVAL": "bar",
+            }
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "invalid DOCUMENTDB_PG_READY_TIMEOUT", result.stdout + result.stderr
+        )
+        self.assertIn(
+            "invalid DOCUMENTDB_PG_READY_INTERVAL", result.stdout + result.stderr
+        )
+        self.assertIn("stub-user-created", result.stdout)
+
+    def test_admin_user_wait_clamps_zero_interval(self):
+        # DOCUMENTDB_PG_READY_INTERVAL=0 must be clamped to >=1 so a never-ready
+        # PostgreSQL times out instead of busy-spinning forever (elapsed would
+        # never advance past 0). A failing pg_isready + a short timeout proves
+        # the loop terminates; without the clamp this would hang until the
+        # subprocess timeout.
+        self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 1\n")
+        sleeps = self._record_sleeps()
+        result = self._run_entrypoint(
+            extra_env={
+                "CREATE_USER": "true",
+                "DOCUMENTDB_PG_READY_INTERVAL": "0",
+                "DOCUMENTDB_PG_READY_TIMEOUT": "2",
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not become ready", result.stdout + result.stderr)
+        # Wall-clock timing ends even a 0-second loop, so check the interval itself.
+        self.assertIn("1", sleeps())
+        self.assertNotIn("0", sleeps())
+
+    def test_admin_user_wait_handles_zero_padded_interval(self):
+        # A zero-padded interval like "08"/"09" must be treated as base-10, not
+        # octal -- otherwise the $(( )) arithmetic in the wait loop aborts fatally
+        # with "value too great for base". A failing pg_isready + an instant
+        # sleep stub + short timeout proves the loop counts and times out
+        # cleanly instead of dying mid-wait.
+        self._write_exec(self.bin_dir / "pg_isready", "#!/bin/sh\nexit 1\n")
+        sleeps = self._record_sleeps()
+        result = self._run_entrypoint(
+            extra_env={
+                "CREATE_USER": "true",
+                "DOCUMENTDB_PG_READY_INTERVAL": "08",
+                "DOCUMENTDB_PG_READY_TIMEOUT": "2",
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("8", sleeps())
+        self.assertNotIn(
+            "value too great for base", result.stdout + result.stderr
+        )
+        self.assertIn("did not become ready", result.stdout + result.stderr)
+
+    def test_zero_padded_ports_are_normalized_to_base10(self):
+        # A zero-padded DOCUMENTDB_PORT / POSTGRESQL_PORT passes the ^[0-9]+$
+        # check but would break the later jq numeric assignment (leading zero =
+        # invalid JSON/octal). Normalizing with $((10#...)) must strip the pad
+        # so the config carries the decimal port and startup succeeds.
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"DOCUMENTDB_PORT": "010260", "POSTGRESQL_PORT": "09712"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertEqual(config["GatewayListenPort"], 10260)
+        self.assertEqual(config["PostgresPort"], 9712)
+
+    def test_runtime_state_file_written_with_resolved_settings(self):
+        # healthcheck.sh keys off this file: it must appear only after startup
+        # completes and must carry the resolved values (CLI flags included,
+        # since health probes never see them in their exec environment).
+        state_file = self.root / "runtime-state.env"
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            "--documentdb-port",
+            "12345",
+            extra_env={"DOCUMENTDB_RUNTIME_STATE_FILE": str(state_file)},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        state = state_file.read_text(encoding="utf-8")
+        self.assertIn("DOCUMENTDB_PORT=12345\n", state)
+        self.assertIn("POSTGRESQL_PORT=9712\n", state)
+        # Only what the probe reads: an unread key would be dead weight the
+        # probe's parser has to skip and this test would pin in place. The
+        # probe checks PostgreSQL unconditionally (the gateway always dials
+        # localhost), so START_POSTGRESQL is as unread as TLS_MODE.
+        self.assertNotIn("START_POSTGRESQL", state)
+        self.assertNotIn("TLS_MODE", state)
+
+    def test_unwritable_state_file_path_fails_fast(self):
+        # An unwritable path means the container could never turn healthy;
+        # that must fail at boot start, not after a multi-minute startup.
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={
+                "DOCUMENTDB_RUNTIME_STATE_FILE": str(
+                    self.root / "no-such-dir" / "runtime-state.env"
+                )
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "cannot reset or write the runtime state file",
+            result.stdout + result.stderr,
+        )
+
+    def test_oss_server_failure_aborts_startup(self):
+        # `start_oss_server.sh | tee` reports tee's status; the entrypoint
+        # must check the script's own, or a setup step failing after the
+        # postmaster daemonized would end in a healthy verdict.
+        self._write_exec(
+            self.gateway_scripts / "start_oss_server.sh",
+            "#!/bin/sh\necho oss-server-stub-failing\nexit 7\n",
+        )
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"START_POSTGRESQL": "true"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "start_oss_server.sh failed (status 7)",
+            result.stdout + result.stderr,
+        )
+
+    def test_stale_runtime_state_file_removed_when_startup_fails(self):
+        # A leftover file from a previous boot (docker restart) must not let
+        # the healthcheck report healthy while this boot is failing.
+        state_file = self.root / "runtime-state.env"
+        state_file.write_text("DOCUMENTDB_PORT=10260\n", encoding="utf-8")
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            "--documentdb-port",
+            "banana",
+            extra_env={"DOCUMENTDB_RUNTIME_STATE_FILE": str(state_file)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(state_file.exists())
+
+    def test_default_mode_sets_allowTLS_in_config(self):
+        result = self._run_entrypoint("--password", _TEST_PW)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertNotIn("TlsMode", config, "the gateway has no TlsMode field; only EnforceTls is written")
+        self.assertEqual(config["EnforceTls"], False)
+        self.assertEqual(config["GatewayListenPort"], 10260)
+        self.assertEqual(config["PostgresPort"], 9712)
+        self.assertNotIn("does not turn TLS off", result.stdout + result.stderr)
+
+    def test_tlsMode_requireTLS_flag_sets_requireTLS_in_config(self):
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, "--tlsMode", "requireTLS"
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertNotIn("TlsMode", config, "the gateway has no TlsMode field; only EnforceTls is written")
+        self.assertEqual(config["EnforceTls"], True)
+
+    def test_tlsMode_disabled_flag_sets_disabled_in_config(self):
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, "--tlsMode", "disabled"
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertNotIn("TlsMode", config, "the gateway has no TlsMode field; only EnforceTls is written")
+        self.assertEqual(config["EnforceTls"], False)
+        self.assertIn("does not turn TLS off", result.stdout + result.stderr)
+
+    def test_tlsMode_env_var_sets_mode_in_config(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"TLS_MODE": "requireTLS"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertNotIn("TlsMode", config, "the gateway has no TlsMode field; only EnforceTls is written")
+        self.assertEqual(config["EnforceTls"], True)
+
+    def test_tlsMode_env_var_allowTLS_does_not_enforce_tls(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"TLS_MODE": "allowTLS"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertNotIn("TlsMode", config, "the gateway has no TlsMode field; only EnforceTls is written")
+        self.assertEqual(config["EnforceTls"], False)
+
+    def test_system_postgres_log_defaults_to_runtime_pg_version(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"PG_VERSION_USED": "18", "SYSTEM_POSTGRES_LOG": ""},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "System PostgreSQL logs (/var/log/postgresql/postgresql-18-main.log)",
+            result.stdout,
+        )
+
+    def test_invalid_tlsMode_value_fails_fast(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"TLS_MODE": "maybe"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Invalid tlsMode value 'maybe', must be one of: disabled, allowTLS, requireTLS",
+            result.stdout + result.stderr,
+        )
+
+    def test_a_list_of_enum_members_is_rejected(self):
+        # Each value is a substring of its allowed list; "allowTLS,requireTLS" ran with EnforceTls=false.
+        for var, value in (
+            ("TLS_MODE", "allowTLS,requireTLS"),
+            ("LOG_LEVEL", "info,debug"),
+            ("DOCUMENTDB_TOAST_COMPRESSION", "lz4,pglz"),
+        ):
+            with self.subTest(var=var):
+                result = self._run_entrypoint("--password", _TEST_PW, extra_env={var: value})
+                self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+                self.assertIn(f"value '{value}', must be one of", result.stderr)
+
+    def _gateway_log_level(self, *args, extra_env=None):
+        """The DOCUMENTDB_LOG_LEVEL the gateway process inherits, or "<unset>"."""
+        record = self.root / "gateway-log-level"
+        record.unlink(missing_ok=True)
+        self._write_exec(
+            self.gateway_release_dir / "documentdb_gateway",
+            f'#!/bin/sh\nprintf "%s" "${{DOCUMENTDB_LOG_LEVEL-<unset>}}" > "{record}"\n',
+        )
+        env = {"LOG_LEVEL": None, "DOCUMENTDB_LOG_LEVEL": None, "RUST_LOG": None}
+        env.update(extra_env or {})
+        result = self._run_entrypoint(*args, extra_env=env)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        return record.read_text(encoding="utf-8")
+
+    def test_log_level_reaches_the_gateway(self):
+        # The gateway never read LOG_LEVEL, so --log-level changed nothing.
+        for level, expected in (
+            ("quiet", "error"),
+            ("error", "error"),
+            ("warn", "warn"),
+            ("info", "info"),
+            ("debug", "debug"),
+            ("trace", "trace"),
+        ):
+            with self.subTest(level):
+                self.assertEqual(self._gateway_log_level("--log-level", level), expected)
+        self.assertEqual(self._gateway_log_level(), "info")
+        self.assertEqual(self._gateway_log_level(extra_env={"LOG_LEVEL": "debug"}), "debug")
+
+    def test_gateway_log_variables_the_operator_set_win_over_log_level(self):
+        self.assertEqual(
+            self._gateway_log_level(
+                "--log-level", "error",
+                extra_env={"DOCUMENTDB_LOG_LEVEL": "documentdb_gateway=debug"},
+            ),
+            "documentdb_gateway=debug",
+        )
+        self.assertEqual(
+            self._gateway_log_level("--log-level", "error", extra_env={"RUST_LOG": "debug"}),
+            "<unset>",
+        )
+
+    def test_empty_tlsMode_env_var_fails_fast(self):
+        # Treated as unset, it would silently become allowTLS and accept plaintext.
+        result = self._run_entrypoint("--password", _TEST_PW, extra_env={"TLS_MODE": ""})
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("TLS_MODE is set but empty", result.stderr)
+        self.assertNotIn("gateway-daemon-stub-started", result.stdout)
+
+    def test_other_empty_settings_still_mean_unset(self):
+        result = self._run_entrypoint(
+            "--password", _TEST_PW,
+            extra_env={"INIT_DATA": "", "CERT_PATH": "", "KEY_FILE": ""},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def test_enforce_tls_write_failure_aborts(self):
+        failing_jq = """#!/usr/bin/env python3
+import json
+import sys
+args = sys.argv[1:]
+raw = False
+vars = {}
+while args and args[0].startswith('-'):
+    if args[0] in ('--arg', '--argjson'):
+        flag, name, value, *args = args
+        vars[name] = json.loads(value) if flag == '--argjson' else value
+    elif args[0] in ('-r', '--raw-output'):
+        raw = True
+        args = args[1:]
+    else:
+        args = args[1:]
+expr, file_path = args
+expr = expr.strip()
+if expr == '.BlockedRolePrefixes | type':
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    v = data.get('BlockedRolePrefixes')
+    if v is None:
+        print('null')
+    elif isinstance(v, bool):
+        print('boolean')
+    elif isinstance(v, list):
+        print('array')
+    elif isinstance(v, str):
+        print('string')
+    elif isinstance(v, (int, float)):
+        print('number')
+    else:
+        print('object')
+    raise SystemExit(0)
+if expr == 'all(.BlockedRolePrefixes[]; type == "string")':
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    arr = data.get('BlockedRolePrefixes') or []
+    ok = isinstance(arr, list) and all(isinstance(x, str) for x in arr)
+    raise SystemExit(0 if ok else 1)
+if expr in ('.BlockedRolePrefixes[]', '.BlockedRolePrefixes[]?'):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    for item in data.get('BlockedRolePrefixes', []):
+        print(item)
+    raise SystemExit(0)
+if expr.startswith('.EnforceTls = '):
+    sys.stderr.write('jq: simulated failure\\n')
+    sys.exit(1)
+with open(file_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+if expr.startswith('.GatewayListenPort = '):
+    data['GatewayListenPort'] = int(expr.split('=', 1)[1].strip())
+elif expr.startswith('.PostgresPort = '):
+    data['PostgresPort'] = int(expr.split('=', 1)[1].strip())
+elif expr.startswith('.TlsMode = '):
+    data['TlsMode'] = vars.get('tlsMode', expr.split('=', 1)[1].strip().strip('"'))
+else:
+    raise SystemExit(f'Unsupported jq expression: {expr}')
+json.dump(data, sys.stdout)
+"""
+        self._write_exec(self.bin_dir / "jq", failing_jq)
+        result = self._run_entrypoint("--password", _TEST_PW)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "failed to write EnforceTls to the gateway configuration file",
+            result.stdout + result.stderr,
+        )
+
+    def test_a_failed_host_config_edit_only_warns(self):
+        real = self.bin_dir / "jq.real"
+        (self.bin_dir / "jq").rename(real)
+        self._write_exec(
+            self.bin_dir / "jq",
+            f"""#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in .DynamicConfigurationFile\\ =*) echo "jq: simulated failure" >&2; exit 1 ;; esac
+done
+exec "{real}" "$@"
+""",
+        )
+        self._configure_toast_stubs()
+        result = self._run_entrypoint(
+            extra_env={"START_POSTGRESQL": "true", "TOAST_COMPRESSION_CONF": str(self.root / "toast.conf")}
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("could not set up the gateway host configuration file", result.stderr)
+        self.assertNotIn("DynamicConfigurationFile", self._read_config())
+
+    def test_pem_certificate_and_key_are_written_to_config(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            "--cert-path",
+            "/tmp/documentdb-local.pem",
+            "--key-file",
+            "/tmp/documentdb-local.key",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        config = self._read_config()
+        self.assertEqual(
+            config["CertificateOptions"],
+            {
+                "CertType": "PemFile",
+                "FilePath": "/tmp/documentdb-local.pem",
+                "KeyFilePath": "/tmp/documentdb-local.key",
+            },
+        )
+
+    def test_pfx_certificate_without_key_file_is_rejected(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            "--cert-path",
+            "/tmp/documentdb-local.pfx",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Error: Both CERT_PATH and KEY_FILE must be set together, or neither should be set.",
+            result.stdout + result.stderr,
+        )
+
+    def test_key_file_without_certificate_is_rejected(self):
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            "--key-file",
+            "/tmp/documentdb-local.key",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Error: Both CERT_PATH and KEY_FILE must be set together, or neither should be set.",
+            result.stdout + result.stderr,
+        )
+
+    def test_help_describes_tlsMode_and_pem_certificate_requirements(self):
+        result = self._run_entrypoint("--help")
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("--tlsMode", result.stdout)
+        self.assertIn(
+            "By default, the gateway accepts both plain and TLS connections",
+            result.stdout,
+        )
+        self.assertIn("Specify a path to a PEM certificate", result.stdout)
+        self.assertIn(
+            "PEM certificates must be provided together with --key-file.",
+            result.stdout,
+        )
+        self.assertNotIn("CERT_SECRET", result.stdout)
+
+    def test_missing_password_refuses_to_start(self):
+        for password in (None, ""):
+            with self.subTest(password=password):
+                result = self._run_entrypoint(extra_env={"PASSWORD": password, "CREATE_USER": "true"})
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("no password was supplied", result.stderr)
+                self.assertIn("DOCUMENTDB_ALLOW_DEFAULT_PASSWORD=true", result.stderr)
+                self.assertNotIn("gateway-daemon-stub-started", result.stdout)
+
+    def test_default_password_opt_in_must_be_exactly_true(self):
+        for value in ("false", "1", "yes", "TRUE"):
+            with self.subTest(value=value):
+                result = self._run_entrypoint(extra_env={
+                    "PASSWORD": None, "CREATE_USER": "true",
+                    "DOCUMENTDB_ALLOW_DEFAULT_PASSWORD": value,
+                })
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+
+    def test_default_password_opt_in_starts_with_a_one_line_warning(self):
+        received = self.root / "received-password"
+        self._write_exec(
+            self.gateway_scripts / "utils.sh",
+            f'#!/bin/sh\nSetupCustomAdminUser() {{ printf "%s" "$2" > "{received}"; }}\n',
+        )
+        for create_user in ("false", "true"):
+            with self.subTest(create_user=create_user):
+                received.unlink(missing_ok=True)
+                result = self._run_entrypoint(extra_env={
+                    "PASSWORD": None, "USERNAME": "myadmin", "CREATE_USER": create_user,
+                    "DOCUMENTDB_ALLOW_DEFAULT_PASSWORD": "true",
+                })
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+                warnings = [line for line in result.stderr.splitlines() if "built-in" in line]
+                self.assertEqual(len(warnings), 1, msg=result.stderr)
+                self.assertIn("is used to create user 'myadmin' (an existing user keeps its "
+                              "password; --create-user false creates none)", warnings[0])
+                self.assertIn("gateway-daemon-stub-started", result.stdout)
+                # Only a created user gets the password the warning names.
+                if create_user == "true":
+                    self.assertIn(f"password '{received.read_text()}'", warnings[0])
+                else:
+                    self.assertFalse(received.exists())
+
+    def test_explicit_password_prints_no_default_password_warning(self):
+        for extra_env in ({"USERNAME": "myadmin"}, {"USERNAME": None}):
+            with self.subTest(extra_env=extra_env):
+                result = self._run_entrypoint("--password", _TEST_PW, extra_env=extra_env)
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+                self.assertNotIn("built-in", result.stderr.lower())
+
+    def test_help_says_password_is_required_and_names_the_opt_in(self):
+        result = self._run_entrypoint("--help")
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("Password for the DocumentDB user. REQUIRED.", result.stdout)
+        self.assertIn("DOCUMENTDB_ALLOW_DEFAULT_PASSWORD=true", result.stdout)
+
+    def test_create_user_false_needs_no_password(self):
+        result = self._run_entrypoint(extra_env={"PASSWORD": None, "CREATE_USER": "false"})
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("no password was supplied", result.stderr)
+        self.assertNotIn("built-in", result.stderr)
+        self.assertIn("gateway-daemon-stub-started", result.stdout)
+
+    def test_create_user_false_loading_data_without_password_fails_fast(self):
+        (self.sample_data_dir / "01-sample.js").write_text("// sample\n", encoding="utf-8")
+        real_init = REPO_ROOT / "documentdb-local" / "scripts" / "init_documentdb_data.sh"
+        self._write_exec(self.gateway_scripts / "init_documentdb_data.sh",
+                         f'#!/bin/sh\nexec bash "{real_init}" "$@"\n')
+        result = self._run_entrypoint(extra_env={
+            "PASSWORD": None, "CREATE_USER": "false", "INIT_DATA": "true", "SKIP_INIT_DATA": "",
+        })
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("Error: Password is required.", result.stdout)
+        self.assertNotIn("Starting DocumentDB data initialization", result.stdout)
+        self.assertFalse((self.data_dir / ".documentdb-local" / "sample_data_initialized").exists())
+
+    def test_create_user_false_restart_after_seeding_needs_no_password(self):
+        init_dir = self.root / "custom_init"
+        init_dir.mkdir()
+        (init_dir / "00-custom.js").write_text("// custom\n", encoding="utf-8")
+        markers = self.data_dir / ".documentdb-local"
+        cases = (
+            ({"INIT_DATA": "true"}, ("sample_data_initialized",)),
+            ({"INIT_DATA": "false", "INIT_DATA_PATH": str(init_dir)},
+             ("custom_data_attempted", "custom_data_succeeded")),
+        )
+        for env, names in cases:
+            with self.subTest(markers=names):
+                shutil.rmtree(markers, ignore_errors=True)
+                markers.mkdir()
+                for name in names:
+                    (markers / name).touch()
+                counter = self._write_counting_init_stub(fail_always=True)
+                result = self._run_entrypoint(extra_env={
+                    "PASSWORD": None, "CREATE_USER": "false", "SKIP_INIT_DATA": "", **env,
+                })
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+                self.assertIn("already initialized", result.stdout)
+                self.assertFalse(counter.exists(), "the seed must not run")
+
+    def _write_counting_init_stub(self, fail_on_second=False, fail_always=False):
+        """Replace the init-data stub with one that records each invocation.
+
+        The counter persists under the data dir so it survives across the two
+        entrypoint runs in a single test, simulating a container restart on a
+        persistent volume. The stub also emulates the real script's
+        --attempt-marker contract: it creates the marker before doing any work,
+        so the entrypoint's one-shot skip behaves as in production (#612).
+        """
+        counter = self.data_dir / "init_invocations"
+        # The two failure modes generate conflicting stub logic, so disallow combining them.
+        assert not (
+            fail_on_second and fail_always
+        ), "fail_on_second and fail_always are mutually exclusive"
+        fail_block = ""
+        if fail_on_second:
+            fail_block = (
+                'if [ "$count" -ge 2 ]; then\n'
+                '  echo "init-stub: refusing repeat invocation"\n'
+                "  exit 1\n"
+                "fi\n"
+            )
+        if fail_always:
+            fail_block += 'echo "init-stub: simulated failure"\nexit 1\n'
+        self._write_exec(
+            self.gateway_scripts / "init_documentdb_data.sh",
+            f"#!/bin/sh\n"
+            f'attempt_marker=""\n'
+            f"while [ $# -gt 0 ]; do\n"
+            f'  case "$1" in\n'
+            f'    --attempt-marker) attempt_marker="$2"; shift 2 ;;\n'
+            f"    *) shift ;;\n"
+            f"  esac\n"
+            f"done\n"
+            f'if [ -n "$attempt_marker" ]; then\n'
+            f'  mkdir -p "$(dirname "$attempt_marker")" && touch "$attempt_marker"\n'
+            f"fi\n"
+            f"count=0\n"
+            f'if [ -f "{counter}" ]; then count=$(cat "{counter}"); fi\n'
+            f"count=$((count + 1))\n"
+            f'echo "$count" > "{counter}"\n'
+            f'echo "init-stub invocation $count"\n'
+            f"{fail_block}"
+            f"exit 0\n",
+        )
+        return counter
+
+    def test_state_file_published_only_after_data_initialization(self):
+        # The probe's whole contract is "state file present => fully
+        # initialized"; publishing before seeding would let service_healthy
+        # dependents start against a database still being seeded.
+        (self.sample_data_dir / "01-sample.js").write_text(
+            "// sample\n", encoding="utf-8"
+        )
+        state_file = self.root / "runtime-state.env"
+        seen = self.root / "state-file-seen-by-seeder"
+        self._write_exec(
+            self.gateway_scripts / "init_documentdb_data.sh",
+            f'#!/bin/sh\nif [ -e "{state_file}" ]; then touch "{seen}"; fi\n'
+            f"exit 0\n",
+        )
+
+        result = self._run_entrypoint(
+            extra_env={
+                "INIT_DATA": "true",
+                "SKIP_INIT_DATA": "",
+                "DOCUMENTDB_RUNTIME_STATE_FILE": str(state_file),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue(state_file.exists())
+        self.assertFalse(
+            seen.exists(),
+            "runtime state file was published before data seeding completed",
+        )
+
+    def test_sample_data_is_seeded_once_and_skipped_on_restart(self):
+        # Make the sample-data dir resemble the real layout.
+        (self.sample_data_dir / "01-sample.js").write_text(
+            "// sample\n", encoding="utf-8"
+        )
+        # The stub fails if invoked a second time, so this test fails unless the
+        # marker prevents a re-seed on the simulated restart (#612).
+        counter = self._write_counting_init_stub(fail_on_second=True)
+        env = {"INIT_DATA": "true", "SKIP_INIT_DATA": ""}
+
+        first = self._run_entrypoint(extra_env=env)
+        self.assertEqual(first.returncode, 0, msg=first.stdout + first.stderr)
+        self.assertEqual(counter.read_text().strip(), "1")
+        marker = self.data_dir / ".documentdb-local" / "sample_data_initialized"
+        self.assertTrue(marker.exists(), "marker should be written after first seed")
+
+        # Second boot against the same persistent data dir must skip the seed.
+        second = self._run_entrypoint(extra_env=env)
+        self.assertEqual(second.returncode, 0, msg=second.stdout + second.stderr)
+        self.assertEqual(
+            counter.read_text().strip(), "1", "seed must not run again on restart"
+        )
+        self.assertIn("already initialized", second.stdout)
+        self.assertIn("fresh data volume", second.stdout)
+
+    def test_custom_data_is_one_shot_on_restart(self):
+        init_dir = self.root / "custom_init"
+        init_dir.mkdir()
+        (init_dir / "00-custom.js").write_text("// custom\n", encoding="utf-8")
+        # Fails if invoked a second time, so this test fails unless the marker
+        # prevents the custom init from re-running on a simulated restart (#612).
+        counter = self._write_counting_init_stub(fail_on_second=True)
+        env = {
+            "INIT_DATA": "false",
+            "SKIP_INIT_DATA": "",
+            "INIT_DATA_PATH": str(init_dir),
+        }
+
+        first = self._run_entrypoint(extra_env=env)
+        self.assertEqual(first.returncode, 0, msg=first.stdout + first.stderr)
+        self.assertEqual(counter.read_text().strip(), "1")
+        attempt_marker = self.data_dir / ".documentdb-local" / "custom_data_attempted"
+        success_marker = self.data_dir / ".documentdb-local" / "custom_data_succeeded"
+        self.assertTrue(attempt_marker.exists(), "attempt marker should be written")
+        self.assertTrue(
+            success_marker.exists(), "success marker should be written after a successful run"
+        )
+
+        second = self._run_entrypoint(extra_env=env)
+        self.assertEqual(second.returncode, 0, msg=second.stdout + second.stderr)
+        self.assertEqual(
+            counter.read_text().strip(), "1", "custom init must not run again on restart"
+        )
+        self.assertIn("already initialized", second.stdout)
+
+    def test_custom_data_failure_is_not_retried_on_restart(self):
+        # A failing custom init (e.g. a non-idempotent user script that errors partway)
+        # must not loop: the attempt marker is written before the script runs, so the
+        # failed init is not re-run on restart (#612). Matches the official-image contract.
+        init_dir = self.root / "custom_init"
+        init_dir.mkdir()
+        (init_dir / "00-custom.js").write_text("// custom\n", encoding="utf-8")
+        counter = self._write_counting_init_stub(fail_always=True)
+        env = {
+            "INIT_DATA": "false",
+            "SKIP_INIT_DATA": "",
+            "INIT_DATA_PATH": str(init_dir),
+        }
+
+        first = self._run_entrypoint(extra_env=env)
+        self.assertNotEqual(
+            first.returncode, 0, msg="first boot should surface the init failure"
+        )
+        self.assertEqual(counter.read_text().strip(), "1")
+        attempt_marker = self.data_dir / ".documentdb-local" / "custom_data_attempted"
+        success_marker = self.data_dir / ".documentdb-local" / "custom_data_succeeded"
+        self.assertTrue(
+            attempt_marker.exists(),
+            "attempt marker must be written before running so a failed init is not retried",
+        )
+        self.assertFalse(
+            success_marker.exists(), "success marker must not exist after a failed init"
+        )
+
+        second = self._run_entrypoint(extra_env=env)
+        self.assertEqual(second.returncode, 0, msg=second.stdout + second.stderr)
+        self.assertEqual(
+            counter.read_text().strip(),
+            "1",
+            "failed custom init must not be retried on restart",
+        )
+        self.assertIn("attempted but its success was not recorded", second.stdout)
+        self.assertIn("fresh data volume", second.stdout)
+        self.assertNotIn("already initialized", second.stdout)
+
+    def test_custom_failure_then_sample_runs_on_next_boot(self):
+        # Custom init runs before sample. If custom fails on the first boot the container
+        # exits; on restart custom is skipped (one-shot) and sample then seeds (#612).
+        init_dir = self.root / "custom_init"
+        init_dir.mkdir()
+        (init_dir / "00-custom.js").write_text("// custom\n", encoding="utf-8")
+        (self.sample_data_dir / "01-sample.js").write_text("// sample\n", encoding="utf-8")
+        # Stub fails (after marking) when invoked for custom (--attempt-marker present)
+        # and succeeds for sample (no --attempt-marker).
+        self._write_exec(
+            self.gateway_scripts / "init_documentdb_data.sh",
+            "#!/bin/sh\n"
+            'attempt_marker=""\n'
+            "while [ $# -gt 0 ]; do\n"
+            '  case "$1" in\n'
+            '    --attempt-marker) attempt_marker="$2"; shift 2 ;;\n'
+            "    *) shift ;;\n"
+            "  esac\n"
+            "done\n"
+            'if [ -n "$attempt_marker" ]; then\n'
+            '  mkdir -p "$(dirname "$attempt_marker")" && touch "$attempt_marker"\n'
+            '  echo "custom init failing"\n'
+            "  exit 1\n"
+            "fi\n"
+            'echo "sample init ok"\n'
+            "exit 0\n",
+        )
+        env = {
+            "INIT_DATA": "true",
+            "SKIP_INIT_DATA": "",
+            "INIT_DATA_PATH": str(init_dir),
+        }
+
+        first = self._run_entrypoint(extra_env=env)
+        self.assertNotEqual(
+            first.returncode, 0, msg="custom failure should fail the first boot"
+        )
+        attempt_marker = self.data_dir / ".documentdb-local" / "custom_data_attempted"
+        sample_marker = self.data_dir / ".documentdb-local" / "sample_data_initialized"
+        self.assertTrue(attempt_marker.exists())
+        self.assertFalse(
+            sample_marker.exists(), "sample must not seed when custom fails first"
+        )
+
+        second = self._run_entrypoint(extra_env=env)
+        self.assertEqual(second.returncode, 0, msg=second.stdout + second.stderr)
+        self.assertTrue(
+            sample_marker.exists(),
+            "sample should seed on the next boot after custom is skipped",
+        )
+        self.assertIn("attempted but its success was not recorded", second.stdout)
+
+    def test_help_does_not_advertise_force_init_data(self):
+        # Re-initialization is intentionally done by starting with a fresh data
+        # volume (common container-image parity), not a force flag (#612).
+        result = self._run_entrypoint("--help")
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("--force-init-data", result.stdout)
+
+    def _set_blocked_role_prefixes(self, prefixes):
+        config_path = self.gateway_config_dir / "SetupConfiguration.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["BlockedRolePrefixes"] = prefixes
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    def test_blocked_username_prefix_is_rejected(self):
+        # citus is the username in the issue #650 reproduction; documentdb is the
+        # prefix the default test config blocks. Either must fail fast at startup
+        # rather than letting the container report ready with an unusable user.
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "documentdb_user"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "username 'documentdb_user' uses reserved prefix 'documentdb'",
+            result.stdout + result.stderr,
+        )
+
+    def test_blocked_username_prefix_is_case_insensitive(self):
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "DocumentDBAdmin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "uses reserved prefix 'documentdb'",
+            result.stdout + result.stderr,
+        )
+
+    def test_allowed_username_passes_validation(self):
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("reserved prefix", result.stdout + result.stderr)
+
+    def test_all_configured_blocked_prefixes_are_rejected(self):
+        prefixes = ["documentdb", "citus", "pg", "internal_role"]
+        self._set_blocked_role_prefixes(prefixes)
+        for prefix in prefixes:
+            username = f"{prefix}_service"
+            with self.subTest(username=username):
+                result = self._run_entrypoint(
+                    "--password", _TEST_PW, extra_env={"USERNAME": username}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"uses reserved prefix '{prefix}'",
+                    result.stdout + result.stderr,
+                )
+
+    def test_empty_blocked_prefix_entry_fails_fast(self):
+        # The gateway's starts_with("") matches every username, so an empty
+        # BlockedRolePrefixes entry blocks all authentication. The entrypoint
+        # must fail fast rather than start a container whose user can never
+        # authenticate -- even for an otherwise-allowed username.
+        self._set_blocked_role_prefixes([""])
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains an empty entry", result.stdout + result.stderr)
+
+    def test_missing_gateway_config_fails_fast(self):
+        # Validation reads the gateway's own SetupConfiguration.json; if it is
+        # missing the check must not silently pass (which would re-open the
+        # false-success-startup bug), it must fail fast.
+        (self.gateway_config_dir / "SetupConfiguration.json").unlink()
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not found", result.stdout + result.stderr)
+
+    def test_unparseable_gateway_config_fails_fast(self):
+        config_path = self.gateway_config_dir / "SetupConfiguration.json"
+        config_path.write_text("{not valid json", encoding="utf-8")
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "failed to parse gateway configuration",
+            result.stdout + result.stderr,
+        )
+
+    def test_non_array_blocked_role_prefixes_fails_fast(self):
+        # A syntactically valid config whose BlockedRolePrefixes is not an array
+        # (the gateway requires an array of strings) must fail fast rather than
+        # be silently treated as "no prefixes", which would re-open the
+        # false-success-startup bug.
+        config_path = self.gateway_config_dir / "SetupConfiguration.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["BlockedRolePrefixes"] = "documentdb"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be a JSON array", result.stdout + result.stderr)
+
+    def _write_raw_config(self, mutate):
+        config_path = self.gateway_config_dir / "SetupConfiguration.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        mutate(config)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    def test_missing_blocked_role_prefixes_key_fails_fast(self):
+        # The gateway requires BlockedRolePrefixes (non-defaulted Vec<String>), so
+        # an absent key is invalid; validate the same contract instead of silently
+        # skipping and letting the gateway fail later.
+        self._write_raw_config(lambda c: c.pop("BlockedRolePrefixes", None))
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be a JSON array", result.stdout + result.stderr)
+
+    def test_null_blocked_role_prefixes_fails_fast(self):
+        self._write_raw_config(
+            lambda c: c.__setitem__("BlockedRolePrefixes", None)
+        )
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be a JSON array", result.stdout + result.stderr)
+
+    def test_non_string_blocked_role_prefixes_element_fails_fast(self):
+        # An array with a non-string element is not a Vec<String> and the gateway
+        # would reject it; fail fast with a clear message.
+        self._write_raw_config(
+            lambda c: c.__setitem__("BlockedRolePrefixes", ["documentdb", 123])
+        )
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "docdb_admin"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must contain only strings", result.stdout + result.stderr)
+
+    def test_empty_blocked_role_prefixes_allows_non_reserved_username(self):
+        # An empty array disables prefix blocking, so a username the default
+        # prefix policy would block must pass validation.
+        self._set_blocked_role_prefixes([])
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "documentdb_service"}
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertNotIn("reserved prefix", result.stdout + result.stderr)
+
+    def test_internal_role_name_is_rejected_by_prefix_policy(self):
+        # The shipped documentdb prefix is what keeps extension-owned identities
+        # out; there is no longer a separate exact-name list behind it.
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "documentdb_admin_role"}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uses reserved prefix 'documentdb'", result.stdout + result.stderr)
+
+    def test_empty_blocked_role_prefixes_allows_internal_role_name(self):
+        # Pins the deliberate policy reduction: with prefix blocking disabled,
+        # an extension-owned identity is no longer refused at startup. Startup
+        # readiness, not a name list, is the intended cover for this case.
+        self._set_blocked_role_prefixes([])
+        result = self._run_entrypoint(
+            "--password", _TEST_PW, extra_env={"USERNAME": "documentdb_admin_role"}
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def _write_alternate_config_dir(self, prefixes):
+        """Config dir holding its own policy, distinct from the legacy
+        GATEWAY_HOME location, so the two cannot be confused."""
+        alt = self.root / "etc-documentdb-gateway"
+        alt.mkdir(parents=True, exist_ok=True)
+        source = self.gateway_config_dir / "SetupConfiguration.json"
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["BlockedRolePrefixes"] = prefixes
+        (alt / "SetupConfiguration.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        return alt
+
+    def test_username_validated_against_resolved_config_dir(self):
+        # The gateway is started from $CONFIG_DIR; validating the legacy
+        # GATEWAY_HOME copy instead would clear a username the gateway blocks.
+        alt = self._write_alternate_config_dir(["acme"])
+        self._set_blocked_role_prefixes([])
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"USERNAME": "acme_user", "CONFIG_DIR": str(alt)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uses reserved prefix 'acme'", result.stdout + result.stderr)
+
+    def test_legacy_config_policy_is_not_consulted(self):
+        # The converse: a prefix blocked only in the legacy copy must not
+        # reject a username the gateway's own configuration permits.
+        alt = self._write_alternate_config_dir([])
+        self._set_blocked_role_prefixes(["acme"])
+        result = self._run_entrypoint(
+            "--password",
+            _TEST_PW,
+            extra_env={"USERNAME": "acme_user", "CONFIG_DIR": str(alt)},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+
+class InitDataAttemptMarkerTests(unittest.TestCase):
+    """Exercises the real init_documentdb_data.sh --attempt-marker contract (#612).
+
+    The marker is written immediately before the first user script runs. If it cannot
+    be persisted, initialization must abort before touching any data so a retry stays
+    safe (no partially-applied, non-idempotent scripts that could loop on restart).
+    """
+
+    INIT_SCRIPT = (
+        REPO_ROOT / "documentdb-local" / "scripts" / "init_documentdb_data.sh"
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.bin_dir = self.root / "bin"
+        self.init_dir = self.root / "init"
+        self.bin_dir.mkdir()
+        self.init_dir.mkdir()
+        (self.init_dir / "00-data.js").write_text("// data\n", encoding="utf-8")
+        # Records each user-script (load-mode) execution so a test can assert
+        # whether any user script actually ran. The readiness ping (empty
+        # DOCUMENTDB_INIT_FILE) is treated as a no-op.
+        self.file_runs = self.root / "mongosh_file_runs"
+        # Records whether the attempt marker already existed at the moment the first user
+        # script was invoked, so a test can prove the marker is written BEFORE (not after)
+        # any data is mutated -- the core ordering invariant of the #612 fix.
+        self.marker_state = self.root / "marker_state_at_file_run"
+        mongosh = self.bin_dir / "mongosh"
+        mongosh.write_text(
+            "#!/bin/sh\n"
+            # The init script passes the user script path in DOCUMENTDB_INIT_FILE
+            # (load mode); the readiness probe passes an empty value (ping mode),
+            # which must stay a no-op here.
+            'if [ -n "$DOCUMENTDB_INIT_FILE" ]; then\n'
+            '  if [ -f "$ATTEMPT_MARKER_PATH" ]; then\n'
+            f'    echo present >> "{self.marker_state}"\n'
+            "  else\n"
+            f'    echo missing >> "{self.marker_state}"\n'
+            "  fi\n"
+            f'  echo ran >> "{self.file_runs}"\n'
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        mongosh.chmod(0o755)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _run(self, attempt_marker, init_dir=None):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
+        env["ATTEMPT_MARKER_PATH"] = str(attempt_marker)
+        # The init script reads the password only from DOCUMENTDB_PASSWORD; the
+        # -p/--password flag was removed so the secret never lands on the argv.
+        env["DOCUMENTDB_PASSWORD"] = "p"
+        return subprocess.run(
+            [
+                "bash",
+                str(self.INIT_SCRIPT),
+                "-H", "localhost",
+                "-P", "10260",
+                "-u", "u",
+                "-d", str(init_dir or self.init_dir),
+                "--attempt-marker", str(attempt_marker),
+                "-v",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def test_marker_write_failure_aborts_before_running_scripts(self):
+        # A parent path component is a regular file, so `mkdir -p` can never succeed
+        # (ENOTDIR) -- this holds even for root, unlike a chmod-based read-only dir.
+        blocker = self.root / "not_a_dir"
+        blocker.write_text("x", encoding="utf-8")
+        bad_marker = blocker / "sub" / "custom_data_attempted"
+
+        result = self._run(bad_marker)
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertFalse(
+            self.file_runs.exists(),
+            "no user script may run if the attempt marker cannot be written",
+        )
+        self.assertIn(
+            "could not write initialization marker", result.stdout + result.stderr
+        )
+
+    def test_marker_written_before_first_script_runs(self):
+        marker = self.root / "data" / ".documentdb-local" / "custom_data_attempted"
+        result = self._run(marker)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue(marker.exists(), "attempt marker should be written")
+        self.assertTrue(
+            self.file_runs.exists(), "user script should run after the marker is written"
+        )
+        # The marker must already exist at the moment the first user script is invoked --
+        # writing it afterward would re-open the #612 loop on a partial failure.
+        self.assertEqual(
+            self.marker_state.read_text(encoding="utf-8").strip(),
+            "present",
+            "attempt marker must be written BEFORE the first user script runs",
+        )
+
+    def test_partial_failure_still_records_attempt_marker(self):
+        # Real #612 shape: the first script succeeds, a later one fails. The marker must
+        # already be present (it is written before the first script), so the entrypoint
+        # skips the whole set on restart rather than re-running the non-idempotent first one.
+        (self.init_dir / "01-more.js").write_text("// more\n", encoding="utf-8")
+        mongosh = self.bin_dir / "mongosh"
+        mongosh.write_text(
+            "#!/bin/sh\n"
+            # Only user-script runs carry DOCUMENTDB_INIT_FILE; the readiness
+            # probe (empty value) stays a no-op. Fail the second script to
+            # exercise a partial failure.
+            'if [ -n "$DOCUMENTDB_INIT_FILE" ]; then\n'
+            f'  echo ran >> "{self.file_runs}"\n'
+            f'  n=$(wc -l < "{self.file_runs}")\n'
+            '  if [ "$n" -ge 2 ]; then exit 1; fi\n'
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        mongosh.chmod(0o755)
+
+        marker = self.root / "data" / ".documentdb-local" / "custom_data_attempted"
+        result = self._run(marker)
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue(
+            marker.exists(),
+            "attempt marker must persist even when a later script fails",
+        )
+        self.assertEqual(
+            len(self.file_runs.read_text(encoding="utf-8").splitlines()),
+            2,
+            "both scripts should be attempted before the failure",
+        )
+
+    def test_script_contents_are_not_echoed(self):
+        # Seed scripts often carry createUser passwords; only the file name
+        # may reach stdout (which the entrypoint tees into its log).
+        secret = "seed-secret-" + secrets.token_hex(8)
+        (self.init_dir / "00-data.js").write_text(
+            f'db.createUser({{user: "u", pwd: "{secret}"}});\n', encoding="utf-8"
+        )
+        marker = self.root / "data" / ".documentdb-local" / "custom_data_attempted"
+        result = self._run(marker)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("00-data.js", result.stdout)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_no_js_files_does_not_write_marker(self):
+        # No user scripts means no data is mutated, so no marker should be written -- the
+        # volume stays eligible for a real initialization later (no spurious one-shot lock).
+        empty_dir = self.root / "empty_init"
+        empty_dir.mkdir()
+        marker = self.root / "data" / ".documentdb-local" / "custom_data_attempted"
+        result = self._run(marker, init_dir=empty_dir)
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "no marker may be written when no scripts run")
+        self.assertFalse(self.file_runs.exists(), "no user script should run")
+
+
+class ValidateUsernameScriptTests(unittest.TestCase):
+    """Direct tests for documentdb_validate_username.sh, invoked standalone with
+    a stubbed jq and a temp SetupConfiguration.json -- covering the
+    BlockedRolePrefixes logic without booting the whole entrypoint."""
+
+    VALIDATOR = (
+        REPO_ROOT / "documentdb-local" / "scripts" / "documentdb_validate_username.sh"
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        jq = self.bin_dir / "jq"
+        jq.write_text(
+            """#!/usr/bin/env python3
+import json, sys
+rest = [a for a in sys.argv[1:] if not a.startswith('-')]
+expr, file_path = rest[0].strip(), rest[1]
+with open(file_path, encoding='utf-8') as f:
+    data = json.load(f)
+if expr == '.BlockedRolePrefixes | type':
+    v = data.get('BlockedRolePrefixes')
+    print('null' if v is None else 'array' if isinstance(v, list)
+          else 'string' if isinstance(v, str) else 'boolean' if isinstance(v, bool)
+          else 'number' if isinstance(v, (int, float)) else 'object')
+    raise SystemExit(0)
+if expr == 'all(.BlockedRolePrefixes[]; type == "string")':
+    arr = data.get('BlockedRolePrefixes') or []
+    raise SystemExit(0 if isinstance(arr, list) and all(isinstance(x, str) for x in arr) else 1)
+if expr in ('.BlockedRolePrefixes[]', '.BlockedRolePrefixes[]?'):
+    for item in data.get('BlockedRolePrefixes', []):
+        print(item)
+    raise SystemExit(0)
+raise SystemExit('Unsupported jq expression: ' + expr)
+""",
+            encoding="utf-8",
+        )
+        jq.chmod(0o755)
+        self.config = self.root / "SetupConfiguration.json"
+        self._write_prefixes(["documentdb", "citus", "pg", "internal_role"])
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_prefixes(self, prefixes):
+        self.config.write_text(
+            json.dumps({"BlockedRolePrefixes": prefixes}), encoding="utf-8"
+        )
+
+    def _run(self, username, config=None, gateway_home=None):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        args = ["bash", str(self.VALIDATOR), username]
+        if config is not None:
+            args.append(str(config))
+        if gateway_home is not None:
+            env["GATEWAY_HOME"] = str(gateway_home)
+        return subprocess.run(
+            args, capture_output=True, text=True, env=env,
+            timeout=30, stdin=subprocess.DEVNULL,
+        )
+
+    def test_allowed_username_exits_zero(self):
+        result = self._run("docdb_admin", config=self.config)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def test_citus_username_is_rejected(self):
+        # The exact issue #650 reproduction.
+        result = self._run("citus", config=self.config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uses reserved prefix 'citus'", result.stdout + result.stderr)
+
+    def test_every_configured_prefix_is_rejected(self):
+        for prefix in ("documentdb", "citus", "pg", "internal_role"):
+            with self.subTest(prefix=prefix):
+                result = self._run(f"{prefix}_svc", config=self.config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"uses reserved prefix '{prefix}'", result.stdout + result.stderr
+                )
+
+    def test_prefix_check_is_case_insensitive(self):
+        result = self._run("DOCUMENTDB_svc", config=self.config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uses reserved prefix 'documentdb'", result.stdout + result.stderr)
+
+    def test_reserved_role_names_are_rejected(self):
+        # PostgreSQL refuses public/none only after the container has
+        # initialized. Exact match: "Public" is a valid role.
+        for username in ("public", "none"):
+            with self.subTest(username=username):
+                result = self._run(username, config=self.config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("is reserved by PostgreSQL",
+                              result.stdout + result.stderr)
+
+    def test_username_over_63_bytes_is_rejected(self):
+        # PostgreSQL truncates the role, so the full name never logs in.
+        for username in ("a" * 64, "\u00e9" * 32):
+            with self.subTest(length=len(username)):
+                result = self._run(username, config=self.config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("is 64 bytes", result.stdout + result.stderr)
+
+    def test_existing_usernames_outside_the_cli_charset_still_start(self):
+        # The packaged CLIs restrict new names to [A-Za-z0-9_-]; this check
+        # runs on every container start, so it must not lock out a name an
+        # existing data directory already uses.
+        for username in ("first.last", "app@corp", "-ops", "a" * 63,
+                         "public_admin", "Public", "None"):
+            with self.subTest(username=username):
+                result = self._run(username, config=self.config)
+                self.assertEqual(result.returncode, 0,
+                                 msg=result.stdout + result.stderr)
+
+    def test_missing_config_is_rejected(self):
+        result = self._run("docdb_admin", config=self.root / "absent.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not found", result.stdout + result.stderr)
+
+    def test_non_array_prefixes_is_rejected(self):
+        self.config.write_text(
+            json.dumps({"BlockedRolePrefixes": "documentdb"}), encoding="utf-8"
+        )
+        result = self._run("docdb_admin", config=self.config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be a JSON array", result.stdout + result.stderr)
+
+    def test_empty_prefix_entry_is_rejected(self):
+        self._write_prefixes([""])
+        result = self._run("docdb_admin", config=self.config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains an empty entry", result.stdout + result.stderr)
+
+    def test_config_path_defaults_to_gateway_home(self):
+        # With no config argument, the validator derives it from GATEWAY_HOME.
+        gw = self.root / "gw"
+        (gw / "pg_documentdb_gw").mkdir(parents=True)
+        (gw / "pg_documentdb_gw" / "SetupConfiguration.json").write_text(
+            json.dumps({"BlockedRolePrefixes": ["citus"]}), encoding="utf-8"
+        )
+        result = self._run("citus", gateway_home=gw)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uses reserved prefix 'citus'", result.stdout + result.stderr)
+
+
+class EntrypointUxTextTests(unittest.TestCase):
+    """Round-4 UX review fixes to the emulator entrypoint: honest help text,
+    a clean PostgreSQL shutdown on container stop, and a connect string."""
+
+    def _text(self):
+        return ENTRYPOINT.read_text(encoding="utf-8")
+
+    def test_help_documents_real_env_var_names(self):
+        result = subprocess.run(
+            ["bash", str(ENTRYPOINT), "--help"],
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        text = result.stdout
+        self.assertIn("Overrides DOCUMENTDB_PORT environment variable.", text)
+        self.assertIn("Overrides POSTGRESQL_PORT environment variable.", text)
+        # The old, wrong names must be gone from the override help lines.
+        self.assertNotIn("Overrides PORT environment variable.", text)
+        self.assertNotIn("Overrides PG_PORT environment variable.", text)
+
+    def test_cleanup_stops_postgresql(self):
+        # docker stop must cleanly stop the daemonized PostgreSQL (pg_ctl fast
+        # stop) instead of leaving it to be SIGKILLed with WAL recovery next boot.
+        text = self._text()
+        bodies = {}
+        for name in ("stop_owned_postgresql", "cleanup"):
+            match = re.search(rf"{name}\(\)\s*\{{(?P<body>.*?)\n\}}", text, flags=re.DOTALL)
+            self.assertIsNotNone(match, name)
+            bodies[name] = match.group("body")
+        self.assertIn('stop -D "${DATA_PATH}" -m fast', bodies["stop_owned_postgresql"])
+        self.assertIn("stop_owned_postgresql", bodies["cleanup"])
+
+    def test_ready_banner_prints_mongosh_connection_string(self):
+        text = _lib_text("serve.sh")
+        self.assertIn(
+            "mongosh 'mongodb://${USERNAME}:<password>@localhost:${DOCUMENTDB_PORT}",
+            text,
+            "the ready banner must print a working mongosh connection string",
+        )
+
+
+class ReportExtendedRumScriptTests(unittest.TestCase):
+    """Direct tests for documentdb_report_extended_rum.sh: one stubbed psql
+    reply per outcome, no entrypoint boot."""
+
+    SCRIPT = (
+        REPO_ROOT
+        / "documentdb-local"
+        / "scripts"
+        / "documentdb_report_extended_rum.sh"
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.psql_args = self.root / "psql-args.txt"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _run(self, answer, pg_accepting="true"):
+        reply = "exit 1" if answer is None else f"printf '%s\\n' {json.dumps(answer)}"
+        stub = self.bin_dir / "psql"
+        stub.write_text(
+            f"""#!/bin/sh
+printf '%s\\n' "$@" > "{self.psql_args}"
+cat > /dev/null
+{reply}
+""",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT), "5432", "owner-role", pg_accepting],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def test_probe_reads_only_the_two_durable_facts(self):
+        """The handler GUC is PGC_USERSET, so a startup session cannot speak
+        for the volume; the probe must not read it (thread 36794335)."""
+        self._run("1,1")
+        args = self.psql_args.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(args[args.index("-U") + 1], "owner-role")
+        self.assertEqual(args[args.index("-p") + 1], "5432")
+        sql = " ".join(args)
+        self.assertIn("pg_extension", sql)
+        self.assertIn("pg_available_extensions", sql)
+        self.assertNotIn("alternate_index_handler_name", sql)
+
+    def test_created_is_reported_on_stdout(self):
+        result = self._run("1,1")
+        self.assertIn("documentdb_extended_rum is created on this data volume", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_not_created_but_provided_names_the_repair(self):
+        result = self._run("0,1")
+        self.assertIn("not created on this data volume", result.stderr)
+        self.assertIn("CREATE EXTENSION documentdb_extended_rum", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_missing_from_image_warns(self):
+        result = self._run("0,0")
+        self.assertIn("does not provide the documentdb_extended_rum extension", result.stderr)
+        self.assertIn("Pull a newer documentdb-local image", result.stderr)
+
+    def test_failed_probe_is_an_anomaly_when_server_was_ready(self):
+        result = self._run(None, pg_accepting="true")
+        self.assertIn("although PostgreSQL is accepting connections", result.stderr)
+
+    def test_failed_probe_is_expected_when_server_was_not_ready(self):
+        result = self._run(None, pg_accepting="false")
+        self.assertIn("not confirmed to be accepting connections", result.stderr)
+
+    def test_garbage_reply_falls_through_to_the_unverified_arm(self):
+        result = self._run("nonsense")
+        self.assertIn("could not verify", result.stderr)
+        self.assertIn("nonsense", result.stderr)
+
+    def test_every_stderr_line_carries_the_warning_prefix(self):
+        for answer in ("0,1", "0,0", "nonsense", None):
+            with self.subTest(answer=answer):
+                result = self._run(answer)
+                self.assertTrue(result.stderr.startswith("Warning: "), result.stderr)
+                self.assertEqual(result.stdout, "")
+
+
+class PrepareDataDirectoryScriptTests(unittest.TestCase):
+    """Direct tests for documentdb_prepare_data_directory.sh.
+
+    The entrypoint tests above cover the WIRING (exit 10 -> `-c` reaches
+    start_oss_server.sh); these cover the script's own decision table without
+    booting the entrypoint, so a data-directory rule can be pinned down in
+    isolation -- this is the one part of the startup change that can destroy
+    user data."""
+
+    SCRIPT = (
+        REPO_ROOT
+        / "documentdb-local"
+        / "scripts"
+        / "documentdb_prepare_data_directory.sh"
+    )
+
+    ADOPT_OR_NOOP = 0
+    NEEDS_REINIT = 10
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.data_dir = self.root / "data"
+        self.data_dir.mkdir()
+        # The script proves pristineness against live pg_controldata output;
+        # a PATH-first stub keeps that deterministic on machines with or
+        # without a real PostgreSQL installation.
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self._write_pg_controldata_stub(PG_CONTROLDATA_STUB)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_pg_controldata_stub(self, content):
+        stub = self.bin_dir / "pg_controldata"
+        stub.write_text(content, encoding="utf-8")
+        stub.chmod(0o755)
+
+    def _run(self, data_dir=None, template=None):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        if template is not None:
+            env["DOCUMENTDB_PGDATA_TEMPLATE"] = str(template)
+        else:
+            env.pop("DOCUMENTDB_PGDATA_TEMPLATE", None)
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), str(data_dir or self.data_dir)],
+            env=env, text=True, capture_output=True, timeout=30,
+        )
+
+    def _seed_template(self, directory, used=False, fingerprint=BAKED_FINGERPRINT):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "PG_VERSION").write_text("17\n", encoding="utf-8")
+        marker_dir = directory / ".documentdb-local"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker = marker_dir / "baked_template"
+        if fingerprint is None:
+            marker.touch()
+        else:
+            marker.write_text(fingerprint, encoding="utf-8")
+        if used:
+            # Every real boot writes a server log; the baked template does not
+            # ship one. Even without the log, a used cluster's control data no
+            # longer matches the recorded fingerprint.
+            (directory / "pglog.log").write_text("used\n", encoding="utf-8")
+
+    def _marker_exists(self, directory=None):
+        directory = directory or self.data_dir
+        return (directory / ".documentdb-local" / "baked_template").exists()
+
+    def test_pristine_template_is_adopted_and_marker_consumed(self):
+        self._seed_template(self.data_dir)
+        result = self._run()
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("Adopting pre-initialized data directory", result.stdout)
+        self.assertFalse(self._marker_exists())
+
+    def test_used_volume_with_stale_marker_is_never_reinitialized(self):
+        """Upgrade/downgrade guard: an older image does not consume the
+        marker, so a volume it filled with data still carries one. The server
+        log must veto the destructive path. A major mismatch is the only
+        re-init trigger left, so the veto tests below all seed one."""
+        self._seed_template(self.data_dir, used=True)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        result = self._run()
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("stale pre-initialized template marker", result.stdout)
+        self.assertNotIn(
+            "Adopting pre-initialized data directory template", result.stdout,
+            "nothing is adopted here: the directory holds user data and only "
+            "carries a leftover marker",
+        )
+        self.assertFalse(
+            self._marker_exists(),
+            "the stale marker must still be consumed",
+        )
+
+    def test_plain_user_data_directory_is_left_alone(self):
+        """No marker, so a major mismatch is not the script's to act on."""
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        result = self._run()
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertTrue((self.data_dir / "PG_VERSION").is_file())
+
+    def test_empty_custom_path_is_populated_from_template(self):
+        template = self.root / "template"
+        self._seed_template(template)
+        (template / "postgresql.conf").write_text("x = 1\n", encoding="utf-8")
+        custom = self.root / "custom"
+        custom.mkdir()
+
+        result = self._run(data_dir=custom, template=template)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("Populating empty data directory", result.stdout)
+        self.assertTrue((custom / "PG_VERSION").is_file())
+        self.assertTrue((custom / "postgresql.conf").is_file())
+        self.assertEqual(
+            custom.stat().st_mode & 0o777, 0o750,
+            "cp -a propagates the template's mode; the populate branch must "
+            "re-pin the copy to 0750 or PostgreSQL refuses to start",
+        )
+        self.assertFalse(
+            self._marker_exists(custom),
+            "the copied marker must be consumed in the new data directory",
+        )
+        self.assertTrue(
+            self._marker_exists(template),
+            "copying must not consume the image template's own marker",
+        )
+
+    def test_non_empty_custom_path_is_not_populated(self):
+        template = self.root / "template"
+        self._seed_template(template)
+        custom = self.root / "custom"
+        custom.mkdir()
+        (custom / "leftover").write_text("keep\n", encoding="utf-8")
+
+        result = self._run(data_dir=custom, template=template)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Populating empty data directory", result.stdout)
+        self.assertTrue((custom / "leftover").is_file())
+        self.assertFalse((custom / "PG_VERSION").exists())
+
+    def test_used_template_is_not_copied_to_custom_path(self):
+        template = self.root / "template"
+        self._seed_template(template, used=True)
+        custom = self.root / "custom"
+        custom.mkdir()
+
+        result = self._run(data_dir=custom, template=template)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Populating empty data directory", result.stdout)
+        self.assertFalse((custom / "PG_VERSION").exists())
+
+    def test_restored_volume_without_logs_is_never_wiped(self):
+        """A used volume (stale marker from an older-image boot) restored from
+        a backup that excluded server logs. A log-presence heuristic would
+        call this pristine; the control-data fingerprint -- which any server
+        run changes -- must not, so the helper cannot wipe it. A major
+        mismatch is the only trigger left, so seed one for the veto to block."""
+        self._seed_template(self.data_dir, fingerprint=MISMATCHED_FINGERPRINT)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("cannot be verified", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertTrue((self.data_dir / "PG_VERSION").is_file())
+        self.assertFalse(self._marker_exists())
+
+    def test_fingerprintless_marker_is_treated_as_user_data(self):
+        """A hand-created marker (or one written by an image predating the
+        fingerprint) is empty; it proves nothing and must never enable the
+        destructive path, even with a major mismatch to act on."""
+        self._seed_template(self.data_dir, fingerprint=None)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("cannot be verified", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertFalse(self._marker_exists())
+
+    def test_unreadable_control_data_fails_closed(self):
+        """When pg_controldata cannot read the cluster, pristineness is
+        unprovable and the safe answer is 'user data' -- never exit 10. No
+        trigger can be seeded here: the major check needs pg_controldata's
+        binary too, so it fails closed before any comparison."""
+        self._seed_template(self.data_dir)
+        self._write_pg_controldata_stub("#!/bin/sh\nexit 1\n")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertTrue((self.data_dir / "PG_VERSION").is_file())
+
+    def test_unverified_template_is_not_copied_to_custom_path(self):
+        """Only a proven-pristine template may seed a custom data path; a
+        mismatched fingerprint (used cluster) must fall through to full
+        initialization instead of cloning unknown data."""
+        template = self.root / "template"
+        self._seed_template(template, fingerprint=MISMATCHED_FINGERPRINT)
+        custom = self.root / "custom"
+        custom.mkdir()
+
+        result = self._run(data_dir=custom, template=template)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Populating empty data directory", result.stdout)
+        self.assertFalse((custom / "PG_VERSION").exists())
+
+    def test_ran_and_killed_cluster_is_never_wiped(self):
+        """The F1 case: a cluster that started, took writes, and was killed
+        before its first checkpoint still shows the BAKED system identifier
+        and the BAKED checkpoint location (a clean startup advances neither);
+        only the cluster state ('in production') betrays that it ran. The
+        state field is part of the fingerprint precisely for this."""
+        self._seed_template(self.data_dir)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        (self.data_dir / ".control_stub").write_text(
+            "".join(line + "\n" for line in RAN_AND_KILLED_FIELD_LINES),
+            encoding="utf-8",
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("cannot be verified", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertTrue((self.data_dir / "PG_VERSION").is_file())
+        self.assertFalse(self._marker_exists())
+
+    def test_checkpoint_only_mismatch_without_newline_is_not_pristine(self):
+        """The F3 case: a marker whose FINAL line (the checkpoint, the only
+        line that differs) lacks a trailing newline. A line-by-line `read`
+        loop silently drops that line and never compares it; the whole-value
+        equality check must still reject the marker."""
+        self._seed_template(
+            self.data_dir,
+            fingerprint=(
+                "Database system identifier: 1234567890123456789\n"
+                "Database cluster state: shut down\n"
+                "Latest checkpoint location: 0/9999999"
+            ),
+        )
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("cannot be verified", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+
+    def test_marker_with_duplicated_lines_is_not_pristine(self):
+        """A marker padded with duplicated matching lines must not pass; a
+        per-line match counter could be satisfied without ever comparing the
+        mutable fields."""
+        self._seed_template(
+            self.data_dir,
+            fingerprint=BAKED_FINGERPRINT
+            + "Database system identifier: 1234567890123456789\n",
+        )
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertNotIn("Re-initializing", result.stdout)
+
+    def test_pristine_template_of_wrong_major_is_reinitialized(self):
+        """The F2 case: a volume seeded by one image tag (its PG_VERSION says
+        16) but first booted by this image (tooling reports 17). Adopting
+        would wedge the volume on 'database files are incompatible' forever;
+        the pristineness proof says no user data exists, so a clean
+        re-initialization heals it."""
+        self._seed_template(self.data_dir)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.NEEDS_REINIT, result.stderr)
+        self.assertIn("this image runs PostgreSQL 17", result.stdout)
+        self.assertFalse(self._marker_exists())
+
+    def test_indeterminate_binary_version_adopts_nondestructively(self):
+        """When the tooling version cannot be parsed the major guard must not
+        fire; adopting is the non-destructive fallback."""
+        self._seed_template(self.data_dir)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        self._write_pg_controldata_stub(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then echo "pg_controldata unknown"; exit 0; fi\n'
+            + "".join(f'echo "{line}"\n' for line in PG_CONTROLDATA_FIELD_LINES)
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("Adopting pre-initialized data directory", result.stdout)
+
+    def test_failed_template_copy_rolls_back_to_empty(self):
+        """Regression pin: a partial template copy must be rolled back so the
+        directory stays empty for full initialization instead of wedging as
+        'non-empty without PG_VERSION' on every later boot."""
+        template = self.root / "template"
+        self._seed_template(template)
+        custom = self.root / "custom"
+        custom.mkdir()
+        cp_stub = self.bin_dir / "cp"
+        cp_stub.write_text(
+            "#!/bin/sh\n"
+            f'touch "{custom}/partial_a" "{custom}/partial_b"\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        cp_stub.chmod(0o755)
+
+        result = self._run(data_dir=custom, template=template)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("falling back to full initialization", result.stdout)
+        self.assertEqual(
+            list(custom.iterdir()), [],
+            "a failed copy must leave the custom path empty",
+        )
+
+    def test_empty_default_path_logs_slow_first_boot(self):
+        """A bind-mounted /data shadows the baked template and arrives empty;
+        the slow full-initialization path must say why it is slower."""
+        result = self._run(template=self.data_dir)
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn(
+            "was not populated from the image template", result.stdout
+        )
+
+    def test_trailing_slash_data_path_still_gets_slow_boot_notice(self):
+        """--data-path /data/ must compare equal to the /data template path;
+        a raw string compare would silently drop the slow-boot advisory."""
+        result = self._run(
+            data_dir=str(self.data_dir) + "/", template=self.data_dir
+        )
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn(
+            "was not populated from the image template", result.stdout
+        )
+
+    def test_two_field_marker_and_live_never_adopt(self):
+        """Kills the `wc -l -eq 3` mutant: when BOTH the marker and the live
+        output carry only two fields (a future PostgreSQL renaming one), the
+        proof must fail closed even though the bytes match."""
+        two_lines = (
+            "Database system identifier: 1234567890123456789\n"
+            "Database cluster state: shut down\n"
+        )
+        self._seed_template(self.data_dir, fingerprint=two_lines)
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        (self.data_dir / ".control_stub").write_text(
+            "pg_control version number:            1700\n"
+            "Database system identifier:           1234567890123456789\n"
+            "Database cluster state:               shut down\n",
+            encoding="utf-8",
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("cannot be verified", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+
+    def test_pg_controldata_is_invoked_with_c_locale(self):
+        """Kills the LC_ALL=C mutant: pg_controldata's labels AND the state
+        value are gettext-translated, so the proof only works if the script
+        forces the C locale."""
+        self._seed_template(self.data_dir)
+        self._write_pg_controldata_stub(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then\n'
+            '    echo "pg_controldata (PostgreSQL) 17.5"\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "${LC_ALL:-}" != "C" ]; then\n'
+            '    echo "Datenbanksystemidentifikation:        1234567890123456789"\n'
+            '    echo "Datenbank-Cluster-Status:             heruntergefahren"\n'
+            '    echo "Position des letzten Checkpoints:     0/1000028"\n'
+            "    exit 0\n"
+            "fi\n"
+            + "".join(f'echo "{line}"\n' for line in PG_CONTROLDATA_FIELD_LINES)
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("Adopting pre-initialized data directory", result.stdout)
+
+    def test_zero_padded_checkpoint_render_still_matches(self):
+        """PostgreSQL master changed the LSN render from %X/%X to %X/%08X;
+        the canonicalization must keep a marker written by one render
+        readable under the other, so the wrong-major heal stays reachable."""
+        self._seed_template(self.data_dir)
+        (self.data_dir / ".control_stub").write_text(
+            "pg_control version number:            1800\n"
+            "Database system identifier:           1234567890123456789\n"
+            "Database cluster state:               shut down\n"
+            "Latest checkpoint location:           0/01000028\n"
+            "Latest checkpoint's REDO location:    0/01000028\n",
+            encoding="utf-8",
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("Adopting pre-initialized data directory", result.stdout)
+
+    def test_pristine_template_missing_pg_version_is_not_adopted(self):
+        """A proof-passing directory without PG_VERSION is a partially copied
+        template; claiming 'fast start' right before the server bootstrap
+        rejects it would mislead."""
+        self._seed_template(self.data_dir)
+        (self.data_dir / "PG_VERSION").unlink()
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("incomplete", result.stdout)
+        self.assertNotIn("Adopting", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+        self.assertFalse(self._marker_exists())
+
+    def test_garbage_pg_version_is_never_echoed_as_a_major(self):
+        self._seed_template(self.data_dir)
+        (self.data_dir / "PG_VERSION").write_text(
+            "not-a-version\n", encoding="utf-8"
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, self.ADOPT_OR_NOOP, result.stderr)
+        self.assertIn("incomplete", result.stdout)
+        self.assertNotIn("not-a-version", result.stdout)
+        self.assertNotIn("Re-initializing", result.stdout)
+
+    def test_interrupted_first_boot_restart_is_safe(self):
+        """A boot killed after the marker was consumed but before the server
+        ran leaves a marker-less template. The next boot must treat it as
+        ordinary user data and start normally -- no wipe, no wedge."""
+        self._seed_template(self.data_dir)
+        first = self._run()
+        self.assertEqual(first.returncode, self.ADOPT_OR_NOOP, first.stderr)
+
+        # Marker consumed: even a major mismatch is now not the script's call.
+        (self.data_dir / "PG_VERSION").write_text("16\n", encoding="utf-8")
+        second = self._run()
+
+        self.assertEqual(second.returncode, self.ADOPT_OR_NOOP, second.stderr)
+        self.assertNotIn("Re-initializing", second.stdout)
+        self.assertTrue((self.data_dir / "PG_VERSION").is_file())
+
+    def test_missing_argument_fails(self):
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT)],
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(
+            result.returncode, self.NEEDS_REINIT,
+            "a usage error must not be mistaken for the re-init signal",
+        )
+
+
+class PrepareDataDirectoryContractTests(unittest.TestCase):
+    """The entrypoint and the script must agree on the exit-code protocol."""
+
+    def _prepare_with_status(self, status):
+        """Run prepare_data_path against a stub script that exits `status`."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "documentdb_prepare_data_directory.sh").write_text(f"exit {status}\n")
+        (root / "data").mkdir()
+        script = (
+            f'. "{LIB_DIR / "postgres.sh"}"\n'
+            f'entrypoint_dir="{root}" DATA_PATH="{root / "data"}"\n'
+            'DOCUMENTDB_RUNTIME_USER="$(id -un)" DOCUMENTDB_RUNTIME_GROUP="$(id -gn)"\n'
+            'prepare_data_path 6>&2\n'
+            'echo "reinit=[${force_reinit_args[*]}]"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+
+    def test_entrypoint_maps_exit_10_to_force_cleanup(self):
+        result = self._prepare_with_status(10)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn(
+            "reinit=[-c]", result.stdout,
+            "the entrypoint must translate exit 10 into start_oss_server.sh -c",
+        )
+        self.assertIn("reinit=[]", self._prepare_with_status(0).stdout)
+
+    def test_entrypoint_aborts_on_unexpected_status(self):
+        result = self._prepare_with_status(3)
+        self.assertEqual(result.returncode, 3, msg=result.stdout + result.stderr)
+        self.assertIn("preparing the data directory failed (status 3)", result.stderr)
+        self.assertNotIn("reinit=", result.stdout)
+
+
+@unittest.skipUnless(shutil.which("flock"), "claim_data_directory needs flock(1)")
+class ClaimDataDirectoryTests(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        self.pidfile = self.data / "postmaster.pid"
+        self._helpers = []
+
+    def tearDown(self):
+        for proc in self._helpers:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        self.temp_dir.cleanup()
+
+    def _function(self):
+        # Every function the helper defines, up to its sourced-or-executed guard.
+        match = re.search(
+            r"^postmaster_identity\(\) \{\n.*?^claim_data_directory\(\) \{\n.*?^\}$",
+            CLAIM_HELPER.read_text(encoding="utf-8"),
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "could not locate the claim helper's functions")
+        return match.group(0) + "\n"
+
+    def _claim(self, data_dir=None, prefix=""):
+        target = self.data if data_dir is None else data_dir
+        return subprocess.run(
+            ["bash", "-c", self._function() + prefix + 'claim_data_directory "%s"\necho claimed\n' % target],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def _write_pidfile(self, pid):
+        self.pidfile.write_text(
+            "%s\n%s\n1700000000\n9712\n/var/run/postgresql\n" % (pid, self.data),
+            encoding="utf-8",
+        )
+
+    OVERRIDE = "export DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID=true\n"
+
+    def _spawn_holder(self, after_claim=""):
+        out = self.root / "holder.log"
+        with out.open("w") as sink:
+            proc = subprocess.Popen(
+                ["bash", "-c", self._function() + 'claim_data_directory "%s"\n%secho held\nexec sleep 300\n' % (self.data, after_claim)],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+        self._helpers.append(proc)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if "held" in out.read_text(errors="replace"):
+                return proc
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        self.fail("holder never claimed: %s" % out.read_text(errors="replace"))
+
+    def test_a_second_container_on_an_in_use_volume_is_refused(self):
+        holder = self._spawn_holder()
+        self._write_pidfile(999999)
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("already using the data directory", result.stderr)
+        self.assertNotIn("claimed", result.stdout)
+        self.assertTrue(
+            self.pidfile.exists(),
+            "the running container's lock file must survive a refused start",
+        )
+        self.assertIsNone(holder.poll(), "the running container must be unaffected")
+
+    def test_a_crashed_holder_releases_the_directory_for_the_next_start(self):
+        holder = self._spawn_holder()
+        holder.kill()
+        holder.wait(timeout=10)
+        self._write_pidfile(999999)
+
+        refused = self._claim()
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", refused.stderr)
+        self.assertTrue(self.pidfile.exists(), "a free flock alone must not remove the pidfile")
+
+        forced = self._claim(prefix=self.OVERRIDE)
+        self.assertEqual(forced.returncode, 0, forced.stdout + forced.stderr)
+        self.assertIn("Warning: removing", forced.stderr)
+        self.assertIn("claimed", forced.stdout)
+        self.assertFalse(self.pidfile.exists(), "the override must remove the pidfile")
+
+    def _spawn_recorded_holder(self):
+        """A holder that plays its own postmaster: it inherits the lock fd and is recorded."""
+        return self._spawn_holder(after_claim=(
+            "printf '%%s\\n%s\\n1700000000\\n' $$ > \"%s\"\nrecord_postmaster_owner \"%s\"\n"
+            % (self.data, self.pidfile, self.data)
+        ))
+
+    def _owner_record(self):
+        return self.data / ".documentdb-local" / "postmaster-owner"
+
+    def test_a_pidfile_from_a_postmaster_that_held_the_lock_is_removed_after_an_unclean_stop(self):
+        holder = self._spawn_recorded_holder()
+        self.assertEqual(self._owner_record().read_text(), "%d 1700000000\n" % holder.pid)
+        holder.kill()
+        holder.wait(timeout=10)
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Warning: removing", result.stderr)
+        self.assertIn("unclean stop", result.stderr)
+        self.assertIn("claimed", result.stdout)
+        self.assertFalse(self.pidfile.exists())
+
+    def test_a_recorded_recovery_still_reminds_about_an_unneeded_override(self):
+        holder = self._spawn_recorded_holder()
+        holder.kill()
+        holder.wait(timeout=10)
+
+        result = self._claim(prefix=self.OVERRIDE)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("unclean stop", result.stderr)
+        self.assertIn("was not needed for this; unset it", result.stderr)
+        self.assertFalse(self.pidfile.exists())
+
+    def test_a_pidfile_from_another_postmaster_is_refused_despite_a_record(self):
+        holder = self._spawn_recorded_holder()
+        holder.kill()
+        holder.wait(timeout=10)
+        # A container without the lock reused the volume and wrote its own pidfile.
+        self._write_pidfile(4243)
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+        self.assertTrue(self.pidfile.exists())
+
+    def test_a_pidfile_reusing_the_recorded_pid_with_another_start_time_is_refused(self):
+        holder = self._spawn_recorded_holder()
+        holder.kill()
+        holder.wait(timeout=10)
+        # A new PID namespace handed the same PID to a postmaster started later.
+        self.pidfile.write_text(
+            "%d\n%s\n1700000010\n9712\n/var/run/postgresql\n" % (holder.pid, self.data),
+            encoding="utf-8",
+        )
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+        self.assertTrue(self.pidfile.exists())
+
+    def test_a_recorded_pidfile_is_not_removed_while_the_lock_is_held(self):
+        holder = self._spawn_recorded_holder()
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("already using the data directory", result.stderr)
+        self.assertTrue(self.pidfile.exists())
+        self.assertIsNone(holder.poll())
+
+    def test_only_a_lock_holder_records_its_postmaster(self):
+        self._write_pidfile(4242)
+
+        result = subprocess.run(
+            ["bash", "-c", self._function() + 'record_postmaster_owner "%s"\n' % self.data],
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+
+        # A skipped record says so: the operator must know the override will be needed.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Warning: not recording the postmaster", result.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+        self.assertFalse(self._owner_record().exists())
+        self.assertEqual(self._claim().returncode, 1)
+
+    def test_a_standalone_backend_is_not_recorded(self):
+        # initdb's backends inherit the lock fd but write a negative PID.
+        holder = self._spawn_holder(after_claim=(
+            "printf -- '-%%s\\n%s\\n1700000000\\n' $$ > \"%s\"\nrecord_postmaster_owner \"%s\"\n"
+            % (self.data, self.pidfile, self.data)
+        ))
+        holder.kill()
+        holder.wait(timeout=10)
+
+        self.assertFalse(self._owner_record().exists())
+        self.assertIn("Warning: not recording", (self.root / "holder.log").read_text())
+
+    def test_an_already_recorded_dead_postmaster_needs_no_warning(self):
+        # The startup poller recorded it; the post-start call finds it dead.
+        holder = self._spawn_recorded_holder()
+        holder.kill()
+        holder.wait(timeout=10)
+
+        result = subprocess.run(
+            ["bash", "-c", self._function() + 'exec 200<"%s"\nflock -n 200 || exit 9\nrecord_postmaster_owner "%s"\n' % (self.data, self.data)],
+            text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Warning", result.stderr)
+        self.assertEqual(self._claim().returncode, 0)
+
+    def test_vouching_waits_for_a_complete_pidfile(self):
+        # The entrypoint polls vouched_postmaster while the postmaster starts;
+        # an empty pidfile (created, not yet written) must not vouch or record.
+        holder = self._spawn_holder(after_claim=(
+            ": > \"%s\"\nvouched_postmaster \"%s\" && echo vouched\n"
+            "printf '%%s\\n%s\\n1700000000\\n' $$ > \"%s\"\nvouched_postmaster \"%s\"\n"
+            % (self.pidfile, self.data, self.data, self.pidfile, self.data)
+        ))
+        holder.kill()
+        holder.wait(timeout=10)
+
+        log = (self.root / "holder.log").read_text()
+        self.assertNotIn("vouched", log)
+        self.assertIn("%d 1700000000\n" % holder.pid, log)
+        self.assertFalse(self._owner_record().exists())
+
+    def test_a_postmaster_that_does_not_hold_the_lock_is_not_recorded(self):
+        # The lock holder records, but the pidfile names a process without fd 200.
+        holder = self._spawn_holder(after_claim=(
+            "printf '%%s\\n%s\\n1700000000\\n' %d > \"%s\"\nrecord_postmaster_owner \"%s\"\n"
+            % (self.data, os.getpid(), self.pidfile, self.data)
+        ))
+        holder.kill()
+        holder.wait(timeout=10)
+
+        self.assertFalse(self._owner_record().exists())
+        self.assertEqual(self._claim().returncode, 1)
+
+    def test_claiming_leaves_a_fresh_data_directory_empty(self):
+        result = self._claim()
+
+        self.assertIn("claimed", result.stdout, result.stderr)
+        self.assertEqual(
+            sorted(p.name for p in self.data.iterdir()),
+            [],
+            "claiming must not create anything start_oss_server.sh would trip on",
+        )
+
+    def test_inherited_directory_lock_is_retained(self):
+        result = self._claim(
+            prefix=f'exec 201<"{self.data}"\nflock -n 201\nexec 200<&201\n',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("claimed", result.stdout)
+
+    def test_inherited_fd_for_another_directory_does_not_bypass_the_lock(self):
+        holder = self._spawn_holder()
+        other = self.root / "other"
+        other.mkdir()
+
+        result = self._claim(prefix=f'exec 200<"{other}"\n')
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("already using the data directory", result.stderr)
+        self.assertIsNone(holder.poll())
+
+    def test_an_unopenable_data_directory_is_refused(self):
+        result = self._claim(data_dir=self.root / "missing")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("claimed", result.stdout)
+
+    def test_any_existing_pid_file_is_refused_without_the_override(self):
+        """The PID cannot be judged from inside a container: a recycled PID
+        looks alive and another namespace's postmaster looks dead. Only the
+        operator can vouch that no other container is serving the volume."""
+        for pid in (999999, os.getpid()):
+            with self.subTest(pid=pid):
+                self._write_pidfile(pid)
+
+                result = self._claim()
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+                self.assertIn(str(pid), result.stderr)
+                self.assertNotIn("claimed", result.stdout)
+                self.assertTrue(self.pidfile.exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "directory write permissions do not restrict root")
+    def test_readonly_directory_is_writable_only_after_authorized_recovery(self):
+        holder = self._spawn_holder()
+        self._write_pidfile(999999)
+        self.data.chmod(0o500)
+        try:
+            locked = self._claim(prefix=self.OVERRIDE)
+            self.assertEqual(locked.returncode, 1, locked.stdout + locked.stderr)
+            self.assertIn("already using the data directory", locked.stderr)
+            self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o500)
+            self.assertTrue(self.pidfile.exists())
+
+            holder.terminate()
+            holder.wait(timeout=10)
+            refused = self._claim()
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", refused.stderr)
+            self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o500)
+            self.assertTrue(self.pidfile.exists())
+
+            failed_repair = self._claim(
+                prefix=self.OVERRIDE + "chmod() { return 1; }\nsudo() { return 1; }\n",
+            )
+            self.assertEqual(
+                failed_repair.returncode, 1, failed_repair.stdout + failed_repair.stderr,
+            )
+            self.assertIn("writable to remove stale", failed_repair.stderr)
+            self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o500)
+            self.assertTrue(self.pidfile.exists())
+
+            recovered = self._claim(prefix=self.OVERRIDE)
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertIn("Warning: removing", recovered.stderr)
+            self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
+            self.assertFalse(self.pidfile.exists())
+        finally:
+            self.data.chmod(0o700)
+
+    def test_truncated_pid_file_is_refused(self):
+        self.pidfile.write_text("", encoding="utf-8")
+
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(self.pidfile.exists())
+
+    def test_truncated_pid_file_is_removed_by_the_override_under_errexit(self):
+        # The sudo re-exec path runs with set -euo pipefail; an unparseable
+        # identity must fall through to the override, not abort the claim.
+        self.pidfile.write_text("", encoding="utf-8")
+
+        result = self._claim(prefix="set -euo pipefail\n" + self.OVERRIDE)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("claimed", result.stdout)
+        self.assertFalse(self.pidfile.exists())
+
+    def test_truncated_pid_file_is_refused_with_guidance_under_errexit(self):
+        self.pidfile.write_text("", encoding="utf-8")
+
+        result = self._claim(prefix="set -euo pipefail\n")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", result.stderr)
+        self.assertTrue(self.pidfile.exists())
+
+    def test_missing_pid_file_is_a_noop(self):
+        result = self._claim()
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("claimed", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_the_override_never_overrides_a_held_lock(self):
+        holder = self._spawn_holder()
+        self._write_pidfile(999999)
+
+        result = self._claim(prefix=self.OVERRIDE)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("already using the data directory", result.stderr)
+        self.assertTrue(self.pidfile.exists())
+        self.assertIsNone(holder.poll(), "the running container must be unaffected")
+
+    def test_trailing_slash_data_path_still_refuses_a_pid_file(self):
+        self._write_pidfile(999999)
+
+        result = self._claim(data_dir="%s/" % self.data)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(self.pidfile.exists())
+
+    def test_unremovable_stale_lock_fails_loudly(self):
+        self._write_pidfile(999999)
+
+        result = self._claim(prefix=self.OVERRIDE + "rm() { return 1; }\n")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cannot remove stale", result.stderr)
+        self.assertNotIn("claimed", result.stdout)
+
+    def _main_steps(self, *steps):
+        """Offsets of `steps` in the entrypoint's boot sequence, checked present."""
+        boot = _boot_sequence()
+        offsets = [boot.find(step) for step in steps]
+        for step, offset in zip(steps, offsets):
+            self.assertNotEqual(offset, -1, "%s not found in the boot sequence" % step)
+        return offsets
+
+    def test_the_claim_precedes_ownership_and_permission_repair(self):
+        offsets = self._main_steps("claim_data_path", "prepare_data_path", "start_postgresql")
+        self.assertEqual(offsets, sorted(offsets), "boot steps are out of order")
+        claim = _function_body(ENTRYPOINT.read_text(encoding="utf-8"), "claim_data_path")
+        self.assertIn('claim_data_directory "$DATA_PATH"', claim)
+        postgres = _lib_text("postgres.sh")
+        self.assertIn(
+            'sudo chown -R "${DOCUMENTDB_RUNTIME_USER}:${DOCUMENTDB_RUNTIME_GROUP}" "$DATA_PATH"',
+            _function_body(postgres, "prepare_data_path"),
+        )
+        start = _function_body(postgres, "start_postgresql")
+        self.assertLess(start.index("run_start_oss_server"), start.index("wait_for_postmaster_pid"))
+        self.assertIn('"$SCRIPT_DIR/start_oss_server.sh"',
+                      _function_body(postgres, "run_start_oss_server"))
+        self.assertIn('while [ ! -f "$DATA_PATH/postmaster.pid" ]',
+                      _function_body(postgres, "wait_for_postmaster_pid"))
+        for path, text in _entrypoint_sources().items():
+            with self.subTest(file=path.name):
+                self.assertNotIn("clear_stale_postmaster_pid", text)
+                self.assertNotIn("PRESERVED_POSTMASTER_PID", text)
+                self.assertNotIn("/proc/$pid/comm", text)
+
+    def test_refusals_bypass_the_stderr_tee(self):
+        """Messages written through `exec 2> >(tee ...)` are lost when PID 1
+        exits right behind them, and a refusal is the operator's only
+        explanation of why the container stopped coming up."""
+        text = ENTRYPOINT.read_text(encoding="utf-8")
+        saved_at = text.find("exec 6>&2\n")
+        tee_at = text.find('exec > >(tee -a "$ENTRYPOINT_LOG")')
+        self.assertNotEqual(saved_at, -1, "original stderr is not saved on fd 6")
+        self.assertLess(saved_at, tee_at, "fd 6 must be saved before the tee redirect")
+        self.assertEqual(text.count('claim_data_directory "$DATA_PATH" 2>&6'), 1)
+
+    def test_the_directory_is_only_claimed_when_this_container_starts_postgresql(self):
+        main = _boot_sequence()
+        block_at = main.find('if [ "$START_POSTGRESQL" = "true" ]; then')
+        self.assertNotEqual(block_at, -1, "START_POSTGRESQL block not found")
+        claim_at = main.find("claim_data_path")
+        self.assertLess(block_at, claim_at)
+        self.assertLess(claim_at, main.index("else", block_at))
+        self.assertEqual(main.count("claim_data_path"), 1)
+        calls = sum(text.count('claim_data_directory "') for text in _entrypoint_sources().values())
+        self.assertEqual(calls, 1)
+
+    def test_the_directory_is_claimed_before_the_data_directory_is_prepared(self):
+        """documentdb_prepare_data_directory.sh can copy a baked template over
+        the volume or wipe it for a clean re-initialization, so the claim has to
+        be held before it runs. The upstream ordering test cannot cover this:
+        that script does not exist upstream, so a future reordering that moved
+        the prepare call above the claim would go uncaught."""
+        claim_at, prepare_at = self._main_steps("claim_data_path", "prepare_data_path")
+        self.assertLess(
+            claim_at,
+            prepare_at,
+            "the data directory is prepared before it is claimed: two containers "
+            "could each seed or wipe the same volume before either holds the lock",
+        )
+        self.assertIn("documentdb_prepare_data_directory.sh",
+                      _function_body(_lib_text("postgres.sh"), "prepare_data_path"))
+
+
+if __name__ == "__main__":
+    unittest.main()

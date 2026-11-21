@@ -1,0 +1,1799 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
+
+-- Tests for dynamic cursor behavior with index scans: validates that streaming
+-- cursors are used for simple ordered index scans with filters, and that
+-- eligible find commands with skip or limit use dynamic streaming cursors.
+
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documentdb_api_internal;
+
+SET documentdb.next_collection_id TO 41000;
+SET citus.next_shard_id TO 4100000;
+SET documentdb.next_collection_index_id TO 41000;
+
+SET documentdb.enableDynamicCursors TO on;
+SET documentdb.enable_dynamic_cursor_early_index_lock_release TO on;
+SET documentdb.enable_dynamic_cursor_with_skiplimit TO on;
+SET documentdb.enableIndexOnlyScanForFindProject TO on;
+SET enable_seqscan TO off;
+
+DO $$
+DECLARE
+    dynamic_cursor_nodes int;
+    lock_release_nodes int;
+    skip_limit_nodes int;
+    reloaded_nodes int;
+BEGIN
+    SELECT count(*) INTO dynamic_cursor_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM SET documentdb.enableDynamicCursors = 'on'$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO lock_release_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM SET documentdb.enable_dynamic_cursor_early_index_lock_release = 'on'$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO skip_limit_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM SET documentdb.enable_dynamic_cursor_with_skiplimit = 'on'$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO reloaded_nodes
+    FROM run_command_on_all_nodes($cmd$SELECT pg_reload_conf()$cmd$)
+    WHERE success;
+
+    IF dynamic_cursor_nodes <> 2 OR lock_release_nodes <> 2 OR
+       skip_limit_nodes <> 2 OR reloaded_nodes <> 2 THEN
+        RAISE EXCEPTION 'failed to configure all nodes';
+    END IF;
+END
+$$;
+
+-- ===========================================================================
+-- Data setup: 20 documents with a secondary index on "val" for ordered scans
+-- ===========================================================================
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_coll');
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_coll',
+    FORMAT('{ "_id": %s, "val": %s, "cat": "%s", "tag": %s }',
+           i, i * 10, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END, i % 5
+    )::documentdb_core.bson))
+FROM generate_series(1, 20) AS i;
+
+-- Create a compound index on val (ascending) for ordered index scans
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_coll", "indexes": [{"key": {"val": 1}, "name": "idx_val_asc", "enableOrderedIndex": true}]}', true);
+
+-- Create a compound index on (cat, val) for filtered ordered scans
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_coll", "indexes": [{"key": {"cat": 1, "val": 1}, "name": "idx_cat_val", "enableOrderedIndex": true}]}', true);
+
+-- Create a descending index on val
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_coll", "indexes": [{"key": {"val": -1}, "name": "idx_val_desc", "enableOrderedIndex": true}]}', true);
+
+ANALYZE;
+
+-- Move sp_coll shard to worker node 1 to force remote-unsharded code path
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_coll', 1);
+
+-- Execute first-page planning directly on the worker, then inspect the locks
+-- held by that same backend before its transaction ends. sp_coll has four
+-- indexes and the hint uses one, so early release leaves one index lock.
+SELECT bool_and(success AND result = '1') AS only_used_index_lock_held
+FROM run_command_on_workers($worker$
+    WITH feature_enabled AS MATERIALIZED (
+        SELECT set_config(
+            (SELECT name
+             FROM pg_settings
+             WHERE name LIKE '%.enable_dynamic_cursor_early_index_lock_release'),
+            'on',
+            true)
+    ),
+    first_page AS MATERIALIZED (
+        SELECT continuation
+        FROM feature_enabled,
+             LATERAL documentdb_api.find_cursor_first_page(
+                database => 'dyncur_sp_db',
+                commandSpec => '{ "find": "sp_coll", "filter": { "val": { "$gte": 10 } }, "hint": "idx_val_asc", "batchSize": 1 }',
+                cursorId => 537)
+    )
+    SELECT count(*)
+    FROM first_page,
+         pg_locks l
+         JOIN pg_index i ON i.indexrelid = l.relation
+         JOIN pg_class t ON t.oid = i.indrelid
+    WHERE l.pid = pg_backend_pid() AND
+          l.mode = 'AccessShareLock' AND
+          t.relname LIKE (
+              SELECT format('documents_%s_%%', collection_id)
+              FROM documentdb_api_catalog.collections
+              WHERE database_name = 'dyncur_sp_db' AND collection_name = 'sp_coll');
+$worker$);
+
+-- With the feature disabled in the worker transaction, all four planner index
+-- locks remain held. This proves the enabled result above reflects early
+-- release rather than a plan that acquired only the hinted index lock.
+SELECT bool_and(success AND result = '4') AS all_index_locks_held
+FROM run_command_on_workers($worker$
+    WITH feature_disabled AS MATERIALIZED (
+        SELECT set_config(
+            (SELECT name
+             FROM pg_settings
+             WHERE name LIKE '%.enable_dynamic_cursor_early_index_lock_release'),
+            'off',
+            true)
+    ),
+    first_page AS MATERIALIZED (
+        SELECT continuation
+        FROM feature_disabled,
+             LATERAL documentdb_api.find_cursor_first_page(
+                database => 'dyncur_sp_db',
+                commandSpec => '{ "find": "sp_coll", "filter": { "val": { "$gte": 10 } }, "hint": "idx_val_asc", "batchSize": 1 }',
+                cursorId => 537)
+    )
+    SELECT count(*)
+    FROM first_page,
+         pg_locks l
+         JOIN pg_index i ON i.indexrelid = l.relation
+         JOIN pg_class t ON t.oid = i.indrelid
+    WHERE l.pid = pg_backend_pid() AND
+          l.mode = 'AccessShareLock' AND
+          t.relname LIKE (
+              SELECT format('documents_%s_%%', collection_id)
+              FROM documentdb_api_catalog.collections
+              WHERE database_name = 'dyncur_sp_db' AND collection_name = 'sp_coll');
+$worker$);
+
+-- ===========================================================================
+-- Helper: drain all pages and report batch sizes + cursor type from continuation
+-- ===========================================================================
+CREATE OR REPLACE FUNCTION remote_drain_and_report(
+    p_find_spec    text,
+    p_getmore_spec text,
+    p_print_cont   bool DEFAULT false
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_page        documentdb_core.bson;
+    v_cont        documentdb_core.bson;
+    v_persist     bool;
+    v_page_num    int := 1;
+    v_batch_count bigint;
+    v_cursor_type int;
+    v_cursor_type_name text;
+    v_cursor_kind text;
+    v_tbl         text;
+    v_idx         text;
+    v_portal_name text;
+    v_is_aggregate bool;
+BEGIN
+    -- Keep this signature aligned with the mini suite's helper and infer the
+    -- command kind so co-scheduled runs replace rather than overload it.
+    v_is_aggregate := (bson_dollar_project(p_find_spec::documentdb_core.bson,
+        '{ "aggregate": 1 }') ->> 'aggregate') IS NOT NULL;
+
+    -- First page
+    IF v_is_aggregate THEN
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM aggregate_cursor_first_page(
+            database    => 'dyncur_sp_db',
+            commandSpec => p_find_spec::documentdb_core.bson,
+            cursorId    => 538
+        ) fp;
+    ELSE
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM find_cursor_first_page(
+            database    => 'dyncur_sp_db',
+            commandSpec => p_find_spec::documentdb_core.bson,
+            cursorId    => 538
+        ) fp;
+    END IF;
+
+    SELECT (bson_dollar_project(v_page,
+        '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+    INTO v_batch_count;
+
+    IF v_cont IS NOT NULL THEN
+        -- Determine cursor kind from the query-spec key:
+        --   qr + wc.dc.type = remote unsharded streaming
+        --   qr without wc.dc.type = remote unsharded file
+        --   qd = CursorKind_DynamicStreaming          (local streaming)
+        --   qc = CursorKind_Streaming                 (legacy streaming)
+        --   qp = true + qn = CursorKind_Persisted     (coordinator portal)
+        IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+            -- A streaming worker cursor carries a "wc.dc.type" scan type. A
+            -- persisted worker cursor has none: it is a file cursor when it
+            -- carries the "wc.qf" file-state binary, otherwise a held portal.
+            -- Distinguishing them keeps a held portal from being mislabeled as
+            -- a file cursor.
+            IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                v_cursor_kind := 'DynamicStreamingRemote';
+            ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                v_cursor_kind := 'DynamicFileCursorRemote';
+            ELSE
+                v_cursor_kind := 'DynamicHoldPortalRemote';
+            END IF;
+        ELSIF (bson_dollar_project(v_cont, '{ "qd": 1 }') ->> 'qd') IS NOT NULL THEN
+            v_cursor_kind := 'DynamicStreaming';
+        ELSIF (bson_dollar_project(v_cont, '{ "qc": 1 }') ->> 'qc') IS NOT NULL THEN
+            v_cursor_kind := 'Streaming';
+        ELSIF v_persist THEN
+            v_cursor_kind := 'Persisted';
+        ELSE
+            v_cursor_kind := 'Unknown';
+        END IF;
+
+        -- IF v_cursor_kind NOT IN ('DynamicStreamingRemote', 'DynamicFileCursorRemote') THEN
+        --     RAISE EXCEPTION 'Page 1: expected remote unsharded cursor, got Kind=%, Continuation=%', v_cursor_kind, v_cont;
+        -- END IF;
+
+        SELECT (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type')::int
+        INTO v_cursor_type;
+        IF v_cursor_type IS NULL THEN
+            v_cursor_type := 0;
+        END IF;
+        v_cursor_type_name := CASE
+            WHEN v_cursor_kind IN ('Persisted', 'Unknown') THEN 'N/A'
+            WHEN v_cursor_type =  0 THEN v_cursor_kind
+            WHEN v_cursor_type =  1 THEN 'QueryScanType_TidRangeScan'
+            WHEN v_cursor_type =  2 THEN 'QueryScanType_PrimaryKeyScan'
+            WHEN v_cursor_type =  3 THEN 'QueryScanType_SecondaryIndexScan'
+            WHEN v_cursor_type =  4 THEN 'QueryScanType_SecondaryIndexBitmapScan'
+            WHEN v_cursor_type =  5 THEN 'QueryScanType_SecondaryIndexBitmapAnd'
+            WHEN v_cursor_type =  6 THEN 'QueryScanType_SecondaryIndexBitmapOr'
+            WHEN v_cursor_type =  7 THEN 'QueryScanType_SecondaryIndexOnlyScan'
+            WHEN v_cursor_type = -1 THEN 'Done'
+            ELSE 'Unknown(' || v_cursor_type || ')'
+        END;
+
+        v_tbl         := bson_dollar_project(v_cont, '{ "wc.dc.tbl": 1 }') ->> 'wc.dc.tbl';
+        v_idx         := bson_dollar_project(v_cont, '{ "wc.dc.idx": 1 }') ->> 'wc.dc.idx';
+        v_portal_name := bson_dollar_project(v_cont, '{ "qn": 1 }') ->> 'qn';
+    ELSE
+        v_cursor_kind      := 'Done';
+        v_cursor_type      := -1;
+        v_cursor_type_name := 'Done';
+        v_tbl              := NULL;
+        v_idx              := NULL;
+        v_portal_name      := NULL;
+    END IF;
+
+    IF p_print_cont THEN
+        RAISE NOTICE 'Page %: batch=%, coordinator_holds_portal=%, kind=%, scan_type=%, remote_shard=%, idx=%, portal=%, continuation=%',
+            v_page_num, v_batch_count, v_persist, v_cursor_kind, v_cursor_type_name, v_tbl, v_idx, v_portal_name, v_cont;
+    ELSE
+        RAISE NOTICE 'Page %: batch=%, coordinator_holds_portal=%, kind=%, scan_type=%, remote_shard=%, idx=%, portal=%',
+            v_page_num, v_batch_count, v_persist, v_cursor_kind, v_cursor_type_name, v_tbl, v_idx, v_portal_name;
+    END IF;
+
+    -- getMore pages
+    WHILE v_cont IS NOT NULL LOOP
+        v_page_num := v_page_num + 1;
+
+        SELECT gm.cursorPage, gm.continuation
+        INTO v_page, v_cont
+        FROM cursor_get_more(
+            database         => 'dyncur_sp_db',
+            getMoreSpec      => p_getmore_spec::documentdb_core.bson,
+            continuationSpec => v_cont
+        ) gm;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch_count;
+
+        IF v_cont IS NOT NULL THEN
+            IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+                -- A streaming worker cursor carries a "wc.dc.type" scan type. A
+                -- persisted worker cursor has none: it is a file cursor when it
+                -- carries the "wc.qf" file-state binary, otherwise a held portal.
+                -- Distinguishing them keeps a held portal from being mislabeled
+                -- as a file cursor.
+                IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                    v_cursor_kind := 'DynamicStreamingRemote';
+                ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                    v_cursor_kind := 'DynamicFileCursorRemote';
+                ELSE
+                    v_cursor_kind := 'DynamicHoldPortalRemote';
+                END IF;
+            ELSIF (bson_dollar_project(v_cont, '{ "qd": 1 }') ->> 'qd') IS NOT NULL THEN
+                v_cursor_kind := 'DynamicStreaming';
+            ELSIF v_persist THEN
+                v_cursor_kind := 'Persisted';
+            ELSE
+                v_cursor_kind := 'Unknown';
+            END IF;
+
+            SELECT (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type')::int
+            INTO v_cursor_type;
+            IF v_cursor_type IS NULL THEN
+                v_cursor_type := 0;
+            END IF;
+            v_cursor_type_name := CASE
+                WHEN v_cursor_kind IN ('Persisted', 'Unknown') THEN 'N/A'
+                WHEN v_cursor_type =  0 THEN v_cursor_kind
+                WHEN v_cursor_type =  1 THEN 'QueryScanType_TidRangeScan'
+                WHEN v_cursor_type =  2 THEN 'QueryScanType_PrimaryKeyScan'
+                WHEN v_cursor_type =  3 THEN 'QueryScanType_SecondaryIndexScan'
+                WHEN v_cursor_type =  4 THEN 'QueryScanType_SecondaryIndexBitmapScan'
+                WHEN v_cursor_type =  5 THEN 'QueryScanType_SecondaryIndexBitmapAnd'
+                WHEN v_cursor_type =  6 THEN 'QueryScanType_SecondaryIndexBitmapOr'
+                WHEN v_cursor_type =  7 THEN 'QueryScanType_SecondaryIndexOnlyScan'
+                WHEN v_cursor_type = -1 THEN 'Done'
+                ELSE 'Unknown(' || v_cursor_type || ')'
+            END;
+
+            v_tbl         := bson_dollar_project(v_cont, '{ "wc.dc.tbl": 1 }') ->> 'wc.dc.tbl';
+            v_idx         := bson_dollar_project(v_cont, '{ "wc.dc.idx": 1 }') ->> 'wc.dc.idx';
+            v_portal_name := bson_dollar_project(v_cont, '{ "qn": 1 }') ->> 'qn';
+        ELSE
+            v_cursor_kind      := 'Done';
+            v_cursor_type      := -1;
+            v_cursor_type_name := 'Done';
+            v_tbl              := NULL;
+            v_idx              := NULL;
+            v_portal_name      := NULL;
+        END IF;
+
+        IF p_print_cont THEN
+            RAISE NOTICE 'Page %: batch=%, coordinator_holds_portal=%, kind=%, scan_type=%, remote_shard=%, idx=%, portal=%, continuation=%',
+                v_page_num, v_batch_count, v_persist, v_cursor_kind, v_cursor_type_name, v_tbl, v_idx, v_portal_name, v_cont;
+        ELSE
+            RAISE NOTICE 'Page %: batch=%, coordinator_holds_portal=%, kind=%, scan_type=%, remote_shard=%, idx=%, portal=%',
+                v_page_num, v_batch_count, v_persist, v_cursor_kind, v_cursor_type_name, v_tbl, v_idx, v_portal_name;
+        END IF;
+    END LOOP;
+
+    RAISE NOTICE 'Done: drained % pages', v_page_num;
+END;
+$$;
+
+-- ===========================================================================
+-- SECTION A: Cursors with sort and/or filter (no skip/limit)
+-- With enableOrderedIndex (default on in extended_rum_tests), sort queries
+-- that match the index order produce streaming cursors. Filter-only queries
+-- also produce streaming cursors.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Test A1: Simple ordered index scan with sort matching index
+-- sort: { val: 1 } with idx_val_asc → streaming (index serves sort)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test A2: Descending sort matching descending index
+-- sort: { val: -1 } with idx_val_desc → streaming (index serves sort)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": -1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test A3: Filter + sort on compound index
+-- filter: { cat: "even" }, sort: { val: 1 } on idx_cat_val
+-- 10 "even" docs, batchSize=3 should produce 4 pages (3+3+3+1)
+-- Equality filter on prefix + sort on next key → streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 3, "hint": "idx_cat_val" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test A4: Filter only, no explicit sort - dynamic streaming cursor
+-- filter: { val: { $gte: 50, $lte: 150 } }
+-- vals 50..150 by 10s => docs with val 50,60,70,80,90,100,110,120,130,140,150 (11 docs)
+-- Streaming cursor (cursor_type=3, persist_conn=f) - this is correct
+-- behavior: no sort clause, filter servable by index.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "filter": { "val": { "$gte": 50, "$lte": 150 } }, "projection": { "_id": 1, "val": 1 }, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 4 }',
+    false);
+
+-- ===========================================================================
+-- SECTION B: Cursors with skip or limit
+-- Eligible find commands with positive skip or limit stream when the ordered
+-- index satisfies the query. The continuation clears a consumed offset and
+-- tracks the remaining limit across pages.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Test B1: sort + limit - dynamic streaming cursor
+-- limit: 10 with batchSize: 3
+-- The remaining limit is tracked across pages.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test B2: sort + skip - dynamic streaming cursor
+-- skip: 5, batchSize: 3
+-- The offset is consumed once, returning 15 docs (20 - 5 skipped).
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 3, "hint": "idx_val_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test B3: sort + skip + limit - dynamic streaming cursor
+-- skip: 3, limit: 7, batchSize: 2
+-- Returns 7 docs (docs 4-10 by val order) across streaming pages.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "limit": 7, "batchSize": 2, "hint": "idx_val_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test B4: sort + skip=0 behaves the same as the streaming sort-only query
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 0, "batchSize": 5 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test B5: sort + limit >= total docs - dynamic streaming cursor
+-- limit: 100 with only 20 docs
+-- Streaming ends when the collection is exhausted before the limit.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 100, "batchSize": 5 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
+    false);
+
+-- ===========================================================================
+-- SECTION C: Filter + sort + skip/limit combinations on compound index
+-- All stream because the compound index satisfies the filter and sort.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Test C1: Filter + sort + limit on compound index
+-- filter: { cat: "odd" }, sort: { val: 1 }, limit: 5, batchSize: 2
+-- 10 "odd" docs, limited to 5 across streaming pages
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "filter": { "cat": "odd" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 5, "batchSize": 2, "hint": "idx_cat_val" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test C2: Filter + sort + skip on compound index
+-- filter: { cat: "even" }, sort: { val": 1 }, skip: 3, batchSize: 2
+-- 10 "even" docs, skip 3 => 7 docs across streaming pages
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "batchSize": 2, "hint": "idx_cat_val" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test C3: Filter + sort + skip + limit on compound index
+-- filter: { cat: "even" }, sort: { val: 1 }, skip: 2, limit: 4, batchSize: 2
+-- 10 "even" docs, skip 2, take 4 => 4 docs across streaming pages
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 2, "limit": 4, "batchSize": 2, "hint": "idx_cat_val" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    false);
+
+-- ===========================================================================
+-- SECTION D: EXPLAIN verification of plan shapes
+-- NOTE: these EXPLAINs run plain bson_aggregation_find(), which yields a Citus
+-- Adaptive distributed plan, NOT the dynamic-cursor plan. The cursor custom
+-- scan wraps at the find_cursor_first_page layer and never appears here, so the
+-- worker plan reflects the plain find: unhinted sorts materialize via Seq Scan
+-- + Sort, hinted queries use an Index Scan. The actual cursor plan can differ
+-- from what is shown here (compare the drain reports in Sections A / E / H).
+-- ===========================================================================
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO on;
+
+-- ---------------------------------------------------------------------------
+-- Test D1: EXPLAIN for an unhinted sort find (no skip/limit)
+-- Plain find with no hint: the worker plan is a Seq Scan + Sort (no index hint
+-- -> bson_dollar_fullscan). The dynamic-cursor custom scan does not appear here
+-- (see the section note); the same query drains as an ordered streaming
+-- index-scan cursor in Sections A / E.
+-- ---------------------------------------------------------------------------
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5 }');
+$cmd$);
+
+-- ---------------------------------------------------------------------------
+-- Test D2: EXPLAIN for cursor with limit
+-- The plain worker plan contains a Limit node. The cursor path authorizes that
+-- node for dynamic streaming when skip/limit streaming is enabled.
+-- ---------------------------------------------------------------------------
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 5 }');
+$cmd$);
+
+-- ---------------------------------------------------------------------------
+-- Test D3: EXPLAIN for cursor with skip
+-- The skip should cause the planner to produce an Offset node
+-- ---------------------------------------------------------------------------
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 5 }');
+$cmd$);
+
+-- ---------------------------------------------------------------------------
+-- Test D4: EXPLAIN for cursor with skip + limit
+-- ---------------------------------------------------------------------------
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "limit": 7, "batchSize": 5 }');
+$cmd$);
+
+-- ---------------------------------------------------------------------------
+-- Test D5: EXPLAIN for filtered streaming cursor (no skip/limit)
+-- filter on compound index should still allow streaming
+-- ---------------------------------------------------------------------------
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 3, "hint": "idx_cat_val" }');
+$cmd$);
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO off;
+
+-- ===========================================================================
+-- SECTION E: Data correctness verification
+-- Validates that the actual documents returned are correct, not just counts
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Test E1: Streaming cursor returns correct ordered results
+-- sort: { val: 1 }, no skip/limit - verify first batch contains docs with
+-- lowest val values in ascending order
+-- ---------------------------------------------------------------------------
+CREATE TEMP TABLE sp_first_page_response AS
+SELECT bson_dollar_project(cursorpage, '{ "cursor.firstBatch._id": 1, "cursor.firstBatch.val": 1, "cursor.id": 1 }') as cp,
+       continuation, persistconnection, cursorid
+FROM find_cursor_first_page(database => 'dyncur_sp_db',
+    commandSpec => '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5 }',
+    cursorId => 538);
+
+SELECT cp, persistconnection FROM sp_first_page_response;
+
+SELECT continuation AS r1_continuation FROM sp_first_page_response \gset
+
+-- getMore should return next 5 docs
+SELECT bson_dollar_project(cursorpage, '{ "cursor.nextBatch._id": 1, "cursor.nextBatch.val": 1, "cursor.id": 1 }'),
+       continuation IS NOT NULL as has_more
+FROM cursor_get_more(database => 'dyncur_sp_db',
+    getMoreSpec => '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
+    continuationSpec => :'r1_continuation');
+
+DROP TABLE sp_first_page_response;
+
+-- ---------------------------------------------------------------------------
+-- Test E2: Streaming cursor with skip returns correct offset results
+-- skip: 5, sort: { val: 1 } - first batch should start from val=60 (6th doc)
+-- ---------------------------------------------------------------------------
+CREATE TEMP TABLE sp_skip_response AS
+SELECT bson_dollar_project(cursorpage, '{ "cursor.firstBatch._id": 1, "cursor.firstBatch.val": 1, "cursor.id": 1 }') as cp,
+       continuation, persistconnection, cursorid
+FROM find_cursor_first_page(database => 'dyncur_sp_db',
+    commandSpec => '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 3 }',
+    cursorId => 538);
+
+-- persistconnection is false because the remote worker returns a dynamic
+-- streaming continuation rather than holding a connection.
+SELECT cp, persistconnection FROM sp_skip_response;
+
+DROP TABLE sp_skip_response;
+
+-- ---------------------------------------------------------------------------
+-- Test E3: Streaming cursor with limit returns correct count
+-- limit: 7, sort: { val: 1 }, batchSize: 3
+-- Should return exactly 7 docs total across all batches
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 7, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    false);
+
+-- ===========================================================================
+-- SECTION F: Streaming sort with dynamic cursors — sort-index matching
+--
+-- This section tests whether the dynamic cursor planner correctly identifies
+-- when a sort can be fully served by an index (→ streaming) vs when it cannot
+-- (→ persistent). Indexes are created with enableOrderedIndex: true which is
+-- required for ordered index scans.
+--
+-- ┌─────┬──────────────────────────────────────────────────────────┬───────────┬───────────┐
+-- │ Test│ Scenario                                                 │ Expected  │ Correct?  │
+-- ├─────┼──────────────────────────────────────────────────────────┼───────────┼───────────┤
+-- │ F1  │ sort {a:1} on idx {a:1,b:1,c:1} (prefix, 1<3 keys)     │ streaming │ see below │
+-- │ F2  │ sort {a:1,b:1} on idx {a:1,b:1,c:1} (prefix, 2<3)      │ streaming │ see below │
+-- │ F3  │ sort {a:1,b:1,c:1} on idx {a:1,b:1,c:1} (exact, 3==3)  │ streaming │ see below │
+-- │ F4  │ sort {a:1,b:1,c:1,d:1} on idx (extra key, 4>3)         │ persistent│ see below │
+-- │ F5  │ sort {x:1} on idx {a:1,b:1,c:1} (no match)             │ persistent│ see below │
+-- │ F6  │ sort {b:1} on idx {a:1,b:1,c:1} (non-prefix)           │ persistent│ see below │
+-- │ F7  │ filter {a $in [1,2,3]} + sort {b:1} (not servable)      │ persistent│ see below │
+-- │ F8  │ filter {a:1} + sort {b:1} (equality+next key, servable) │ streaming │ see below │
+-- │ F9  │ filter {a >= 1} + sort {b:1} (range+next key)           │ persistent│ see below │
+-- │ F10 │ filter only {a:1, b > 0} no sort (streaming baseline)   │ streaming │ see below │
+-- │ F11 │ sort {a:1} only, no filter (just sort, ordered index)   │ streaming │ see below │
+-- │ F12 │ sort {a:1,b:1,c:1} only, no filter (full match)        │ streaming │ see below │
+-- │ F13 │ sort {a:-1} on idx {a:1,b:1,c:1} (backward prefix)     │ streaming │ see below │
+-- │ F14 │ sort {a:1,b:-1} on idx {a:1,b:1,c:1} (direction mismatch)│persistent│ see below │
+-- │ F15 │ sort {a:1} on single-key idx {a:1} (exact single)       │ streaming │ see below │
+-- └─────┴──────────────────────────────────────────────────────────┴───────────┴───────────┘
+-- ===========================================================================
+
+-- New collection with richer fields for sort/index matching tests
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_sort_coll');
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_sort_coll',
+    FORMAT('{ "_id": %s, "a": %s, "b": %s, "c": %s, "d": %s, "x": %s }',
+           i, i % 4, i % 5, i % 3, i * 2, i % 7
+    )::documentdb_core.bson))
+FROM generate_series(1, 30) AS i;
+
+-- Compound index on (a, b, c) - 3 paths (enableOrderedIndex is default on in extended_rum)
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_sort_coll", "indexes": [{"key": {"a": 1, "b": 1, "c": 1}, "name": "idx_abc", "enableOrderedIndex": true}]}', true);
+
+-- Single-key index on (a)
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_sort_coll", "indexes": [{"key": {"a": 1}, "name": "idx_a_only", "enableOrderedIndex": true}]}', true);
+
+ANALYZE;
+
+-- Move sp_sort_coll shard to worker node 1 to force remote-unsharded code path
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_sort_coll', 1);
+
+-- ---------------------------------------------------------------------------
+-- Test F1: sortKeys < numPathsOfIndex (1 sort key, 3-path index)
+-- sort: { a: 1 }, hint: idx_abc
+-- Prefix sort matches index prefix → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F2: sortKeys < numPathsOfIndex (2 sort keys, 3-path index)
+-- sort: { a: 1, b: 1 }, hint: idx_abc
+-- Prefix sort matches index prefix → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F3: sortKeys == numPathsOfIndex (3 sort keys, 3-path index)
+-- sort: { a: 1, b: 1, c: 1 }, hint: idx_abc
+-- Full sort matches index exactly → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": 1, "c": 1 }, "projection": { "_id": 1, "a": 1, "b": 1, "c": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F4: sortKeys > numPathsOnIndex (4 sort keys, 3-path index)
+-- sort: { a: 1, b: 1, c: 1, d: 1 }, hint: idx_abc
+-- Extra sort key "d" not in index → persistent is correct (index cannot
+-- fully satisfy the sort order)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": 1, "c": 1, "d": 1 }, "projection": { "_id": 1, "a": 1, "b": 1, "c": 1, "d": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F5: sortKeys has paths that don't match index at all
+-- sort: { x: 1 }, hint: idx_abc
+-- Sort on "x" which is not in the index → persistent is correct
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "x": 1 }, "projection": { "_id": 1, "x": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F6: sortKeys partial match but not prefix
+-- sort: { b: 1 }, hint: idx_abc
+-- "b" is in the index but is not the first key → persistent is correct
+-- (non-prefix sort cannot use index ordering)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "b": 1 }, "projection": { "_id": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F7: filter + sort not servable by index
+-- filter: { a: { $in: [1, 2, 3] } }, sort: { b: 1 }, hint: idx_abc
+-- The $in on "a" produces multiple ranges; sorting by "b" across those
+-- ranges cannot be served by the index alone → persistent is correct
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "filter": { "a": { "$in": [1, 2, 3] } }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F8: filter equality on prefix + sort on next key (servable)
+-- filter: { a: 1 }, sort: { b: 1 }, hint: idx_abc
+-- Equality on "a" + sort on "b" is fully servable by idx_abc → should stream
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "filter": { "a": 1 }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F9: filter range on prefix + sort on next key (not fully servable)
+-- filter: { a: { $gte: 1 } }, sort: { b: 1 }, hint: idx_abc
+-- Range on "a" means multiple "a" values; sorting by "b" across them
+-- cannot use index order → persistent is correct
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "filter": { "a": { "$gte": 1 } }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F10: filter only (no sort) on compound index prefix → streaming
+-- filter: { a: 1, b: { $gt: 0 } }, hint: idx_abc
+-- No sort, filter fully servable by index → streaming is correct
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "filter": { "a": 1, "b": { "$gt": 0 } }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F11: sort only, no filter - single prefix key on ordered compound index
+-- sort: { a: 1 }, NO filter, hint: idx_abc
+-- Pure sort with no filter on an ordered index → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F12: sort only, no filter - full match on all index keys
+-- sort: { a: 1, b: 1, c: 1 }, NO filter, hint: idx_abc
+-- Pure sort matching all index paths → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": 1, "c": 1 }, "projection": { "_id": 1, "a": 1, "b": 1, "c": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F13: backward scan - descending sort on ascending index prefix
+-- sort: { a: -1 }, hint: idx_abc
+-- RUM indexes support backward scan for descending sort on ascending index
+-- → should be streaming (backward index scan)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": -1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F14: mixed sort directions that don't match index
+-- sort: { a: 1, b: -1 }, hint: idx_abc (index is {a:1, b:1, c:1})
+-- Direction mismatch on "b" (sort DESC, index ASC) → persistent is correct
+-- (cannot serve mixed direction unless index matches exactly or fully reversed)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test F15: sort on single-key index (exact match, 1 == 1 path)
+-- sort: { a: 1 }, hint: idx_a_only
+-- Single-key ordered index, sort matches exactly → should be streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_a_only" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_sort_coll", "batchSize": 5 }',
+    false);
+
+-- ===========================================================================
+-- SECTION F RESULTS SUMMARY
+-- ===========================================================================
+-- Index: idx_abc = {a:1, b:1, c:1}, idx_a_only = {a:1}
+-- enableOrderedIndex is default on in extended_rum_tests
+--
+-- | Test | Sort          | Filter       | Index    | Expected    | Actual      | Correct? |
+-- |------|---------------|--------------|----------|-------------|-------------|----------|
+-- | F1   | {a:1}         | -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F2   | {a:1,b:1}    | -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F3   | {a:1,b:1,c:1}| -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F4   | {a:1,b:1,c:1,d:1}| -        | idx_abc  | persistent  | persistent  | YES      |
+-- | F5   | {x:1}        | -            | idx_abc  | persistent  | persistent  | YES      |
+-- | F6   | {b:1}        | -            | idx_abc  | persistent  | persistent  | YES      |
+-- | F7   | {b:1}        | a $in [1,2,3]| idx_abc  | persistent  | persistent  | YES      |
+-- | F8   | {b:1}        | a = 1        | idx_abc  | streaming   | streaming   | YES      |
+-- | F9   | {b:1}        | a >= 1       | idx_abc  | persistent  | persistent  | YES      |
+-- | F10  | -            | a=1,b>0      | idx_abc  | streaming   | streaming   | YES      |
+-- | F11  | {a:1}        | -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F12  | {a:1,b:1,c:1}| -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F13  | {a:-1}       | -            | idx_abc  | streaming   | streaming   | YES      |
+-- | F14  | {a:1,b:-1}   | -            | idx_abc  | persistent  | persistent  | YES      |
+-- | F15  | {a:1}        | -            | idx_a_only| streaming  | streaming   | YES      |
+--
+-- All sort-index streaming scenarios are working correctly with ordered indexes.
+-- Key contract verified:
+--   - Prefix sort ≤ index keys → streaming
+--   - Sort > index keys or non-matching → persistent
+--   - Backward scan (reversed direction on all keys) → streaming
+--   - Mixed directions (partial reversal) → persistent
+--   - Equality filter + next-key sort → streaming
+--   - Range/$in filter + non-prefix sort → persistent
+-- ===========================================================================
+
+-- ===========================================================================
+-- SECTION F EXPLAIN: Plan shapes for sort-index matching scenarios
+-- ===========================================================================
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO on;
+
+-- Test F1 EXPLAIN: partial prefix sort (1 of 3 keys)
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F4 EXPLAIN: sort keys > index paths — verify a Sort node wraps the scan
+-- (PG16+ uses Incremental Sort; PG15 uses full Sort — just check top node)
+-- Also verify no DocumentDBApiCursorScan (persistent cursor, not streaming)
+SELECT
+    (array_agg(run_explain_and_trim))[1] LIKE '%Sort%' AS has_sort_node,
+    count(*) FILTER (WHERE run_explain_and_trim LIKE '%DocumentDBApiCursorScan%') = 0 AS no_cursor_scan
+FROM documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "sort": { "a": 1, "b": 1, "c": 1, "d": 1 }, "projection": { "_id": 1, "a": 1, "b": 1, "c": 1, "d": 1 }, "batchSize": 5, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F7 EXPLAIN: $in filter + non-prefix sort
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "filter": { "a": { "$in": [1, 2, 3] } }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 5, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F8 EXPLAIN: equality filter + next-key sort (servable)
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "filter": { "a": 1 }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F11 EXPLAIN: sort only, no filter (pure ordered scan)
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F13 EXPLAIN: backward scan (descending sort on ascending index)
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "sort": { "a": -1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_abc" }');
+$cmd$);
+
+-- Test F15 EXPLAIN: sort on single-key index
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_sort_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 5, "hint": "idx_a_only" }');
+$cmd$);
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO off;
+
+-- ===========================================================================
+-- SECTION G: Sort correctness — validate documents returned in correct order
+-- Tests use a dedicated collection with controlled data to verify ordering
+-- across batches for streaming cursors with various index/sort combinations.
+-- ===========================================================================
+
+-- Create collection with predictable data for sort validation
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_order_coll');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 1, "a": 3, "b": 2, "c": 10 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 2, "a": 1, "b": 5, "c": 30 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 3, "a": 2, "b": 1, "c": 20 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 4, "a": 1, "b": 3, "c": 50 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 5, "a": 3, "b": 4, "c": 40 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 6, "a": 2, "b": 2, "c": 60 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 7, "a": 1, "b": 1, "c": 70 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 8, "a": 3, "b": 3, "c": 80 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 9, "a": 2, "b": 5, "c": 90 }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_order_coll', '{ "_id": 10, "a": 1, "b": 4, "c": 100 }');
+
+-- Ascending single-key index
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_order_coll", "indexes": [{"key": {"a": 1}, "name": "idx_order_a_asc","enableOrderedIndex": true}]}', true);
+
+-- Descending single-key index
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_order_coll", "indexes": [{"key": {"a": -1}, "name": "idx_order_a_desc","enableOrderedIndex": true}]}', true);
+
+-- Composite ascending index
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_order_coll", "indexes": [{"key": {"a": 1, "b": 1}, "name": "idx_order_ab_asc", "enableOrderedIndex": true}]}', true);
+
+-- Mixed direction composite index
+SELECT documentdb_api_internal.create_indexes_non_concurrently('dyncur_sp_db',
+    '{"createIndexes": "sp_order_coll", "indexes": [{"key": {"a": 1, "b": -1}, "name": "idx_order_a_asc_b_desc", "enableOrderedIndex": true}]}', true);
+
+ANALYZE;
+
+-- Move sp_order_coll shard to worker node 1 to force remote-unsharded code path
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_order_coll', 1);
+
+-- Helper: drain cursor and return projected docs from all pages in order
+CREATE OR REPLACE FUNCTION sp_drain_ordered(
+    p_find text, p_getmore text, p_batch_size int
+) RETURNS TABLE(page_num int, docs documentdb_core.bson) AS $$
+DECLARE
+    v_page documentdb_core.bson;
+    v_cont documentdb_core.bson;
+    v_persist bool;
+    v_cid bigint;
+    v_page_num int := 0;
+    v_cursor_type int;
+BEGIN
+    SELECT fp.cursorPage, fp.continuation, fp.persistconnection, fp.cursorid
+    INTO v_page, v_cont, v_persist, v_cid
+    FROM find_cursor_first_page(database => 'dyncur_sp_db',
+        commandSpec => p_find::documentdb_core.bson, cursorId => 538) fp;
+
+    -- For remote-unsharded cursors, persistconn is always false; skip this check.
+    IF v_persist THEN
+        RAISE EXCEPTION 'Expected streaming cursor (persistconnection=false) on first page, got persistent';
+    END IF;
+
+    v_page_num := 1;
+    page_num := v_page_num;
+    docs := bson_dollar_project(v_page, '{ "cursor.firstBatch._id": 1, "cursor.firstBatch.a": 1, "cursor.firstBatch.b": 1 }');
+    RETURN NEXT;
+
+    WHILE v_cont IS NOT NULL LOOP
+        -- Verify continuation has wc.dc.type set (streaming indicator).
+        -- For remote-unsharded cursors the worker continuation is stored verbatim under 'wc':
+        -- streaming carries wc.dc.type/tbl/idx; a file cursor carries wc.qf (no wc.dc.type).
+        SELECT (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type')::int
+            INTO v_cursor_type;
+        IF v_cursor_type IS NULL THEN
+            -- A remote file cursor (wc.qf, no wc.dc.type) is a test failure: these tests require streaming.
+            RAISE EXCEPTION 'Expected streaming continuation (wc.dc.type set) on page %, got file/persistent cursor (wc.dc.type is NULL)', v_page_num + 1;
+        END IF;
+        IF v_cursor_type NOT IN (3, 7) THEN
+            RAISE EXCEPTION 'Expected cursor_type 3 (SecondaryIndexScan) or 7 (SecondaryIndexOnlyScan) on page %, got %', v_page_num + 1, v_cursor_type;
+        END IF;
+
+        SELECT gm.cursorPage, gm.continuation
+        INTO v_page, v_cont
+        FROM cursor_get_more(database => 'dyncur_sp_db',
+            getMoreSpec => p_getmore::documentdb_core.bson,
+            continuationSpec => v_cont) gm;
+
+        v_page_num := v_page_num + 1;
+        page_num := v_page_num;
+        docs := bson_dollar_project(v_page, '{ "cursor.nextBatch._id": 1, "cursor.nextBatch.a": 1, "cursor.nextBatch.b": 1 }');
+        RETURN NEXT;
+
+        IF v_cont IS NULL THEN
+            EXIT;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO on;
+
+-- ---------------------------------------------------------------------------
+-- Test G1: Ascending sort on single-key ASC index (no filter)
+-- sort: { a: 1 }, hint: idx_order_a_asc
+-- Expected order: a=1 (ids 2,4,7,10), a=2 (ids 3,6,9), a=3 (ids 1,5,8)
+-- Within same "a" value, order is by _id (secondary sort from index)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G2: Descending sort on single-key DESC index (no filter)
+-- sort: { a: -1 }, hint: idx_order_a_desc
+-- Expected order: a=3 (ids 1,5,8), a=2 (ids 3,6,9), a=1 (ids 2,4,7,10)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G3: Descending sort on single-key ASC index (backward scan, no filter)
+-- sort: { a: -1 }, hint: idx_order_a_asc
+-- Should produce same ordering as G2 (backward scan on ascending index)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G4: Composite ascending sort on composite ASC index (no filter)
+-- sort: { a: 1, b: 1 }, hint: idx_order_ab_asc
+-- Expected: (a=1,b=1,id=7), (a=1,b=3,id=4), (a=1,b=4,id=10), (a=1,b=5,id=2),
+--           (a=2,b=1,id=3), (a=2,b=2,id=6), (a=2,b=5,id=9),
+--           (a=3,b=2,id=1), (a=3,b=3,id=8), (a=3,b=4,id=5)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": 1, "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G5: Mixed direction sort on mixed direction index (no filter)
+-- sort: { a: 1, b: -1 }, hint: idx_order_a_asc_b_desc
+-- Expected: (a=1,b=5,id=2), (a=1,b=4,id=10), (a=1,b=3,id=4), (a=1,b=1,id=7),
+--           (a=2,b=5,id=9), (a=2,b=2,id=6), (a=2,b=1,id=3),
+--           (a=3,b=4,id=5), (a=3,b=3,id=8), (a=3,b=2,id=1)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": 1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G6: Single-key ascending sort WITH filter (no filter on sort key)
+-- filter: { a: { $lte: 2 } }, sort: { a: 1 }, hint: idx_order_a_asc
+-- Expected: a=1 docs (ids 2,4,7,10), then a=2 docs (ids 3,6,9) = 7 docs total
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": { "$lte": 2 } }, "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1 }, "batchSize": 3, "hint": "idx_order_a_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G7: Composite sort with equality filter on prefix
+-- filter: { a: 2 }, sort: { b: 1 }, hint: idx_order_ab_asc
+-- Only a=2 docs: (b=1,id=3), (b=2,id=6), (b=5,id=9) = 3 docs in b-order
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": 2 }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+-- ---------------------------------------------------------------------------
+-- Test G8: Mixed direction index with equality filter + desc sort
+-- filter: { a: 3 }, sort: { b: -1 }, hint: idx_order_a_asc_b_desc
+-- Only a=3 docs: (b=4,id=5), (b=3,id=8), (b=2,id=1) = 3 docs in b-desc order
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": 3 }, "sort": { "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+-- ---------------------------------------------------------------------------
+-- Test G9: Full backward scan on composite ascending index (reverse all dirs)
+-- sort: { a: -1, b: -1 }, hint: idx_order_ab_asc
+-- Expected: (a=3,b=4,id=5), (a=3,b=3,id=8), (a=3,b=2,id=1),
+--           (a=2,b=5,id=9), (a=2,b=2,id=6), (a=2,b=1,id=3),
+--           (a=1,b=5,id=2), (a=1,b=4,id=10), (a=1,b=3,id=4), (a=1,b=1,id=7)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": -1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 4, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 4 }',
+    4);
+
+-- ---------------------------------------------------------------------------
+-- Test G10: Verify all 10 documents are returned (count check)
+-- sort: { a: 1, b: 1 }, hint: idx_order_ab_asc, batchSize: 2
+-- Must return exactly 10 docs across multiple batches
+-- ---------------------------------------------------------------------------
+SELECT COUNT(*) AS total_pages FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": 1, "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+-- ---------------------------------------------------------------------------
+-- Test G11: Verify filtered count - filter: { a: 1 }, sort: { b: -1 }
+-- idx_order_a_asc_b_desc, 4 docs where a=1, batchSize: 2
+-- ---------------------------------------------------------------------------
+SELECT COUNT(*) AS total_pages FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": 1 }, "sort": { "b": -1 }, "projection": { "_id": 1 }, "batchSize": 2, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+-- ---------------------------------------------------------------------------
+-- Test G12: Backward scan correctness — reversed mixed-direction index
+-- sort: { a: -1, b: 1 }, hint: idx_order_a_asc_b_desc (index is {a:1,b:-1})
+-- Full reverse of all index directions → backward scan → streaming
+-- Expected: (a=3,b=2,id=1), (a=3,b=3,id=8), (a=3,b=4,id=5),
+--           (a=2,b=1,id=3), (a=2,b=2,id=6), (a=2,b=5,id=9),
+--           (a=1,b=1,id=7), (a=1,b=3,id=4), (a=1,b=4,id=10), (a=1,b=5,id=2)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": -1, "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G13: Backward scan correctness — ascending sort on descending index
+-- sort: { a: 1 }, hint: idx_order_a_desc (index is {a:-1})
+-- Ascending sort on descending index → backward scan → streaming
+-- Expected: a=1 (ids 2,4,7,10), a=2 (ids 3,6,9), a=3 (ids 1,5,8)
+-- Same order as G1 (ascending sort on ascending index)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G14: Backward scan correctness — compound ASC index with filter
+-- filter: { a: { $lte: 2 } }, sort: { a: -1, b: -1 }, hint: idx_order_ab_asc
+-- Full reverse of {a:1,b:1} with range filter → backward scan → streaming
+-- Expected: (a=2,b=5,id=9), (a=2,b=2,id=6), (a=2,b=1,id=3),
+--           (a=1,b=5,id=2), (a=1,b=4,id=10), (a=1,b=3,id=4), (a=1,b=1,id=7)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": { "$lte": 2 } }, "sort": { "a": -1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    3);
+
+-- ---------------------------------------------------------------------------
+-- Test G15: Backward scan correctness — equality filter + reversed next-key
+-- filter: { a: 2 }, sort: { b: -1 }, hint: idx_order_ab_asc
+-- Equality on prefix + descending sort on next key (reverse of {b:1})
+-- → backward scan within equality range → streaming
+-- Expected: (a=2,b=5,id=9), (a=2,b=2,id=6), (a=2,b=1,id=3)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": 2 }, "sort": { "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+-- ---------------------------------------------------------------------------
+-- Test G16: Backward scan correctness — equality filter + reversed next-key
+--           on mixed-direction index
+-- filter: { a: 1 }, sort: { b: 1 }, hint: idx_order_a_asc_b_desc (idx {a:1,b:-1})
+-- Equality on prefix + ascending sort on b (reverse of {b:-1})
+-- → backward scan within equality range → streaming
+-- Expected: (a=1,b=1,id=7), (a=1,b=3,id=4), (a=1,b=4,id=10), (a=1,b=5,id=2)
+-- ---------------------------------------------------------------------------
+SELECT * FROM sp_drain_ordered(
+    '{ "find": "sp_order_coll", "filter": { "a": 1 }, "sort": { "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    2);
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO off;
+
+-- ===========================================================================
+-- SECTION H: Primary key dynamic cursors with sort
+-- Tests verify dynamic cursor behavior when using primary key scans with sort.
+-- Primary key scans use the built-in _id index. With sort on _id, the scan
+-- should be streamable (cursor_type=2, PrimaryKeyScan). Currently primary key
+-- scans with sort produce persistent cursors — these are marked as UNEXPECTED.
+-- Also includes backward scan tests for secondary index scans.
+--
+-- cursor_type values: 2 = PrimaryKeyScan, 3 = SecondaryIndexScan,
+--                     7 = SecondaryIndexOnlyScan, NULL = persistent
+-- ===========================================================================
+
+-- Create a collection with sequential _id values for primary key scan tests
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_pk_coll');
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_pk_coll',
+    FORMAT('{ "_id": %s, "val": %s }', i, i * 10)::documentdb_core.bson))
+FROM generate_series(1, 20) AS i;
+
+ANALYZE;
+
+-- Move sp_pk_coll shard to worker node 1 to force remote-unsharded code path
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_pk_coll', 1);
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO on;
+
+-- ---------------------------------------------------------------------------
+-- Test H1: Primary key scan with ascending _id sort (no filter)
+-- sort: { _id: 1 }, hint: _id_
+-- EXPECTED: streaming (cursor_type=2, persist_conn=f) — OK
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H2: Primary key scan with descending _id sort (backward scan)
+-- sort: { _id: -1 }, hint: _id_
+-- EXPECTED: streaming (cursor_type=2, persist_conn=f) — OK
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "sort": { "_id": -1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H3: Primary key scan with filter + ascending _id sort
+-- filter: { _id: { $gte: 5 } }, sort: { _id: 1 }
+-- EXPECTED: streaming (cursor_type=2, persist_conn=f) — OK
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "filter": { "_id": { "$gte": 5 } }, "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H4: Primary key scan with filter + descending _id sort (backward)
+-- filter: { _id: { $lte: 15 } }, sort: { _id: -1 }
+-- EXPECTED: streaming (cursor_type=2, persist_conn=f) — OK
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "filter": { "_id": { "$lte": 15 } }, "sort": { "_id": -1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H5: Primary key scan, filter only (no sort) — baseline streaming
+-- filter: { _id: { $gte: 10, $lte: 18 } }
+-- EXPECTED: streaming (cursor_type=2, persist_conn=f)
+-- This should already work since filter-only primary key scans are streamable.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "filter": { "_id": { "$gte": 10, "$lte": 18 } }, "projection": { "_id": 1, "val": 1 }, "batchSize": 3, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H6: Primary key scan with skip + ascending sort -> streaming
+-- sort: { _id: 1 }, skip: 5
+-- The primary key ordering supports dynamic skip streaming.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H7: Primary key scan with limit + ascending sort -> streaming
+-- sort: { _id: 1 }, limit: 10
+-- The primary key ordering supports dynamic limit streaming.
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 5, "hint": "_id_" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- SECTION H EXPLAIN: Plan shapes for primary key scans with sort
+-- ---------------------------------------------------------------------------
+
+-- Test H1 EXPLAIN: ascending _id sort
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }');
+$cmd$);
+
+-- Test H2 EXPLAIN: descending _id sort (backward scan)
+SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
+    '{ "find": "sp_pk_coll", "sort": { "_id": -1 }, "projection": { "_id": 1, "val": 1 }, "batchSize": 5, "hint": "_id_" }');
+$cmd$);
+
+-- ===========================================================================
+-- SECTION H2: Backward scan tests for secondary index scans
+-- Validates that backward scans on secondary indexes (reversed sort direction
+-- on all index keys) produce streaming cursors.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Test H8: Backward scan on compound ASC index with full reverse sort
+-- sort: { a: -1, b: -1 }, hint: idx_order_ab_asc (from Section G)
+-- Full reverse of {a:1, b:1} → streaming backward index scan
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_order_coll", "sort": { "a": -1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H9: Backward scan on mixed direction index with full reverse sort
+-- sort: { a: -1, b: 1 }, hint: idx_order_a_asc_b_desc (from Section G)
+-- Full reverse of {a:1, b:-1} → streaming backward index scan
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_order_coll", "sort": { "a": -1, "b": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_asc_b_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H10: Backward scan on DESC index with ascending sort
+-- sort: { a: 1 }, hint: idx_order_a_desc (from Section G)
+-- Ascending sort on descending index → backward scan → streaming
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_order_coll", "sort": { "a": 1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_a_desc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H11: Backward scan with filter on compound ASC index
+-- filter: { a: { $lte: 2 } }, sort: { a: -1, b: -1 }, hint: idx_order_ab_asc
+-- Full reverse of {a:1, b:1} with filter → streaming backward scan
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_order_coll", "filter": { "a": { "$lte": 2 } }, "sort": { "a": -1, "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 3, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 3 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- Test H12: Backward scan with equality filter + reversed next-key sort
+-- filter: { a: 2 }, sort: { b: -1 }, hint: idx_order_ab_asc
+-- Equality on prefix + descending sort on next key (reverse of {b:1})
+-- → should be streaming (backward scan within equality range)
+-- ---------------------------------------------------------------------------
+SELECT * FROM remote_drain_and_report(
+    '{ "find": "sp_order_coll", "filter": { "a": 2 }, "sort": { "b": -1 }, "projection": { "_id": 1, "a": 1, "b": 1 }, "batchSize": 2, "hint": "idx_order_ab_asc" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_order_coll", "batchSize": 2 }',
+    false);
+
+-- ---------------------------------------------------------------------------
+-- SECTION H RESULTS SUMMARY
+-- ===========================================================================
+-- | Test | Sort          | Filter       | Index/Scan   | Expected    | Status    |
+-- |------|---------------|--------------|--------------|-------------|-----------|
+-- | H1   | {_id:1}       | -            | primary key  | streaming   | OK        |
+-- | H2   | {_id:-1}      | -            | primary key  | streaming   | OK        |
+-- | H3   | {_id:1}       | _id >= 5     | primary key  | streaming   | OK        |
+-- | H4   | {_id:-1}      | _id <= 15    | primary key  | streaming   | OK        |
+-- | H5   | -             | _id range    | primary key  | streaming   | OK        |
+-- | H6   | {_id:1}       | - (skip:5)   | primary key  | streaming   | OK        |
+-- | H7   | {_id:1}       | - (limit:10) | primary key  | streaming   | OK        |
+-- | H8   | {a:-1,b:-1}   | -            | idx_ab_asc   | streaming   | OK        |
+-- | H9   | {a:-1,b:1}    | -            | idx_a1_b-1   | streaming   | OK        |
+-- | H10  | {a:1}         | -            | idx_a_desc   | streaming   | OK        |
+-- | H11  | {a:-1,b:-1}   | a <= 2       | idx_ab_asc   | streaming   | OK        |
+-- | H12  | {b:-1}        | a = 2        | idx_ab_asc   | streaming   | OK        |
+-- ===========================================================================
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO on;
+
+-- ===========================================================================
+-- SECTION I: Aggregation stages with Citus remote-unsharded execution
+-- These stages introduce joins, append branches, and recursive traversal into
+-- the worker plan. They are not dynamically streamable, so they must fall back
+-- to remote file cursors and must not enter the early lock-release path.
+-- ===========================================================================
+
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_lookup_coll');
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_union_coll');
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_graph_start');
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_graph_nodes');
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_lookup_coll',
+    FORMAT('{ "_id": %s, "tag": %s, "label": "tag-%s" }', i, i, i)::documentdb_core.bson))
+FROM generate_series(0, 4) AS i;
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_union_coll',
+    FORMAT('{ "_id": %s, "source": "union" }', i)::documentdb_core.bson))
+FROM generate_series(101, 104) AS i;
+
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_start',
+    '{ "_id": 1, "start": "A" }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_start',
+    '{ "_id": 2, "start": "B" }');
+
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_nodes',
+    '{ "_id": 1, "node": "A", "next": [ "B", "C" ] }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_nodes',
+    '{ "_id": 2, "node": "B", "next": [ "D" ] }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_nodes',
+    '{ "_id": 3, "node": "C", "next": [ "D" ] }');
+SELECT documentdb_api.insert_one('dyncur_sp_db', 'sp_graph_nodes',
+    '{ "_id": 4, "node": "D", "next": [] }');
+
+ANALYZE;
+
+CALL documentdb_distributed_test_helpers.place_collection_on_node(
+    'dyncur_sp_db', 'sp_lookup_coll', 1);
+CALL documentdb_distributed_test_helpers.place_collection_on_node(
+    'dyncur_sp_db', 'sp_union_coll', 1);
+CALL documentdb_distributed_test_helpers.place_collection_on_node(
+    'dyncur_sp_db', 'sp_graph_start', 1);
+CALL documentdb_distributed_test_helpers.place_collection_on_node(
+    'dyncur_sp_db', 'sp_graph_nodes', 1);
+
+-- $lookup: the outer and foreign collections are remote unsharded collections
+-- on the same worker. All 20 source documents match one foreign document.
+SELECT * FROM remote_drain_and_report(
+    '{ "aggregate": "sp_coll", "pipeline": [
+        { "$lookup": { "from": "sp_lookup_coll", "localField": "tag", "foreignField": "tag", "as": "matches" } },
+        { "$match": { "matches.0": { "$exists": true } } },
+        { "$project": { "_id": 1 } }
+    ], "cursor": { "batchSize": 6 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 6 }',
+    false);
+
+-- $unionWith: four source documents and four remote-unsharded union documents
+-- are sorted and drained across multiple worker cursor pages.
+SELECT * FROM remote_drain_and_report(
+    '{ "aggregate": "sp_coll", "pipeline": [
+        { "$match": { "_id": { "$lte": 4 } } },
+        { "$project": { "_id": 1 } },
+        { "$unionWith": { "coll": "sp_union_coll", "pipeline": [
+            { "$project": { "_id": 1 } }
+        ] } },
+        { "$sort": { "_id": 1 } }
+    ], "cursor": { "batchSize": 3 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    false);
+
+-- $graphLookup: both the starting collection and recursively traversed
+-- collection are remote unsharded collections on the same worker.
+SELECT * FROM remote_drain_and_report(
+    '{ "aggregate": "sp_graph_start", "pipeline": [
+        { "$graphLookup": {
+            "from": "sp_graph_nodes",
+            "startWith": "$start",
+            "connectFromField": "next",
+            "connectToField": "node",
+            "as": "reachable",
+            "maxDepth": 2
+        } },
+        { "$project": { "_id": 1, "reachable": 1 } }
+    ], "cursor": { "batchSize": 1 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_graph_start", "batchSize": 1 }',
+    false);
+
+SET documentdb.enableCursorsOnAggregationQueryRewrite TO off;
+
+-- ===========================================================================
+-- SECTION I: no-sort skip / limit windows on the remote-unsharded worker
+--
+-- Sections B/C/E already cover skip/limit with an explicit sort (drained via the
+-- dynamic streaming cursor). This section fills the remaining gap: skip/limit
+-- with NO sort clause (order-unspecified windows), skip edge cases (== total,
+-- > total), the aggregation $skip/$limit forms, and a collection with no
+-- secondary index.
+--
+-- Eligible find windows use a dynamic streaming cursor. Aggregation stage forms
+-- remain worker file cursors because skip/limit streaming is find-only. The
+-- helper reports the total drained count and classification, so it is stable
+-- for order-unspecified results.
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION remote_window_report(
+    p_label   text,
+    p_find    text,
+    p_getmore text,
+    p_is_agg  bool DEFAULT false
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_page    documentdb_core.bson;
+    v_cont    documentdb_core.bson;
+    v_persist bool;
+    v_total   bigint := 0;
+    v_batch   bigint;
+    v_kind    text := 'Done';
+BEGIN
+    IF p_is_agg THEN
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM aggregate_cursor_first_page(database => 'dyncur_sp_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 538) fp;
+    ELSE
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM find_cursor_first_page(database => 'dyncur_sp_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 538) fp;
+    END IF;
+
+    SELECT (bson_dollar_project(v_page,
+        '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+    INTO v_batch;
+    v_total := v_total + COALESCE(v_batch, 0);
+
+    IF v_cont IS NOT NULL THEN
+        IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+            IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                v_kind := 'DynamicStreamingRemote';
+            ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                v_kind := 'DynamicFileCursorRemote';
+            ELSE
+                v_kind := 'DynamicHoldPortalRemote';
+            END IF;
+        ELSIF v_persist THEN
+            v_kind := 'Persisted';
+        ELSE
+            v_kind := 'Unknown';
+        END IF;
+    END IF;
+
+    WHILE v_cont IS NOT NULL LOOP
+        SELECT gm.cursorPage, gm.continuation
+        INTO v_page, v_cont
+        FROM cursor_get_more(database => 'dyncur_sp_db',
+            getMoreSpec => p_getmore::documentdb_core.bson,
+            continuationSpec => v_cont) gm;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch;
+        v_total := v_total + COALESCE(v_batch, 0);
+    END LOOP;
+
+    RETURN format('%s: total=%s, coordinator_holds_portal=%s, kind=%s',
+        p_label, v_total, v_persist, v_kind);
+END;
+$$;
+
+-- A collection with NO secondary index (only the implicit _id primary key), on
+-- the remote worker, to exercise skip/limit windows without an index available.
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_noidx_coll');
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_noidx_coll',
+    FORMAT('{ "_id": %s, "k": %s }', i, i)::documentdb_core.bson))
+FROM generate_series(1, 15) AS i;
+ANALYZE;
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_noidx_coll', 1);
+
+-- I1 (S2): no-sort skip>0 -> streaming worker cursor, 15 rows
+SELECT remote_window_report('I1 no-sort skip>0',
+    '{ "find": "sp_coll", "skip": 5, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I2 (S6): skip spanning multiple pages before the first returned row -> 12 rows
+SELECT remote_window_report('I2 no-sort skip spans pages',
+    '{ "find": "sp_coll", "skip": 8, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I3 (S7): skip == total -> empty window
+SELECT remote_window_report('I3 no-sort skip==total',
+    '{ "find": "sp_coll", "skip": 20, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I4 (S7): skip > total -> empty window
+SELECT remote_window_report('I4 no-sort skip>total',
+    '{ "find": "sp_coll", "skip": 25, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I5 (L2): no-sort limit>1 -> streaming worker cursor, exactly 7 rows
+SELECT remote_window_report('I5 no-sort limit>1',
+    '{ "find": "sp_coll", "limit": 7, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I6 (SL4): no-sort skip + limit -> exactly 10 rows (skip 4, take 10)
+SELECT remote_window_report('I6 no-sort skip+limit',
+    '{ "find": "sp_coll", "skip": 4, "limit": 10, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+
+-- I7 (SL3): filter + skip + limit, no sort -> 4 rows
+--   cat=even has 10 docs (val 20,40,...,200); skip 2, take 4 => 4 rows
+SELECT remote_window_report('I7 filter+skip+limit no-sort',
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "skip": 2, "limit": 4, "batchSize": 2 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }');
+
+-- I8 (S11): skip>0 on a collection with no secondary index -> 12 rows (15 - 3)
+SELECT remote_window_report('I8 skip>0 no-index',
+    '{ "find": "sp_noidx_coll", "skip": 3, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_noidx_coll", "batchSize": 4 }');
+
+-- I9 (L11): limit>1 on a collection with no secondary index -> 6 rows
+SELECT remote_window_report('I9 limit>1 no-index',
+    '{ "find": "sp_noidx_coll", "limit": 6, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_noidx_coll", "batchSize": 4 }');
+
+-- I10 (S9): aggregation $skip>0 -> persistent, 15 rows
+SELECT remote_window_report('I10 $skip>0',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$skip": 5 } ], "cursor": { "batchSize": 3 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    true);
+
+-- I11 (L9): aggregation $limit>1 -> persistent, 7 rows
+SELECT remote_window_report('I11 $limit>1',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$limit": 7 } ], "cursor": { "batchSize": 3 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    true);
+
+-- I12 (SL7): aggregation $skip + $limit -> 7 rows (skip 3, take 7)
+SELECT remote_window_report('I12 $skip+$limit',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$skip": 3 }, { "$limit": 7 } ], "cursor": { "batchSize": 2 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    true);
+
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_noidx_coll');
+
+-- ===========================================================================
+-- SECTION J (P1-8): batch-size sweep for remote-unsharded dynamic streaming
+-- cursors. Section I proved each window at a single fixed batch size; this
+-- section proves the same window total is invariant across a 1..N batch-size
+-- sweep and requires a continuation whenever the batch is smaller than the
+-- result. Exact identity checks for unordered windows remain separate coverage.
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION remote_window_sweep(
+    p_label       text,
+    p_find_tmpl   text,
+    p_getmore_tmpl text,
+    p_batch_sizes int[],
+    p_expected    bigint,
+    p_expected_kind text,
+    p_is_agg      bool DEFAULT false
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_bs      int;
+    v_page    documentdb_core.bson;
+    v_cont    documentdb_core.bson;
+    v_persist bool;
+    v_total   bigint;
+    v_batch   bigint;
+    v_kind    text;
+    v_had_continuation bool;
+BEGIN
+    FOREACH v_bs IN ARRAY p_batch_sizes LOOP
+        v_total := 0;
+        IF p_is_agg THEN
+            SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+            INTO v_page, v_cont, v_persist
+            FROM aggregate_cursor_first_page(database => 'dyncur_sp_db',
+                commandSpec => format(p_find_tmpl, v_bs)::documentdb_core.bson, cursorId => 539) fp;
+        ELSE
+            SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+            INTO v_page, v_cont, v_persist
+            FROM find_cursor_first_page(database => 'dyncur_sp_db',
+                commandSpec => format(p_find_tmpl, v_bs)::documentdb_core.bson, cursorId => 539) fp;
+        END IF;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch;
+        v_total := v_total + COALESCE(v_batch, 0);
+        IF v_batch > v_bs THEN
+            RAISE EXCEPTION '%: batchSize=%: first page returned % rows',
+                p_label, v_bs, v_batch;
+        END IF;
+        v_had_continuation := v_cont IS NOT NULL;
+        IF v_bs < p_expected AND NOT v_had_continuation THEN
+            RAISE EXCEPTION '%: batchSize=%: expected pagination for % rows',
+                p_label, v_bs, p_expected;
+        END IF;
+
+        v_kind := 'Done';
+        IF v_cont IS NOT NULL THEN
+            IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+                IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                    v_kind := 'DynamicStreamingRemote';
+                ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                    v_kind := 'DynamicFileCursorRemote';
+                ELSE
+                    v_kind := 'DynamicHoldPortalRemote';
+                END IF;
+            ELSIF v_persist THEN
+                v_kind := 'Persisted';
+            ELSE
+                v_kind := 'Unknown';
+            END IF;
+        END IF;
+
+        WHILE v_cont IS NOT NULL LOOP
+            SELECT gm.cursorPage, gm.continuation
+            INTO v_page, v_cont
+            FROM cursor_get_more(database => 'dyncur_sp_db',
+                getMoreSpec => format(p_getmore_tmpl, v_bs)::documentdb_core.bson,
+                continuationSpec => v_cont) gm;
+
+            SELECT (bson_dollar_project(v_page,
+                '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+            INTO v_batch;
+            v_total := v_total + COALESCE(v_batch, 0);
+            IF v_batch > v_bs THEN
+                RAISE EXCEPTION '%: batchSize=%: getMore returned % rows',
+                    p_label, v_bs, v_batch;
+            END IF;
+        END LOOP;
+
+        IF v_total <> p_expected THEN
+            RAISE EXCEPTION '%: batchSize=%: expected total=%, got %',
+                p_label, v_bs, p_expected, v_total;
+        END IF;
+        -- The cursor kind is only asserted when the window spans more than one
+        -- page (a continuation was issued). When the batch size is >= the window
+        -- size the whole window fits in the first page (kind = Done, no
+        -- continuation), which is the correct single-batch behavior.
+        IF v_had_continuation AND v_kind <> p_expected_kind THEN
+            RAISE EXCEPTION '%: batchSize=%: expected kind=%, got %',
+                p_label, v_bs, p_expected_kind, v_kind;
+        END IF;
+    END LOOP;
+
+    RETURN format('%s: OK  total=%s  kind=%s  (invariant across %s batch sizes)',
+        p_label, p_expected, p_expected_kind, array_length(p_batch_sizes, 1));
+END;
+$$;
+
+-- J1 (qr streaming): filter-only, no sort -> streaming worker cursor. val in
+-- [50,150] by 10s = 11 docs, invariant across the sweep.
+SELECT remote_window_sweep('J1 qr streaming filter',
+    '{ "find": "sp_coll", "filter": { "val": { "$gte": 50, "$lte": 150 } }, "projection": { "_id": 1 }, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,2,4,11,100], 11, 'DynamicStreamingRemote');
+
+-- J2 (qr streaming, skip>0): no-sort skip -> streaming worker cursor.
+SELECT remote_window_sweep('J2 qr streaming skip>0',
+    '{ "find": "sp_coll", "skip": 5, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,3,7,15,100], 15, 'DynamicStreamingRemote');
+
+-- J3 (qr streaming, limit>1): no-sort limit -> streaming worker cursor.
+SELECT remote_window_sweep('J3 qr streaming limit>1',
+    '{ "find": "sp_coll", "limit": 7, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,2,7,100], 7, 'DynamicStreamingRemote');
+
+-- J4 (qr streaming, skip+limit): no-sort window -> streaming worker cursor.
+SELECT remote_window_sweep('J4 qr streaming skip+limit',
+    '{ "find": "sp_coll", "skip": 4, "limit": 10, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,3,10,100], 10, 'DynamicStreamingRemote');
+
+-- ===========================================================================
+-- Cleanup
+-- ===========================================================================
+RESET documentdb.enable_dynamic_cursor_early_index_lock_release;
+RESET documentdb.enable_dynamic_cursor_with_skiplimit;
+
+DO $$
+DECLARE
+    reset_dynamic_cursor_nodes int;
+    reset_lock_release_nodes int;
+    reset_skip_limit_nodes int;
+    reloaded_nodes int;
+BEGIN
+    SELECT count(*) INTO reset_dynamic_cursor_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM RESET documentdb.enableDynamicCursors$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO reset_lock_release_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM RESET documentdb.enable_dynamic_cursor_early_index_lock_release$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO reset_skip_limit_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM RESET documentdb.enable_dynamic_cursor_with_skiplimit$cmd$)
+    WHERE success;
+
+    SELECT count(*) INTO reloaded_nodes
+    FROM run_command_on_all_nodes($cmd$SELECT pg_reload_conf()$cmd$)
+    WHERE success;
+
+     IF reset_dynamic_cursor_nodes <> 2 OR reset_lock_release_nodes <> 2 OR
+         reset_skip_limit_nodes <> 2 OR reloaded_nodes <> 2 THEN
+        RAISE EXCEPTION 'failed to reset all nodes';
+    END IF;
+END
+$$;
+
+DROP FUNCTION IF EXISTS remote_drain_and_report;
+DROP FUNCTION IF EXISTS remote_window_report;
+DROP FUNCTION IF EXISTS remote_window_sweep;
+DROP FUNCTION IF EXISTS sp_drain_ordered;
+DROP FUNCTION IF EXISTS sp_drain_docs;

@@ -1,0 +1,127 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * documentdb_gateway_core/src/context/service.rs
+ *
+ *-------------------------------------------------------------------------
+ */
+
+use std::{sync::Arc, time::Duration};
+
+use crate::{
+    auth::AuthenticationManager,
+    configuration::{DynamicConfiguration, SetupConfiguration},
+    context::{CursorStore, SessionManager, SessionResourceMetrics, TransactionStore},
+    postgres::{conn_mgmt::PoolManager, QueryCatalog},
+    service::TlsProvider,
+};
+
+#[derive(Debug)]
+pub struct ServiceContextInner {
+    pub setup_configuration: Box<dyn SetupConfiguration>,
+    pub dynamic_configuration: Arc<dyn DynamicConfiguration>,
+    pub connection_pool_manager: Arc<PoolManager>,
+    pub tls_provider: TlsProvider,
+    request_metrics_enabled: bool,
+    session_manager: SessionManager,
+    authentication_manager: AuthenticationManager,
+}
+
+#[derive(Debug, Clone)]
+
+pub struct ServiceContext(Arc<ServiceContextInner>);
+
+impl ServiceContext {
+    pub fn new(
+        setup_configuration: Box<dyn SetupConfiguration>,
+        dynamic_configuration: Arc<dyn DynamicConfiguration>,
+        connection_pool_manager: Arc<PoolManager>,
+        tls_provider: TlsProvider,
+        authentication_manager: AuthenticationManager,
+    ) -> Self {
+        let request_metrics_enabled = setup_configuration
+            .telemetry_settings()
+            .request_metrics_enabled();
+
+        // Session Resource Metrics Are Managed Separately
+        let session_resource_metrics =
+            SessionResourceMetrics::new(dynamic_configuration.enable_request_metrics());
+        let timeout_secs = dynamic_configuration.transaction_timeout_sec();
+        let cursor_store = CursorStore::with_reaper(
+            Arc::clone(&dynamic_configuration),
+            session_resource_metrics.clone(),
+            true,
+        );
+        let transaction_store = TransactionStore::new(
+            Duration::from_secs(timeout_secs),
+            session_resource_metrics.clone(),
+        );
+        let session_manager = SessionManager::new(
+            transaction_store,
+            cursor_store,
+            session_resource_metrics,
+            Duration::from_secs(timeout_secs) / 2,
+        );
+
+        let inner = ServiceContextInner {
+            setup_configuration,
+            dynamic_configuration,
+            connection_pool_manager,
+            tls_provider,
+            request_metrics_enabled,
+            session_manager,
+            authentication_manager,
+        };
+        Self(Arc::new(inner))
+    }
+
+    #[must_use]
+    pub fn cursor_store(&self) -> &CursorStore {
+        self.0.session_manager.cursors()
+    }
+
+    #[must_use]
+    pub fn transaction_store(&self) -> &TransactionStore {
+        self.0.session_manager.transactions()
+    }
+
+    #[must_use]
+    pub fn session_manager(&self) -> &SessionManager {
+        &self.0.session_manager
+    }
+
+    #[must_use]
+    pub fn setup_configuration(&self) -> &dyn SetupConfiguration {
+        self.0.setup_configuration.as_ref()
+    }
+
+    #[must_use]
+    pub fn dynamic_configuration(&self) -> Arc<dyn DynamicConfiguration> {
+        Arc::clone(&self.0.dynamic_configuration)
+    }
+
+    #[must_use]
+    pub fn query_catalog(&self) -> &QueryCatalog {
+        self.0.connection_pool_manager.query_catalog()
+    }
+
+    #[must_use]
+    pub fn tls_provider(&self) -> &TlsProvider {
+        &self.0.tls_provider
+    }
+
+    #[must_use]
+    pub fn connection_pool_manager(&self) -> &PoolManager {
+        &self.0.connection_pool_manager
+    }
+
+    #[must_use]
+    pub fn request_metrics_enabled(&self) -> bool {
+        self.0.request_metrics_enabled
+    }
+
+    #[must_use]
+    pub fn authentication_manager(&self) -> &AuthenticationManager {
+        &self.0.authentication_manager
+    }
+}

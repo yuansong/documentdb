@@ -1,0 +1,1305 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * documentdb_gateway_core/src/responses/pg.rs
+ *
+ *-------------------------------------------------------------------------
+ */
+
+use bson::{Bson, Document, RawDocument, RawDocumentBuf};
+use tokio_postgres::{error::SqlState, Row};
+
+use crate::{
+    context::{ConnectionContext, Cursor, CursorId},
+    error::{backend_io_error_kind, DocumentDBError, ErrorCode, ErrorKind, Result},
+    postgres::{document::ColumnByteLen, PgDocument},
+    responses::{
+        constant::{
+            duplicate_key_violation_message, generic_internal_error_message,
+            pg_returned_invalid_response_message,
+        },
+        enhance_internal_error_message, global_custom_error_mapper, RawResponse, Response,
+    },
+};
+
+/// Converts an i32 to a Postgres `SqlState`
+///
+/// # Errors
+///
+/// Returns an error if the operation fails.
+pub fn i32_to_postgres_sqlstate(code: i32) -> Result<SqlState> {
+    let mut code = code;
+    let mut chars = [0_u8; 5];
+    for char in &mut chars {
+        *char = u8::try_from(code & 0x3F).map_err(|error| {
+            tracing::error!("Failed to convert code '{code}' to u8: {error}");
+            DocumentDBError::internal_error(format!("Failed to convert code '{code}' to u8."))
+        })? + b'0';
+        code >>= 6;
+    }
+
+    Ok(SqlState::from_code(str::from_utf8(&chars).map_err(
+        |error| {
+            tracing::error!("Failed to map command error code '{chars:?}' to SQL state: {error}");
+            DocumentDBError::internal_error(format!(
+                "Failed to map command error code '{chars:?}' to SQL state."
+            ))
+        },
+    )?))
+}
+
+#[must_use]
+pub fn postgres_sqlstate_to_i32(sql_state: &SqlState) -> i32 {
+    let mut i = 0;
+    let mut res = 0;
+    for byte in sql_state.code().as_bytes() {
+        res += i32::from((byte - b'0') & 0x3F) << i;
+        i += 6;
+    }
+    res
+}
+
+/// Maps a known `PostgreSQL` error state to its wire-protocol error code.
+#[must_use]
+pub fn from_known_external_error_code(state: &SqlState) -> Option<i32> {
+    include!(concat!(env!("OUT_DIR"), "/int_error_mapping.rs"))
+}
+
+const fn map_postgres_transport_error(
+    io_error_kind: Option<std::io::ErrorKind>,
+) -> (ErrorCode, &'static str) {
+    if matches!(io_error_kind, Some(std::io::ErrorKind::TimedOut)) {
+        (
+            ErrorCode::ExceededTimeLimit,
+            "The command being executed was terminated due to a command timeout. Consider increasing the maxTimeMS on the command.",
+        )
+    } else {
+        (ErrorCode::InternalError, generic_internal_error_message())
+    }
+}
+
+/// Converts a raw [`tokio_postgres::Error`] into a [`DocumentDBError`].
+///
+/// If the error carries a [`SqlState`] code, the code and message are extracted
+/// and forwarded to [`map_pg_db_error`] for semantic mapping, with the original
+/// error preserved as the error source. Errors without a SQL state (e.g. I/O or
+/// connection errors) are classified from their underlying I/O cause when it
+/// is safe to do so.
+#[must_use]
+pub fn map_pg_error(
+    pg_error: tokio_postgres::Error,
+    in_transaction: bool,
+    is_replica_cluster: bool,
+    activity_id: &str,
+) -> DocumentDBError {
+    let Some(sql_state) = pg_error.code().cloned() else {
+        let internal_message = format!("Non db postgres error: {pg_error}");
+        let (error_code, error_message_user) =
+            map_postgres_transport_error(backend_io_error_kind(&pg_error));
+
+        return DocumentDBError::new_documentdb_error(
+            error_code,
+            error_message_user.to_owned(),
+            Some(internal_message),
+            Some(Box::new(pg_error)),
+            ErrorKind::Gateway,
+        );
+    };
+
+    let db_error_message = pg_error
+        .as_db_error()
+        .map_or(String::new(), |e| e.message().to_owned());
+
+    let mapped_result = map_pg_db_error(
+        in_transaction,
+        is_replica_cluster,
+        &sql_state,
+        &db_error_message,
+        activity_id,
+    );
+
+    DocumentDBError::from_mapped_postgres_error(
+        mapped_result.error_code(),
+        mapped_result.error_message(),
+        mapped_result.internal_note(),
+        pg_error,
+    )
+}
+
+/// First applies any registered custom error mapping logic,
+/// then falls back to the generic error mapping logic in `map_pg_db_error_fallback`
+/// if the custom mapper returns `None`.
+///
+/// Errors which are related to open sourced documentdb extension functionality
+/// should be mapped in `map_pg_db_error_fallback`.
+#[must_use]
+pub fn map_pg_db_error<'a>(
+    is_in_transaction: bool,
+    is_replica_cluster: bool,
+    sql_state: &'a SqlState,
+    msg: &'a str,
+    activity_id: &str,
+) -> PostgresErrorMappedResult<'a> {
+    if let Some(mapper) = global_custom_error_mapper() {
+        // Check `CustomPostgresErrorMapper` trait definition for more details.
+        if let Some(mapped_error) = mapper.map_postgres_error(sql_state, msg, activity_id) {
+            return mapped_error;
+        }
+    }
+
+    map_pg_db_error_fallback(
+        is_in_transaction,
+        is_replica_cluster,
+        sql_state,
+        msg,
+        activity_id,
+    )
+}
+
+/// Resource-exhaustion and privilege `SqlState`s whose mapping does not depend on
+/// transaction or activity context. Shared by query-time (`map_pg_db_error_fallback`) and
+/// pool-acquisition-time (`error::map_pool_db_error_code`) mapping so the two tables can't
+/// drift apart. `DISK_FULL` and `INVALID_PASSWORD` are deliberately not included here: those
+/// states are already intercepted earlier by `from_known_external_error_code`, so their match
+/// arms below are unreachable for real postgres errors and surface the raw `msg` rather than a
+/// fixed message; error.rs keeps its own mapping for those two.
+pub const fn map_connection_level_sqlstate(
+    sql_state: &SqlState,
+) -> Option<(ErrorCode, &'static str)> {
+    match *sql_state {
+        SqlState::OUT_OF_MEMORY => Some((
+            ErrorCode::ExceededMemoryLimit,
+            "Exceeded available memory on the server.",
+        )),
+        // Closest proxy — all cases seen so far have been OOM for this error code.
+        SqlState::INSUFFICIENT_RESOURCES => Some((
+            ErrorCode::ExceededMemoryLimit,
+            "Exceeded available resources on the server.",
+        )),
+        SqlState::INSUFFICIENT_PRIVILEGE => Some((
+            ErrorCode::Unauthorized,
+            "User is not authorized to perform this action",
+        )),
+        _ => None,
+    }
+}
+
+/// Errors which are related to open sourced documentdb extension functionality should be mapped in this function.
+#[expect(clippy::too_many_lines, reason = "complex error mapping logic")]
+fn map_pg_db_error_fallback<'a>(
+    is_in_transaction: bool,
+    is_replica_cluster: bool,
+    sql_state: &'a SqlState,
+    msg: &'a str,
+    activity_id: &str,
+) -> PostgresErrorMappedResult<'a> {
+    if let Some(known) = from_known_external_error_code(sql_state) {
+        if known == ErrorCode::NotWritablePrimary as i32 {
+            return PostgresErrorMappedResult {
+                error_code: ErrorCode::NotWritablePrimary,
+                // Hedged because this sqlstate alone cannot confirm the cause,
+                // but a forced read-only cluster is most often disk exhaustion.
+                error_message:
+                    "The server is not currently writable. This may be due to the database disk being full.",
+                internal_note: Some(msg),
+            };
+        }
+
+        let Some(known_error_code) = ErrorCode::from_i32(known) else {
+            tracing::error!(
+                activity_id = activity_id,
+                "Known external error code {known} does not map to any ErrorCode enum variant."
+            );
+
+            return PostgresErrorMappedResult {
+                error_code: ErrorCode::InternalError,
+                error_message: generic_internal_error_message(),
+                internal_note: Some("Failed to map known error code int to ErrorCode enum."),
+            };
+        };
+
+        return PostgresErrorMappedResult {
+            error_code: known_error_code,
+            error_message: msg,
+            internal_note: None,
+        };
+    }
+
+    if let Some((error_code, error_message)) = map_connection_level_sqlstate(sql_state) {
+        if matches!(
+            *sql_state,
+            SqlState::OUT_OF_MEMORY | SqlState::INSUFFICIENT_RESOURCES
+        ) {
+            tracing::error!(activity_id = activity_id, "{error_message}");
+        }
+
+        return PostgresErrorMappedResult {
+            error_code,
+            error_message,
+            internal_note: Some(msg),
+        };
+    }
+
+    // Handle specific pg states and map them to DocumentDB error codes
+    match *sql_state {
+        SqlState::UNIQUE_VIOLATION | SqlState::EXCLUSION_VIOLATION => {
+            if is_in_transaction {
+                tracing::error!(
+                    activity_id = activity_id,
+                    "Duplicate key error during transaction."
+                );
+
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::WriteConflict,
+                    error_message: duplicate_key_violation_message(),
+                    internal_note: Some(msg),
+                }
+            } else {
+                tracing::error!(activity_id = activity_id, "Duplicate key error.");
+
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::DuplicateKey,
+                    error_message: duplicate_key_violation_message(),
+                    internal_note: Some(msg),
+                }
+            }
+        }
+        SqlState::DISK_FULL => PostgresErrorMappedResult {
+            error_code: ErrorCode::OutOfDiskSpace,
+            error_message: "The database disk is full",
+            internal_note: Some(msg),
+        },
+        SqlState::UNDEFINED_TABLE => PostgresErrorMappedResult {
+            error_code: ErrorCode::NamespaceNotFound,
+            error_message: msg,
+            internal_note: Some("undefined table error."),
+        },
+        SqlState::QUERY_CANCELED => {
+            if is_in_transaction {
+                tracing::error!(
+                    activity_id = activity_id,
+                    "Query canceled during transaction."
+                );
+                PostgresErrorMappedResult {
+                        error_code: ErrorCode::ExceededTimeLimit,
+                        error_message: "The command being executed was terminated due to a command timeout. This may be due to concurrent transactions.",
+                        internal_note: Some(msg),
+                    }
+            } else {
+                tracing::error!(activity_id = activity_id, "Query canceled.");
+                PostgresErrorMappedResult {
+                        error_code: ErrorCode::ExceededTimeLimit,
+                        error_message: "The command being executed was terminated due to a command timeout. This may be due to concurrent transactions. Consider increasing the maxTimeMS on the command.",
+                        internal_note: Some(msg),
+                    }
+            }
+        }
+        SqlState::LOCK_NOT_AVAILABLE => {
+            if is_in_transaction {
+                tracing::error!(
+                    activity_id = activity_id,
+                    "Lock not available error during transaction."
+                );
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::WriteConflict,
+                    error_message: msg,
+                    internal_note: Some(msg),
+                }
+            } else {
+                tracing::error!(activity_id = activity_id, "Lock not available error.");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::LockTimeout,
+                    error_message: msg,
+                    internal_note: Some(msg),
+                }
+            }
+        }
+        SqlState::FEATURE_NOT_SUPPORTED => PostgresErrorMappedResult {
+            error_code: ErrorCode::CommandNotSupported,
+            error_message: msg,
+            internal_note: None,
+        },
+        SqlState::DATA_EXCEPTION => {
+            if msg.contains("dimensions, not") || msg.contains("not allowed in vector") {
+                let error_message_loggable = "Dimensions are not allowed in vector error.";
+                tracing::error!(activity_id = activity_id, error_message_loggable);
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::BadValue,
+                    error_message: msg,
+                    internal_note: Some(error_message_loggable),
+                }
+            } else {
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::InternalError,
+                    error_message: generic_internal_error_message(),
+                    internal_note: Some("generic data exception error"),
+                }
+            }
+        }
+        SqlState::PROGRAM_LIMIT_EXCEEDED => {
+            if msg.contains("index row requires") {
+                let error_message = "Index key is too large.";
+                tracing::error!(activity_id = activity_id, "{error_message}");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::CannotBuildIndexKeys,
+                    error_message,
+                    internal_note: Some(msg),
+                }
+            } else if msg.contains("index row size") && msg.contains("exceeds btree version") {
+                let error_message = "Index key is too large for _id.";
+                tracing::error!(activity_id = activity_id, "{error_message}");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::CannotBuildIndexKeys,
+                    error_message,
+                    internal_note: Some(msg),
+                }
+            } else if msg.contains("index row size") && msg.contains("exceeds maximum") {
+                let error_message = "Index key is too large.";
+                tracing::error!(activity_id = activity_id, "{error_message}");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::CannotBuildIndexKeys,
+                    error_message,
+                    internal_note: Some(msg),
+                }
+            } else if msg.contains("MB, maintenance_work_mem is") {
+                // PG Vector hardcodes this as an exceeded memory limit error, replace the original message with a more comprehensive error message.
+                tracing::error!(activity_id = activity_id, "Index creation requires resources too large to fit in the resource memory limit.");
+                PostgresErrorMappedResult {
+                        error_code: ErrorCode::ExceededMemoryLimit,
+                        error_message: "index creation requires resources too large to fit in the resource memory limit, please try creating index with less number of documents or creating index before inserting documents into collection",
+                        internal_note: Some(msg),
+                    }
+            } else {
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::InternalError,
+                    error_message: msg,
+                    internal_note: Some(msg),
+                }
+            }
+        }
+        SqlState::NUMERIC_VALUE_OUT_OF_RANGE => {
+            if msg.contains("is out of range for type halfvec") {
+                let error_message =
+                    "Some values in the vector are out of range for half vector index";
+                tracing::error!(activity_id = activity_id, "{error_message}");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::BadValue,
+                    error_message,
+                    internal_note: Some(error_message),
+                }
+            } else {
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::InternalError,
+                    error_message: generic_internal_error_message(),
+                    internal_note: Some("generic numeric value out of range error"),
+                }
+            }
+        }
+        SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+            if msg.contains("diskann index needs to be upgraded to version") =>
+        {
+            let error_message = "The diskann index needs to be upgraded to the latest version, please drop and recreate the index";
+            tracing::error!(activity_id = activity_id, "{error_message}");
+            PostgresErrorMappedResult {
+                error_code: ErrorCode::InvalidOptions,
+                error_message,
+                internal_note: Some(msg),
+            }
+        }
+        SqlState::INTERNAL_ERROR => {
+            if msg.contains("tsquery stack too small") {
+                // When the search terms have more than 32 nested levels, tsquery raises the PG internal error with message "tsquery stack too small".
+                // This can happen in find commands or $match aggregation stages with $text filter.
+                let error_message = "$text query is exceeding the maximum allowed depth(32), please simplify the query";
+                tracing::error!(activity_id = activity_id, "{error_message}");
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::BadValue,
+                    error_message,
+                    internal_note: Some(error_message),
+                }
+            } else if msg.contains("EXPLAIN ANALYZE is currently not supported for MERGE INTO") {
+                PostgresErrorMappedResult::new(
+                    ErrorCode::IllegalOperation,
+                    "Explain is not supported with certain Merge commands.",
+                    Some(msg),
+                )
+            } else if msg.contains("out of dynamic memory in yy_create_buffer() at file") {
+                PostgresErrorMappedResult::new(
+                    ErrorCode::ExceededMemoryLimit,
+                    "Exceeded available memory on the server.",
+                    Some(msg),
+                )
+            } else {
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::InternalError,
+                    error_message: generic_internal_error_message(),
+                    internal_note: Some(msg),
+                }
+            }
+        }
+        SqlState::INVALID_TEXT_REPRESENTATION => PostgresErrorMappedResult {
+            error_code: ErrorCode::FailedToParse,
+            error_message: msg,
+            internal_note: Some("invalid text representation error."),
+        },
+        SqlState::INVALID_PARAMETER_VALUE => PostgresErrorMappedResult {
+            error_code: ErrorCode::BadValue,
+            error_message: msg,
+            internal_note: Some("invalid parameter value error."),
+        },
+        SqlState::INVALID_ARGUMENT_FOR_NTH_VALUE => PostgresErrorMappedResult {
+            error_code: ErrorCode::BadValue,
+            error_message: msg,
+            internal_note: Some("invalid argument for nth value error."),
+        },
+        SqlState::READ_ONLY_SQL_TRANSACTION if is_replica_cluster => {
+            // Terminal: a replica cluster has no writable primary to fail over to,
+            // so a retryable code would loop the driver against the same server.
+            let error_message = "Cannot execute the operation on this replica cluster";
+            tracing::error!(activity_id = activity_id, "{error_message}");
+            PostgresErrorMappedResult {
+                error_code: ErrorCode::IllegalOperation,
+                error_message,
+                internal_note: Some(msg),
+            }
+        }
+        SqlState::READ_ONLY_SQL_TRANSACTION => PostgresErrorMappedResult {
+            error_code: ErrorCode::ExceededTimeLimit,
+            error_message: "Exceeded time limit while waiting for a new primary to be elected",
+            internal_note: Some(msg),
+        },
+        SqlState::T_R_DEADLOCK_DETECTED => PostgresErrorMappedResult {
+            error_code: ErrorCode::WriteConflict,
+            error_message: "Could not acquire lock for operation due to deadlock",
+            internal_note: Some(msg),
+        },
+        SqlState::UNDEFINED_OBJECT => PostgresErrorMappedResult {
+            error_code: ErrorCode::RoleNotFound,
+            error_message: msg,
+            internal_note: Some("The specified role does not exist."),
+        },
+        SqlState::DUPLICATE_OBJECT => PostgresErrorMappedResult {
+            error_code: ErrorCode::Location51003,
+            error_message: msg,
+            internal_note: Some("duplicate object error."),
+        },
+        SqlState::CARDINALITY_VIOLATION => {
+            if msg.contains("MERGE command cannot affect row a second time") {
+                let error_message = "$merge cannot update a row a second time";
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::CommandNotSupported,
+                    error_message,
+                    internal_note: Some(error_message),
+                }
+            } else {
+                PostgresErrorMappedResult {
+                    error_code: ErrorCode::InternalError,
+                    error_message: generic_internal_error_message(),
+                    internal_note: Some("generic cardinality violation error."),
+                }
+            }
+        }
+        SqlState::DUPLICATE_TABLE => PostgresErrorMappedResult {
+            error_code: ErrorCode::NamespaceExists,
+            error_message: msg,
+            internal_note: Some("duplicate table error."),
+        },
+        SqlState::TOO_MANY_CONNECTIONS => PostgresErrorMappedResult {
+            error_code: ErrorCode::TooManyLogicalSessions,
+            error_message: msg,
+            internal_note: Some(msg),
+        },
+        SqlState::T_R_SERIALIZATION_FAILURE => {
+            let error_message =
+                "Could not complete operation due to conflict with internal apply operation";
+            tracing::error!(activity_id = activity_id, "{error_message}");
+            PostgresErrorMappedResult {
+                error_code: ErrorCode::ConflictingOperationInProgress,
+                error_message,
+                internal_note: Some(msg),
+            }
+        }
+        SqlState::IN_FAILED_SQL_TRANSACTION => {
+            let error_message = "Operation was attempted in a transaction that was aborted";
+            PostgresErrorMappedResult {
+                error_code: ErrorCode::OperationNotSupportedInTransaction,
+                error_message,
+                internal_note: Some(msg),
+            }
+        }
+        SqlState::CANNOT_CONNECT_NOW => {
+            let error_message = "Request terminated due to shutdown on the server.";
+            tracing::error!(activity_id = activity_id, "{error_message}");
+            PostgresErrorMappedResult {
+                error_code: ErrorCode::ShutdownInProgress,
+                error_message,
+                internal_note: Some(msg),
+            }
+        }
+        SqlState::TOO_MANY_COLUMNS => {
+            let error_message = "Too many compound keys for index.";
+            PostgresErrorMappedResult::new(
+                ErrorCode::Location13103,
+                error_message,
+                Some(error_message),
+            )
+        }
+        SqlState::DUPLICATE_COLUMN => {
+            let error_message = "Entity already exists.";
+            PostgresErrorMappedResult::new(
+                ErrorCode::DuplicateKey,
+                error_message,
+                Some(error_message),
+            )
+        }
+        SqlState::INVALID_PASSWORD => {
+            let error_message = "Invalid password.";
+            PostgresErrorMappedResult::new(
+                ErrorCode::InvalidPassword,
+                error_message,
+                Some(error_message),
+            )
+        }
+        SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT | SqlState::IDLE_SESSION_TIMEOUT => {
+            PostgresErrorMappedResult::new(
+                ErrorCode::ExceededTimeLimit,
+                "The session was terminated after exceeding the idle timeout.",
+                Some(msg),
+            )
+        }
+        SqlState::INVALID_JSON_TEXT => PostgresErrorMappedResult::new(
+            ErrorCode::FailedToParse,
+            "Failed to parse the supplied JSON value.",
+            Some(msg),
+        ),
+        // Values the client supplied and the backend could not interpret. DIVISION_BY_ZERO
+        // and INVALID_BINARY_REPRESENTATION are not here on purpose: those can only come
+        // from server-side SQL or a parameter the gateway itself encoded, so they must stay
+        // internal errors rather than being blamed on the request.
+        SqlState::INVALID_REGULAR_EXPRESSION => PostgresErrorMappedResult::new(
+            ErrorCode::BadValue,
+            "The supplied regular expression is invalid.",
+            Some(msg),
+        ),
+        SqlState::INVALID_DATETIME_FORMAT | SqlState::DATETIME_FIELD_OVERFLOW => {
+            PostgresErrorMappedResult::new(
+                ErrorCode::BadValue,
+                "The supplied date or time value is invalid.",
+                Some(msg),
+            )
+        }
+        SqlState::INVALID_CURSOR_NAME => PostgresErrorMappedResult::new(
+            ErrorCode::CursorNotFound,
+            "The cursor is no longer available on the server.",
+            Some(msg),
+        ),
+        SqlState::INVALID_CURSOR_STATE => PostgresErrorMappedResult::new(
+            ErrorCode::CursorInUse,
+            "The cursor is not in a valid state for this operation.",
+            Some(msg),
+        ),
+        SqlState::OBJECT_IN_USE => PostgresErrorMappedResult::new(
+            ErrorCode::ConflictingOperationInProgress,
+            "The operation conflicts with another operation in progress.",
+            Some(msg),
+        ),
+        _ => PostgresErrorMappedResult {
+            error_code: ErrorCode::InternalError,
+            error_message: generic_internal_error_message(),
+            internal_note: Some(msg),
+        },
+    }
+}
+
+fn transform_error(
+    context: &ConnectionContext,
+    error_bson: &mut Bson,
+    activity_id: &str,
+) -> Result<()> {
+    let doc = error_bson
+        .as_document_mut()
+        .ok_or(DocumentDBError::internal_error(
+            "Failed to convert BSON write error into BSON document.".to_owned(),
+        ))?;
+    let msg = doc.get_str("errmsg").unwrap_or("").to_owned();
+    let code = doc
+        .get_i32_mut("code")
+        .map_err(|e| DocumentDBError::internal_error(pg_returned_invalid_response_message(e)))?;
+
+    let pg_code = i32_to_postgres_sqlstate(*code)?;
+
+    let mapped_response = map_pg_db_error(
+        context.transaction.is_some(),
+        context.dynamic_configuration().is_replica_cluster(),
+        &pg_code,
+        &msg,
+        activity_id,
+    );
+
+    // A per-document write error that actually reports an infrastructure failure has to
+    // fail the whole command: emitting it as a writeErrors[] entry on an ok:1 response
+    // would let a client that only checks command status treat a lost backend or a
+    // shutting-down server as a successful batch.
+    if matches!(
+        mapped_response.error_code(),
+        ErrorCode::WriteConflict
+            | ErrorCode::InternalError
+            | ErrorCode::LockTimeout
+            | ErrorCode::Unauthorized
+    ) || matches!(
+        pg_code,
+        SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+            | SqlState::IDLE_SESSION_TIMEOUT
+            | SqlState::INVALID_CURSOR_NAME
+            | SqlState::INVALID_CURSOR_STATE
+            | SqlState::OBJECT_IN_USE
+    ) {
+        return Err(DocumentDBError::error_with_loggable_message(
+            mapped_response.error_code(),
+            mapped_response.error_message(),
+            mapped_response.internal_note().unwrap_or_default(),
+        ));
+    }
+
+    let internal_note = mapped_response.internal_note();
+    tracing::warn!(
+        activity_id = activity_id,
+        sub_status_code = ?pg_code,
+        error_message_loggable = internal_note,
+        external_code = mapped_response.error_code() as i32,
+        "WriteError info: sub_status_code = {{sub_status_code}}, error_message_loggable = {{error_message_loggable}}, external_code = {{external_code}}.",
+    );
+
+    *code = mapped_response.error_code() as i32;
+    doc.insert(
+        "errmsg",
+        enhance_internal_error_message(
+            mapped_response.error_message(),
+            mapped_response.error_code(),
+            activity_id,
+        ),
+    );
+
+    Ok(())
+}
+
+/// Response from PG. This holds ownership of the response from the backend
+#[derive(Debug)]
+pub struct PgResponse {
+    rows: Vec<Row>,
+}
+
+impl PgResponse {
+    #[must_use]
+    pub const fn new(rows: Vec<Row>) -> Self {
+        Self { rows }
+    }
+
+    /// Gets the first row
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    pub fn first(&self) -> Result<&Row> {
+        self.rows
+            .first()
+            .ok_or(DocumentDBError::pg_response_empty())
+    }
+
+    /// Gets the response as a raw document
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    pub fn as_raw_document(&self) -> Result<&RawDocument> {
+        match self.rows.first() {
+            Some(row) => {
+                let content: PgDocument = row.try_get(0)?;
+                Ok(content.0)
+            }
+            None => Err(DocumentDBError::pg_response_empty()),
+        }
+    }
+
+    /// Returns the total byte length across all columns of the first row,
+    /// or 0 if the response is empty. Extracts raw byte lengths without
+    /// deserializing or validating column data.
+    #[must_use]
+    pub fn response_byte_len(&self) -> usize {
+        let Some(row) = self.rows.first() else {
+            return 0;
+        };
+        (0..row.len())
+            .filter_map(|i| row.try_get::<_, ColumnByteLen>(i).map(|col| col.0).ok())
+            .sum()
+    }
+
+    /// # Errors
+    /// Returns an error if the result columns cannot be read or deserialized.
+    pub fn get_cursor(&self) -> Result<Option<(bool, Cursor)>> {
+        match self.rows.first() {
+            Some(row) => {
+                let cols = row.columns();
+                if cols.len() == 4 {
+                    let continuation: Option<PgDocument> = row.try_get(1)?;
+                    match continuation {
+                        Some(continuation) => {
+                            let persist: bool = row.try_get(2)?;
+                            let cursor_id: i64 = row.try_get(3)?;
+                            Ok(Some((
+                                persist,
+                                Cursor {
+                                    continuation: continuation.0.to_raw_document_buf(),
+                                    cursor_id: CursorId::from(cursor_id),
+                                },
+                            )))
+                        }
+                        None => Ok(None),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Err(DocumentDBError::pg_response_empty()),
+        }
+    }
+
+    /// Reads the `p_success` flag from column 1 of the first row.
+    ///
+    /// Returns `true` (success) when the row has only one column, matching
+    /// queries that do not return `p_success`.  Returns an error when the
+    /// response is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is empty or the column cannot be read.
+    pub fn write_success(&self) -> Result<bool> {
+        let row = self.first()?;
+        if row.len() > 1 {
+            row.try_get(1).map_err(Into::into)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// If the `PostgreSQL` UDF signals failure via `p_success` (column 1) and
+    /// `writeErrors` is present, transforms each error by mapping to known
+    /// error codes.  When `p_success` is `true` the response is returned
+    /// without inspecting `writeErrors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    pub fn transform_write_errors(
+        self,
+        connection_context: &ConnectionContext,
+        activity_id: &str,
+    ) -> Result<Response> {
+        let success = self.write_success()?;
+
+        if !success {
+            if let Ok(Some(_)) = self.as_raw_document()?.get("writeErrors") {
+                let mut response = Document::try_from(self.as_raw_document()?)?;
+                let write_errors = response.get_array_mut("writeErrors").map_err(|e| {
+                    DocumentDBError::internal_error(pg_returned_invalid_response_message(e))
+                })?;
+
+                for value in write_errors {
+                    transform_error(connection_context, value, activity_id)?;
+                }
+                let raw = RawDocumentBuf::from_document(&response)?;
+                return Ok(Response::Raw(RawResponse::new(raw).with_write_errors()));
+            }
+        }
+
+        Ok(Response::Pg(self))
+    }
+}
+
+#[derive(Debug)]
+pub struct PostgresErrorMappedResult<'a> {
+    error_code: ErrorCode,
+    error_message: &'a str,
+    internal_note: Option<&'a str>,
+}
+
+impl<'a> PostgresErrorMappedResult<'a> {
+    #[must_use]
+    pub const fn new(
+        error_code: ErrorCode,
+        error_message: &'a str,
+        internal_note: Option<&'a str>,
+    ) -> Self {
+        Self {
+            error_code,
+            error_message,
+            internal_note,
+        }
+    }
+
+    #[must_use]
+    pub const fn error_code(&self) -> ErrorCode {
+        self.error_code
+    }
+
+    #[must_use]
+    pub const fn error_message(&self) -> &'a str {
+        self.error_message
+    }
+
+    #[must_use]
+    pub const fn internal_note(&self) -> Option<&'a str> {
+        self.internal_note
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Once};
+
+    use super::*;
+    use crate::{
+        responses::{register_custom_error_mapper, CustomPostgresErrorMapper},
+        testing::{test_connection_context, TestDynamicConfiguration},
+    };
+
+    static REGISTER_TEST_MAPPER: Once = Once::new();
+
+    fn register_test_mapper() {
+        REGISTER_TEST_MAPPER.call_once(|| {
+            let _ = register_custom_error_mapper(Box::new(TestMapper));
+        });
+    }
+
+    #[derive(Debug)]
+    struct TestMapper;
+
+    impl CustomPostgresErrorMapper for TestMapper {
+        fn map_postgres_error<'a>(
+            &self,
+            sql_state: &'a SqlState,
+            msg: &'a str,
+            _activity_id: &str,
+        ) -> Option<PostgresErrorMappedResult<'a>> {
+            ((*sql_state == SqlState::DISK_FULL) && msg.contains("custom_mapper_test")).then(|| {
+                PostgresErrorMappedResult::new(
+                    ErrorCode::CommandNotSupported,
+                    "custom mapped error",
+                    None,
+                )
+            })
+        }
+    }
+
+    #[test]
+    fn test_custom_postgres_error_mapper() {
+        register_test_mapper();
+
+        // Custom mapper handles DISK_FULL with a test marker and overrides the default
+        // OutOfDiskSpace mapping.
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::DISK_FULL,
+            "custom_mapper_test: could not extend file: No space left on device",
+            "test-activity",
+        );
+        assert_eq!(result.error_code(), ErrorCode::CommandNotSupported);
+        assert_eq!(result.error_message(), "custom mapped error");
+
+        // For a state the custom mapper doesn't handle, it falls through to the generic logic.
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            "this feature is not supported",
+            "test-activity",
+        );
+        assert_eq!(result.error_code(), ErrorCode::CommandNotSupported);
+        assert_eq!(result.error_message(), "this feature is not supported");
+    }
+
+    #[test]
+    fn test_no_custom_mapper_falls_through_to_generic() {
+        // When the message doesn't match custom mapper conditions,
+        // generic mapping is used directly.
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::DISK_FULL,
+            "disk full",
+            "test-activity",
+        );
+        assert_eq!(result.error_code(), ErrorCode::OutOfDiskSpace);
+        assert_eq!(result.error_message(), "disk full");
+    }
+
+    #[test]
+    fn postgres_transport_timeout_maps_to_exceeded_time_limit() {
+        let (error_code, error_message) =
+            map_postgres_transport_error(Some(std::io::ErrorKind::TimedOut));
+
+        assert_eq!(error_code, ErrorCode::ExceededTimeLimit);
+        assert!(error_message.contains("maxTimeMS"));
+    }
+
+    #[test]
+    fn ambiguous_postgres_transport_error_stays_internal() {
+        let (error_code, error_message) =
+            map_postgres_transport_error(Some(std::io::ErrorKind::ConnectionReset));
+
+        assert_eq!(error_code, ErrorCode::InternalError);
+        assert_eq!(error_message, generic_internal_error_message());
+    }
+
+    #[tokio::test]
+    async fn client_input_sqlstate_remains_a_per_document_write_error() {
+        let context =
+            test_connection_context(false, Arc::new(TestDynamicConfiguration::default()), None)
+                .await;
+        let mut write_error = Bson::Document(bson::doc! {
+            "code": postgres_sqlstate_to_i32(&SqlState::INVALID_JSON_TEXT),
+            "errmsg": "backend detail",
+        });
+
+        transform_error(&context, &mut write_error, "test-activity")
+            .expect("invalid client input should remain a writeErrors entry");
+
+        let document = write_error
+            .as_document()
+            .expect("transformed write error should remain a document");
+        assert_eq!(
+            document.get_i32("code"),
+            Ok(ErrorCode::FailedToParse as i32)
+        );
+        assert_eq!(
+            document.get_str("errmsg"),
+            Ok("Failed to parse the supplied JSON value.")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sqlstate_escalates_to_command_error() {
+        let context =
+            test_connection_context(false, Arc::new(TestDynamicConfiguration::default()), None)
+                .await;
+        let mut write_error = Bson::Document(bson::doc! {
+            "code": postgres_sqlstate_to_i32(&SqlState::IDLE_SESSION_TIMEOUT),
+            "errmsg": "backend detail",
+        });
+
+        let error = transform_error(&context, &mut write_error, "test-activity")
+            .expect_err("session termination must fail the whole write command");
+
+        assert_eq!(error.error_code(), ErrorCode::ExceededTimeLimit);
+        assert_eq!(
+            error.error_message_user(),
+            "The session was terminated after exceeding the idle timeout."
+        );
+    }
+
+    /// States that used to fall through to the `InternalError` default arm now
+    /// carry a code the client can act on. The expected message is asserted
+    /// alongside the code because whether an arm echoes the raw backend `msg`
+    /// or a fixed string is what decides whether internal schema, role, and
+    /// query detail reaches the client.
+    #[test]
+    fn previously_unmapped_states_map_to_known_error_codes() {
+        for (state, expected_code, expected_message) in [
+            (
+                &SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+                ErrorCode::ExceededTimeLimit,
+                "The session was terminated after exceeding the idle timeout.",
+            ),
+            (
+                &SqlState::IDLE_SESSION_TIMEOUT,
+                ErrorCode::ExceededTimeLimit,
+                "The session was terminated after exceeding the idle timeout.",
+            ),
+            (
+                &SqlState::INVALID_JSON_TEXT,
+                ErrorCode::FailedToParse,
+                "Failed to parse the supplied JSON value.",
+            ),
+            (
+                &SqlState::INVALID_REGULAR_EXPRESSION,
+                ErrorCode::BadValue,
+                "The supplied regular expression is invalid.",
+            ),
+            (
+                &SqlState::INVALID_DATETIME_FORMAT,
+                ErrorCode::BadValue,
+                "The supplied date or time value is invalid.",
+            ),
+            (
+                &SqlState::DATETIME_FIELD_OVERFLOW,
+                ErrorCode::BadValue,
+                "The supplied date or time value is invalid.",
+            ),
+            (
+                &SqlState::INVALID_CURSOR_NAME,
+                ErrorCode::CursorNotFound,
+                "The cursor is no longer available on the server.",
+            ),
+            (
+                &SqlState::INVALID_CURSOR_STATE,
+                ErrorCode::CursorInUse,
+                "The cursor is not in a valid state for this operation.",
+            ),
+            (
+                &SqlState::OBJECT_IN_USE,
+                ErrorCode::ConflictingOperationInProgress,
+                "The operation conflicts with another operation in progress.",
+            ),
+        ] {
+            let result = map_pg_db_error(false, false, state, "backend detail", "test-activity");
+
+            assert_eq!(
+                result.error_code(),
+                expected_code,
+                "unexpected code for {}",
+                state.code()
+            );
+            assert_eq!(
+                result.error_message(),
+                expected_message,
+                "unexpected message for {}",
+                state.code()
+            );
+        }
+    }
+
+    /// States whose outcome the backend cannot vouch for must keep reporting
+    /// `InternalError`. Handing them a code drivers auto-retry on would let a
+    /// non-idempotent write apply twice, and giving a server-side fault a
+    /// client-facing code hides a gateway bug from availability signals.
+    #[test]
+    fn undecidable_and_server_side_states_still_map_to_internal_error() {
+        for state in [
+            &SqlState::SYNTAX_ERROR,
+            // An established connection dropped: the command may already have run.
+            &SqlState::CONNECTION_EXCEPTION,
+            &SqlState::CONNECTION_DOES_NOT_EXIST,
+            &SqlState::CONNECTION_FAILURE,
+            &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+            &SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION,
+            &SqlState::ADMIN_SHUTDOWN,
+            &SqlState::CRASH_SHUTDOWN,
+            &SqlState::DATABASE_DROPPED,
+            &SqlState::CONFIGURATION_LIMIT_EXCEEDED,
+            &SqlState::T_R_INTEGRITY_CONSTRAINT_VIOLATION,
+            // The backend explicitly cannot say whether the statement took effect.
+            &SqlState::T_R_STATEMENT_COMPLETION_UNKNOWN,
+            // Raised by server-side SQL or by a parameter the gateway itself encoded.
+            &SqlState::DIVISION_BY_ZERO,
+            &SqlState::INVALID_BINARY_REPRESENTATION,
+        ] {
+            let result = map_pg_db_error(false, false, state, "backend detail", "test-activity");
+
+            assert_eq!(
+                result.error_code(),
+                ErrorCode::InternalError,
+                "{} should stay an internal error",
+                state.code()
+            );
+            assert_eq!(result.error_message(), generic_internal_error_message());
+        }
+    }
+
+    #[test]
+    fn test_map_with_unique_violation_in_transaction_returns_write_conflict() {
+        let result = map_pg_db_error(
+            true,
+            false,
+            &SqlState::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::WriteConflict);
+        assert_eq!(result.error_message(), duplicate_key_violation_message());
+    }
+
+    #[test]
+    fn test_map_with_unique_violation_no_transaction_returns_duplicate_key() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::DuplicateKey);
+        assert_eq!(result.error_message(), duplicate_key_violation_message());
+    }
+
+    #[test]
+    fn test_map_with_query_canceled_in_transaction_returns_timeout_message() {
+        let result = map_pg_db_error(
+            true,
+            false,
+            &SqlState::QUERY_CANCELED,
+            "canceling statement due to statement timeout",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::ExceededTimeLimit);
+        assert_eq!(
+            result.error_message(),
+            "The command being executed was terminated due to a command timeout. This may be due to concurrent transactions."
+        );
+    }
+
+    #[test]
+    fn test_map_with_query_canceled_no_transaction_suggests_max_time_ms() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::QUERY_CANCELED,
+            "canceling statement due to statement timeout",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::ExceededTimeLimit);
+        assert!(result
+            .error_message()
+            .contains("Consider increasing the maxTimeMS"));
+    }
+
+    #[test]
+    fn test_map_with_read_only_transaction_on_replica_returns_illegal_operation() {
+        let result = map_pg_db_error(
+            false,
+            true,
+            &SqlState::READ_ONLY_SQL_TRANSACTION,
+            "cannot execute INSERT in a read-only transaction",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::IllegalOperation);
+        assert_eq!(
+            result.error_message(),
+            "Cannot execute the operation on this replica cluster"
+        );
+    }
+
+    #[test]
+    fn test_known_not_writable_primary_keeps_backend_message_as_internal_note() {
+        let sql_state = SqlState::from_code("M00E8");
+        let result = map_pg_db_error(
+            false,
+            false,
+            &sql_state,
+            "cannot execute write operations when default_transaction_read_only is set to true",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::NotWritablePrimary);
+        assert_eq!(
+            result.error_message(),
+            "The server is not currently writable. This may be due to the database disk being full."
+        );
+        assert_eq!(
+            result.internal_note(),
+            Some(
+                "cannot execute write operations when default_transaction_read_only is set to true"
+            )
+        );
+    }
+
+    // Only the NotWritablePrimary arm substitutes a fixed message; every other
+    // known external code still forwards the backend message to the client.
+    #[test]
+    fn test_known_external_code_other_than_not_writable_primary_forwards_message() {
+        let sql_state = SqlState::from_code("M0001");
+        let result = map_pg_db_error(false, false, &sql_state, "backend detail", "test-activity");
+
+        assert_eq!(result.error_code(), ErrorCode::BadValue);
+        assert_eq!(result.error_message(), "backend detail");
+        assert_eq!(result.internal_note(), None);
+    }
+
+    #[test]
+    fn test_map_with_read_only_transaction_no_replica_returns_exceeded_time_limit() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::READ_ONLY_SQL_TRANSACTION,
+            "cannot execute INSERT in a read-only transaction",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::ExceededTimeLimit);
+        assert_eq!(
+            result.error_message(),
+            "Exceeded time limit while waiting for a new primary to be elected"
+        );
+    }
+
+    #[test]
+    fn test_map_with_program_limit_exceeded_memory_message_returns_exceeded_memory_limit() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::PROGRAM_LIMIT_EXCEEDED,
+            "memory required is 120 MB, maintenance_work_mem is 64 MB",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::ExceededMemoryLimit);
+        assert!(result
+            .error_message()
+            .contains("index creation requires resources too large"));
+    }
+
+    #[test]
+    fn test_map_with_numeric_out_of_range_halfvec_returns_bad_value() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+            "value is out of range for type halfvec",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::BadValue);
+        assert_eq!(
+            result.error_message(),
+            "Some values in the vector are out of range for half vector index"
+        );
+    }
+
+    #[test]
+    fn test_map_with_internal_error_tsquery_stack_returns_bad_value() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::INTERNAL_ERROR,
+            "tsquery stack too small",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::BadValue);
+        assert!(result
+            .error_message()
+            .contains("$text query is exceeding the maximum allowed depth"));
+    }
+
+    #[test]
+    fn test_map_with_cannot_connect_now_returns_shutdown_in_progress() {
+        let result = map_pg_db_error(
+            false,
+            false,
+            &SqlState::CANNOT_CONNECT_NOW,
+            "the database system is shutting down",
+            "test-activity",
+        );
+
+        assert_eq!(result.error_code(), ErrorCode::ShutdownInProgress);
+        assert_eq!(
+            result.error_message(),
+            "Request terminated due to shutdown on the server."
+        );
+    }
+}

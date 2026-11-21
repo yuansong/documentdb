@@ -1,0 +1,651 @@
+SET documentdb.next_collection_id TO 1972800;
+SET documentdb.next_collection_index_id TO 1972800;
+
+SET documentdb.maxUserLimit TO 10;
+\set VERBOSITY TERSE
+
+show documentdb.blockedRolePrefixList;
+
+SET documentdb.blockedRolePrefixList TO '';
+SELECT documentdb_api.create_user('{"createUser":"documentdb_unblocked", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_unblocked", "$db":"admin"}');
+SET documentdb.blockedRolePrefixList TO 'documentdb';
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_unblocked", "$db":"admin"}');
+
+SET documentdb.blockedRolePrefixList TO 'newBlock, newBlock2';
+SELECT documentdb_api.create_user('{"createUser":"newBlock_user", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newBlock2_user", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+RESET documentdb.blockedRolePrefixList;
+
+-- Passwords that fail SASLprep must not create or change native users.
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_emoji", "pwd":"Valid\ud83e\uddeaPass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_private_use", "pwd":"Valid\ue000Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_bidi", "pwd":"Valid\u05d0Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_empty", "pwd":"\u00ad", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Raw BSON reaches password validation without the JSON decoder rejecting UTF-8.
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"createUser":"saslprep_rejected_utf8", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}') AS command
+)
+SELECT documentdb_api.create_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT count(*) AS rejected_users_created
+FROM pg_authid
+WHERE rolname LIKE 'saslprep_rejected_%';
+
+SET client_min_messages TO WARNING;
+DROP ROLE IF EXISTS saslprep_rejected_emoji, saslprep_rejected_private_use,
+    saslprep_rejected_bidi, saslprep_rejected_empty, saslprep_rejected_utf8;
+RESET client_min_messages;
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_update_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT rolpassword AS saslprep_original_password
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user' \gset
+
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ud83e\uddeaPass123!", "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ue000Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\u05d0Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"\u00ad", "$db":"admin"}');
+
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"updateUser":"saslprep_update_user", "pwd":"test_password", "$db":"admin"}') AS command
+)
+SELECT documentdb_api.update_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT rolpassword = :'saslprep_original_password' AS password_unchanged
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user';
+SELECT pg_has_role('saslprep_update_user', 'documentdb_readonly_role', 'MEMBER') AS membership_unchanged;
+SELECT documentdb_api.drop_user('{"dropUser":"saslprep_update_user", "$db":"admin"}');
+
+--Enable DB admin requirement feature flag
+SET documentdb.enableUsersAdminDBCheck TO ON;
+
+-- Test user APIs with non-admin database - all should fail
+-- Test create_user with non-admin database
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"nonAdminDatabase"}');
+
+-- Test users_info with non-admin database
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "$db":"nonAdminDatabase"}');
+
+-- Test update_user with non-admin database
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password", "$db":"nonAdminDatabase"}');
+
+-- Test drop_user with non-admin database
+SELECT documentdb_api.drop_user('{"dropUser":"test_user", "$db":"nonAdminDatabase"}');
+
+-- Test user APIs with no database parameter - all should fail
+-- Test create_user with no database parameter
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}]}');
+
+-- Test users_info with no database parameter
+SELECT documentdb_api.users_info('{"usersInfo":"test_user"}');
+
+-- Test update_user with no database parameter
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password"}');
+
+-- Test drop_user with no database parameter
+SELECT documentdb_api.drop_user('{"dropUser":"test_user"}');
+
+-- Test user APIs with admin check disabled - all should succeed
+SET documentdb.enableUsersAdminDBCheck TO OFF;
+
+-- Test create_user with non-admin database
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"nonAdminDatabase"}');
+
+-- Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "$db":"admin"}');
+
+-- Test update_user with non-admin database
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password", "$db":"nonAdminDatabase"}');
+
+-- Test drop_user with non-admin database
+SELECT documentdb_api.drop_user('{"dropUser":"test_user", "$db":"nonAdminDatabase"}');
+
+-- Verify that the user is dropped
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "$db":"admin"}');
+
+-- Test user APIs with no $db parameter when admin check is disabled - all should succeed
+-- Test create_user with no database parameter
+SELECT documentdb_api.create_user('{"createUser":"test_user_no_db", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}]}');
+
+-- Test users_info with no database parameter
+SELECT documentdb_api.users_info('{"usersInfo":"test_user_no_db"}');
+
+-- Test update_user with no database parameter
+SELECT documentdb_api.update_user('{"updateUser":"test_user_no_db", "pwd":"Updated$123Pass"}');
+
+-- Test drop_user with no database parameter
+SELECT documentdb_api.drop_user('{"dropUser":"test_user_no_db"}');
+
+-- Verify that the user is dropped
+SELECT documentdb_api.users_info('{"usersInfo":"test_user_no_db", "$db":"admin"}');
+
+-- Re-enable admin DB check
+SET documentdb.enableUsersAdminDBCheck TO ON;      
+
+--Create a readOnly user
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "$db":"admin"}');
+
+--Create an admin user
+SELECT documentdb_api.create_user('{"createUser":"test_user2", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user2", "$db":"admin"}');
+
+--Try to create a readOnly user without passing in the role as  part of an array
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"Valid$123Pass", "roles":{"role":"readAnyDatabase","db":"admin"}, "$db":"admin"}');
+
+--Create a user with a blocked prefix
+SELECT documentdb_api.create_user('{"createUser":"documentdb_user2", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Create an already existing user
+SELECT documentdb_api.create_user('{"createUser":"test_user2", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Create a user with no role
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "roles":[], "$db":"admin"}');
+
+--Create a user without specifying role parameter
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "$db":"admin"}');
+
+--Create a user with a disallowed parameter
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "testParam":"This is a test", "$db":"admin"}');
+
+--Create a user with a disallowed DB
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"Test"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Create a user with a disallowed role
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "roles":[{"role":"read","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Create a user with no DB
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase"}, {"role":"clusterAdmin"}], "$db":"admin"}');
+
+--Create a user with clusterAdmin but no readWriteAnyDatabase should fail
+SELECT documentdb_api.create_user('{"createUser":"test_user4", "pwd":"test_password", "roles":[{"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+-- Create a user with an empty password should fail
+SELECT documentdb_api.create_user('{"createUser":"test_user_empty_pwd", "pwd":"", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Create a user with password less than 8 characters and drop it
+SELECT documentdb_api.create_user('{"createUser":"test_user_short_pwd", "pwd":"Short1!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user_short_pwd", "$db":"admin"}');
+
+-- Create a user with password more than 256 characters and drop it
+SELECT documentdb_api.create_user('{"createUser":"test_user_long_pwd", "pwd":"ThisIsAVeryLongPasswordThatExceedsTheTwoHundredFiftySixCharacterLimitAndThereforeShouldFailValidation1!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user_long_pwd", "$db":"admin"}');
+
+--Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user4", "$db":"admin"}');
+
+--Create a user with no DB in just one role
+SELECT documentdb_api.create_user('{"createUser":"test_user5", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user5", "$db":"admin"}');
+
+--Create a user with no parameters at all
+SELECT documentdb_api.create_user('{"$db":"admin"}');
+
+--Get all users
+SELECT documentdb_api.users_info('{"usersInfo":1, "$db":"admin"}');
+
+--Test SQL injection attack
+SELECT documentdb_api.create_user('{"createUser":"test_user_injection_attack", "pwd":"; DROP TABLE users; --", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Verify that the user is created
+SELECT documentdb_api.users_info('{"usersInfo":"test_user_injection_attack", "$db":"admin"}');
+
+--Get all users
+SELECT documentdb_api.users_info('{"usersInfo":1, "$db":"admin"}');
+
+--Drop a user
+SELECT documentdb_api.drop_user('{"dropUser":"test_user5", "$db":"admin"}');
+
+--Verify successful drop
+SELECT documentdb_api.users_info('{"usersInfo":"test_user5", "$db":"admin"}');
+
+--Drop a reserved user, should fail
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_user", "$db":"admin"}');
+
+--Drop non-existent user
+SELECT documentdb_api.drop_user('{"dropUser":"nonexistent_user", "$db":"admin"}');
+
+--Drop a system user
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_bg_worker_role", "$db":"admin"}');
+
+--Drop a built-in user
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_admin_role", "$db":"admin"}');
+
+--Drop with disallowed parameter
+SELECT documentdb_api.drop_user('{"user":"test_user", "$db":"admin"}');
+
+--Update a user
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password", "$db":"admin"}');
+
+--Update non existent user
+SELECT documentdb_api.update_user('{"updateUser":"nonexistent_user", "pwd":"new_password", "$db":"admin"}');
+
+--Update with disllowed parameter
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Get non existent user
+SELECT documentdb_api.users_info('{"usersInfo":"nonexistent_user", "$db":"admin"}');
+
+--Create a readOnly user
+SELECT documentdb_api.create_user('{"createUser":"readOnlyUser", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Create an admin user
+SELECT documentdb_api.create_user('{"createUser":"adminUser", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+--Verify that we error out for external identity provider
+SELECT documentdb_api.create_user('{"createUser":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "customData":{"IdentityProvider" : {"type" : "ExternalProvider", "properties": {"principalType": "servicePrincipal"}}}, "$db":"admin"}');
+
+SELECT current_user as original_user \gset
+
+-- Call usersInfo with showPrivileges set to true
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "showPrivileges":true, "$db":"admin"}');
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "showPrivileges":false, "$db":"admin"}');
+SELECT documentdb_api.users_info('{"usersInfo":"adminUser", "showPrivileges":true, "$db":"admin"}');
+SELECT documentdb_api.users_info('{"usersInfo":"adminUser", "showPrivileges":false, "$db":"admin"}');
+
+-- Test usersInfo command with usersInfo set to 1 and showPrivileges set to true, should fail
+SELECT documentdb_api.users_info('{"usersInfo":1, "showPrivileges":true, "$db":"admin"}');
+
+-- Test usersInfo command with enableUserInfoPrivileges set to false
+SET documentdb.enableUsersInfoPrivileges TO OFF;
+SELECT documentdb_api.users_info('{"usersInfo":"test_user", "showPrivileges":true, "$db":"admin"}');
+SELECT documentdb_api.users_info('{"usersInfo":"adminUser", "showPrivileges":true, "$db":"admin"}');
+RESET documentdb.enableUsersInfoPrivileges;
+
+-- switch to read only user
+\c - readOnlyUser
+
+--Create without privileges
+SELECT documentdb_api.create_user('{"createUser":"newUser", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Drop without privileges
+SELECT documentdb_api.drop_user('{"dropUser":"test_user", "$db":"admin"}');
+
+-- switch to admin user
+\c - adminUser
+
+-- Test connectionStatus command without showPrivileges parameter
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "$db":"admin"}');
+
+-- Test connectionStatus command with showPrivileges set to true/false
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "showPrivileges":true, "$db":"admin"}');
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "showPrivileges":false, "$db":"admin"}');
+
+-- Test connectionStatus command with no parameters, should fail
+SELECT documentdb_api.connection_status();
+
+-- Test connectionStatus command with non-int value
+SELECT documentdb_api.connection_status('{"connectionStatus": "1", "$db":"admin"}');
+
+-- Test connectionStatus command with non-1 value
+SELECT documentdb_api.connection_status('{"connectionStatus": 0, "$db":"admin"}');
+
+-- Test connectionStatus command with no $db parameter, should fail
+SELECT documentdb_api.connection_status('{"connectionStatus": 1}');
+
+SET documentdb.enableUsersAdminDBCheck TO OFF;
+
+-- Test connectionStatus command with no $db parameter, should succeed
+SELECT documentdb_api.connection_status('{"connectionStatus": 1}');
+
+SET documentdb.enableUsersAdminDBCheck TO ON;
+
+--Create without privileges
+SELECT documentdb_api.create_user('{"createUser":"newUser", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+--Drop without privileges
+SELECT documentdb_api.drop_user('{"dropUser":"test_user", "$db":"admin"}');
+
+--set Feature flag for user crud OFF
+SET documentdb.enableUserCrud TO OFF;
+
+--All user crud commnads should fail
+SELECT documentdb_api.create_user('{"createUser":"test_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.users_info('{"usersInfo":1, "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"test_user", "pwd":"new_password", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user5", "$db":"admin"}');
+
+-- switch back to original user
+\c - :original_user
+
+--set Feature flag for user crud
+SET documentdb.enableUserCrud TO ON;
+\set VERBOSITY TERSE
+ 
+ --set max user limit to 11
+SET documentdb.maxUserLimit TO 11;
+
+-- Keep creating users till we have 11 users
+SELECT documentdb_api.create_user('{"createUser":"newUser7", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newUser8", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newUser9", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newUser10", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newUser11", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- This call should fail since we're only allowed to create 11 users
+SELECT documentdb_api.create_user('{"createUser":"newUser12", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Increase allowed users to 12
+SET documentdb.maxUserLimit TO 12;
+
+-- This should now succeed
+SELECT documentdb_api.create_user('{"createUser":"newUser12", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- This should fail
+SELECT documentdb_api.create_user('{"createUser":"newUser13", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Delete a user and try to create again, this should succeed
+SELECT documentdb_api.drop_user('{"dropUser":"newUser7", "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"newUser13", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Delete all users created so we don't break other tests that also create users
+SELECT documentdb_api.drop_user('{"dropUser":"newUser8", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"newUser9", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"newUser10", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"newUser11", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"newUser12", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"newUser13", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user2", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user4", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"test_user_injection_attack", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"readOnlyUser", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"adminUser", "$db":"admin"}');
+
+-- ***** Regression: readWriteAnyDatabase-only users must count toward the user limit *****
+-- The user count previously only considered members of the admin and read-only
+-- roles, so a user granted only readWriteAnyDatabase was never counted and could
+-- bypass maxUserLimit. All users created above have been dropped, so the
+-- starting user count here is zero.
+
+-- Allow exactly two users.
+SET documentdb.maxUserLimit TO 2;
+
+-- These users are granted readWriteAnyDatabase on its own, which requires the flag.
+SET documentdb.enable_readwrite_any_database_role_enforcement TO ON;
+
+-- Two users granted only readWriteAnyDatabase succeed.
+SELECT documentdb_api.create_user('{"createUser":"rwLimitUser1", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"rwLimitUser2", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- A third read-write user is rejected: read-write users count toward the limit.
+SELECT documentdb_api.create_user('{"createUser":"rwLimitUser3", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- A read-only user is likewise rejected once the limit is reached.
+SELECT documentdb_api.create_user('{"createUser":"rwLimitUser4", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Dropping a read-write user frees a slot, confirming it was counted.
+SELECT documentdb_api.drop_user('{"dropUser":"rwLimitUser1", "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"rwLimitUser3", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Cleanup
+SELECT documentdb_api.drop_user('{"dropUser":"rwLimitUser2", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"rwLimitUser3", "$db":"admin"}');
+SET documentdb.maxUserLimit TO 500;
+RESET documentdb.enable_readwrite_any_database_role_enforcement;
+
+-- ***** Role membership limit for createUser *****
+-- The minimum limit allows each user to receive one role. It limits roles per
+-- user, not the number of users that may share the same parent role.
+SET documentdb.max_roles_per_role TO 1;
+SELECT documentdb_api.create_user('{"createUser":"membershipLimitUser1", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"membershipLimitUser2", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"membershipLimitUser1", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"membershipLimitUser2", "$db":"admin"}');
+RESET documentdb.max_roles_per_role;
+
+-- ***** Role-combination gating for createUser *****
+-- Only the exact accepted built-in role combinations map to a PG role. Any
+-- other combination is rejected rather than silently reduced to one role.
+
+-- Case 1: specifying all three built-in roles is not an accepted combination and is rejected.
+SELECT documentdb_api.create_user('{"createUser":"gatingUserAllBuiltin", "pwd":"test_password", "roles":[{"role":"clusterAdmin","db":"admin"},{"role":"readWriteAnyDatabase","db":"admin"},{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Case 2: readWriteAnyDatabase + readAnyDatabase is not an accepted combination and is rejected.
+SELECT documentdb_api.create_user('{"createUser":"gatingUserRwRo", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"},{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Case 3: the accepted clusterAdmin + readWriteAnyDatabase combination still succeeds.
+SELECT documentdb_api.create_user('{"createUser":"gatingUserAdmin", "pwd":"test_password", "roles":[{"role":"clusterAdmin","db":"admin"},{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Case 4: readWriteAnyDatabase on its own remains unavailable while the
+-- enforcement feature is disabled.
+SET documentdb.enable_readwrite_any_database_role_enforcement TO OFF;
+SELECT documentdb_api.create_user('{"createUser":"gatingUserRwOnly", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Case 5: enabling enforcement permits standalone readWriteAnyDatabase.
+SET documentdb.enable_readwrite_any_database_role_enforcement TO ON;
+SELECT documentdb_api.create_user('{"createUser":"gatingUserRwOnly", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT pg_has_role(
+    'gatingUserRwOnly',
+    'documentdb_rbac_readwrite_anydb_role',
+    'MEMBER');
+SELECT documentdb_api.create_collection('gating_user_db', 'gating_user_collection');
+SET ROLE "gatingUserRwOnly";
+SELECT documentdb_api.insert_one(
+    'gating_user_db',
+    'gating_user_collection',
+    '{"_id":1,"value":"standalone"}');
+SELECT documentdb_api.count_query(
+    'gating_user_db',
+    '{"count":"gating_user_collection","query":{"value":"standalone"}}');
+RESET ROLE;
+
+-- Case 6: clusterAdmin on its own stays rejected.
+SELECT documentdb_api.create_user('{"createUser":"gatingUserClusterOnly", "pwd":"test_password", "roles":[{"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
+
+-- Cleanup the users created by the accepted cases.
+SELECT documentdb_api.drop_user('{"dropUser":"gatingUserAdmin", "$db":"admin"}');
+SELECT documentdb_api.drop_user('{"dropUser":"gatingUserRwOnly", "$db":"admin"}');
+RESET documentdb.enable_readwrite_any_database_role_enforcement;
+
+-- ***** Granting a custom role via createUser *****
+-- A custom role created through createRole can be granted to a user, provided
+-- the role name is not reserved and the role is not a login role.
+SET documentdb.enableRoleCrud TO ON;
+
+-- Create the custom role, which succeeds.
+SELECT documentdb_api.create_role('{"createRole":"customUserRole", "roles":["readAnyDatabase"], "privileges":[], "$db":"admin"}');
+
+-- Granting the custom role to a new user succeeds.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser", "pwd":"test_password", "roles":[{"role":"customUserRole","db":"admin"}], "$db":"admin"}');
+
+-- Combining the custom role with a built-in role is rejected: a user resolves
+-- to exactly one role.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser2", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"},{"role":"customUserRole","db":"admin"}], "$db":"admin"}');
+
+-- Same input with readWriteAnyDatabase is rejected because a user resolves to
+-- exactly one role.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser2", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"},{"role":"customUserRole","db":"admin"}], "$db":"admin"}');
+
+-- Specifying more than one custom role is rejected.
+SELECT documentdb_api.create_role('{"createRole":"customUserRole2", "roles":["readAnyDatabase"], "privileges":[], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser2", "pwd":"test_password", "roles":[{"role":"customUserRole","db":"admin"},{"role":"customUserRole2","db":"admin"}], "$db":"admin"}');
+
+-- A role that does not exist is still rejected.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser2", "pwd":"test_password", "roles":[{"role":"noSuchRole","db":"admin"}], "$db":"admin"}');
+
+-- Another user may not be granted as if it were a role, since users are login
+-- roles. This prevents one user from inheriting another user's privileges.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser3", "pwd":"test_password", "roles":[{"role":"customRoleUser","db":"admin"}], "$db":"admin"}');
+
+-- Reserved role names are rejected even though they exist.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser3", "pwd":"test_password", "roles":[{"role":"documentdb_readonly_role","db":"admin"}], "$db":"admin"}');
+
+-- PostgreSQL predefined roles are not custom roles even though they cannot log
+-- in, so they may not be granted through createUser.
+SELECT documentdb_api.create_user('{"createUser":"customRoleUser3", "pwd":"test_password", "roles":[{"role":"pg_read_all_data","db":"admin"}], "$db":"admin"}');
+
+-- Verify the membership was actually created and usersInfo reports the
+-- directly assigned custom role.
+SELECT pg_has_role('customRoleUser', 'customUserRole', 'MEMBER');
+SELECT documentdb_api.users_info('{"usersInfo":"customRoleUser", "$db":"admin"}');
+SELECT documentdb_core.bson_to_json_string(
+        documentdb_api.users_info('{"usersInfo":1, "$db":"admin"}'))::text
+    LIKE '%"role" : "customUserRole"%' AS custom_role_reported;
+
+-- An admin querying another user receives custom roles through system.users.
+CREATE ROLE customRoleAdminReader LOGIN;
+GRANT documentdb_admin_role TO customRoleAdminReader;
+SET ROLE customRoleAdminReader;
+SELECT documentdb_core.bson_to_json_string(
+        documentdb_api.users_info('{"usersInfo":"customRoleUser", "$db":"admin"}'))::text
+    LIKE '%"role" : "customUserRole"%' AS other_user_custom_role_reported \gset
+\echo :other_user_custom_role_reported
+RESET ROLE;
+REVOKE documentdb_admin_role FROM customRoleAdminReader;
+DROP ROLE customRoleAdminReader;
+
+-- system.users is the authoritative source for non-admin custom-role output.
+SET ROLE "customRoleUser";
+SELECT document
+FROM documentdb_api_catalog.bson_aggregation_find(
+        'admin', '{"find":"system.users"}');
+SELECT documentdb_api.users_info(
+        '{"usersInfo":"customRoleUser", "$db":"admin"}') AS custom_users_info \gset
+SELECT :'custom_users_info' LIKE '%"role" : "customUserRole"%'
+    AS custom_role_reported_by_users_info;
+SELECT documentdb_api.connection_status(
+        '{"connectionStatus":1, "$db":"admin"}') AS custom_connection_status \gset
+SELECT :'custom_connection_status' LIKE '%"role" : "customUserRole"%'
+    AS custom_role_reported_by_connection_status;
+RESET ROLE;
+
+-- Cleanup
+SELECT documentdb_api.drop_user('{"dropUser":"customRoleUser", "$db":"admin"}');
+SELECT documentdb_api.drop_role('{"dropRole":"customUserRole", "$db":"admin"}');
+SELECT documentdb_api.drop_role('{"dropRole":"customUserRole2", "$db":"admin"}');
+RESET documentdb.enableRoleCrud;
+
+-- Reset the feature flag for db admin requirement
+RESET documentdb.enableUsersAdminDBCheck;
+
+-- Unit test for IS_BUILTIN_ROLE, IS_CUSTOM_RBAC_ROLE, IS_SYSTEM_LOGIN_ROLE, and IS_NATIVE_BUILTIN_ROLE macros
+CREATE OR REPLACE FUNCTION documentdb_test_helpers.test_is_reserved_role_name(text)
+RETURNS bool
+LANGUAGE C AS 'pg_documentdb', $$test_is_reserved_internal_role_name$$;
+
+-- IS_BUILTIN_ROLE: all builtin roles should be reserved
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_admin_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_cluster_admin_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_readonly_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_readwrite_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_root_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_user_admin_role');
+
+-- IS_CUSTOM_RBAC_ROLE: all custom RBAC roles should be reserved
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_api_find_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_api_insert_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_api_remove_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_api_update_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_api_access_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_baseline_read_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_baseline_write_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_readwrite_anydb_role');
+
+-- IS_SYSTEM_LOGIN_ROLE: system login roles should be reserved
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_bg_worker_role');
+
+-- Negative cases: normal usernames should NOT be reserved
+SELECT documentdb_test_helpers.test_is_reserved_role_name('normal_user');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('admin');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_some_other_thing');
+
+-- dropUser with IS_BUILTIN_ROLE name
+SELECT documentdb_api.drop_user('{"dropUser":"documentdb_readonly_role", "$db":"admin"}');
+-- updateUser with IS_BUILTIN_ROLE name
+SELECT documentdb_api.update_user('{"updateUser":"documentdb_readonly_role", "pwd":"New$123Pass", "$db":"admin"}');
+-- usersInfo with a reserved name should still work (read-only, no blocking)
+SELECT documentdb_api.users_info('{"usersInfo":"documentdb_readonly_role", "$db":"admin"}');
+
+DROP FUNCTION documentdb_test_helpers.test_is_reserved_role_name(text);
+-- A role that a user merely created must not be reported as a role the user holds.
+-- PostgreSQL 16 and later records a membership for the role that runs CREATE ROLE
+-- carrying ADMIN OPTION but neither INHERIT nor SET, so it confers none of the new
+-- role's privileges. connectionStatus resolves the caller's role by picking the
+-- first membership in name order, so such a membership on a name that sorts early
+-- would otherwise displace the role the user actually holds.
+SET documentdb.enableRoleCrud TO ON;
+SET documentdb.enableRolesAdminDBCheck TO ON;
+
+CREATE ROLE "connStatusRoleCreator" LOGIN CREATEROLE;
+GRANT documentdb_admin_role TO "connStatusRoleCreator";
+GRANT SELECT ON documentdb_api_catalog.roles TO "connStatusRoleCreator";
+
+-- Baseline: the creator reports readWriteAnyDatabase and clusterAdmin.
+SET ROLE "connStatusRoleCreator";
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "$db":"admin"}');
+
+-- aaaConnStatusCreatedRole sorts before documentdb_admin_role, so an unfiltered
+-- membership would win the ordering and blank out the reported roles.
+SELECT documentdb_api.create_role(
+    '{"createRole":"aaaConnStatusCreatedRole", "roles":[], "privileges":[], "$db":"admin"}');
+
+-- The reported roles must be identical to the baseline above.
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "$db":"admin"}');
+RESET ROLE;
+
+SELECT documentdb_api.drop_role('{"dropRole":"aaaConnStatusCreatedRole", "$db":"admin"}');
+REVOKE SELECT ON documentdb_api_catalog.roles FROM "connStatusRoleCreator";
+REVOKE documentdb_admin_role FROM "connStatusRoleCreator";
+DROP ROLE "connStatusRoleCreator";
+
+-- Positive control: a membership granted WITH ADMIN OPTION does confer the role,
+-- so it must still be reported. Filtering on ADMIN OPTION alone would wrongly
+-- hide it, which is why the filter tests INHERIT and SET instead.
+CREATE ROLE "connStatusAdminOptionUser" LOGIN;
+GRANT documentdb_readonly_role TO "connStatusAdminOptionUser" WITH ADMIN OPTION;
+SET ROLE "connStatusAdminOptionUser";
+SELECT documentdb_api.connection_status('{"connectionStatus": 1, "$db":"admin"}');
+RESET ROLE;
+REVOKE documentdb_readonly_role FROM "connStatusAdminOptionUser";
+DROP ROLE "connStatusAdminOptionUser";
+
+RESET documentdb.enableRoleCrud;
+RESET documentdb.enableRolesAdminDBCheck;
+
+-- dropUser and updateUser must reject user names of NAMEDATALEN (64) bytes or more before
+-- PostgreSQL truncates them to 63 bytes, so a longer name cannot act on an existing user whose
+-- name is its 63-byte prefix.
+SET documentdb.enableUsersAdminDBCheck TO ON;
+SELECT documentdb_api.create_user('{"createUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+CREATE TEMP TABLE long_user_password_before AS SELECT rolpassword FROM pg_authid WHERE rolname = 'uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu';
+
+SET documentdb.enableUsernamePasswordConstraints TO ON;
+SELECT documentdb_api.drop_user('{"dropUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "pwd":"new_password", "$db":"admin"}');
+
+SET documentdb.enableUsernamePasswordConstraints TO OFF;
+SELECT documentdb_api.drop_user('{"dropUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "pwd":"new_password", "$db":"admin"}');
+RESET documentdb.enableUsernamePasswordConstraints;
+
+-- The limit is in bytes: 32 two-byte characters are 64 bytes and are rejected too.
+SELECT documentdb_api.drop_user('{"dropUser":"éééééééééééééééééééééééééééééééé", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"éééééééééééééééééééééééééééééééé", "pwd":"new_password", "$db":"admin"}');
+
+-- The 63-byte user still exists with its original password, and its exact name still works.
+SELECT rolname FROM pg_roles WHERE rolname = 'uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu';
+SELECT a.rolpassword = b.rolpassword AS password_unchanged FROM pg_authid a, long_user_password_before b WHERE a.rolname = 'uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu';
+SELECT documentdb_api.drop_user('{"dropUser":"uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "$db":"admin"}');
+SELECT count(*) FROM pg_roles WHERE rolname LIKE 'uuuuuuuuuu%';
+DROP TABLE long_user_password_before;
+RESET documentdb.enableUsersAdminDBCheck;

@@ -1,0 +1,173 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * documentdb_gateway_core/src/testing/dynamic_configuration.rs
+ *
+ * Shared dynamic-configuration helpers for unit tests.
+ *
+ *-------------------------------------------------------------------------
+ */
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use bson::{rawbson, RawBson};
+
+use crate::configuration::{
+    DynamicConfiguration, CONNECTION_GRACEFUL_CLOSURE_INTERVAL_SEC_KEY,
+    ENABLE_GRACEFUL_CLOSURE_ON_CERT_ROTATION_KEY, MAX_REQUEST_TIMEOUT_DEFAULT_SEC,
+    MAX_REQUEST_TIMEOUT_SEC_KEY, SOCKET_CONNECTION_IDLE_TIMEOUT_DEFAULT_SECS,
+    SOCKET_CONNECTION_IDLE_TIMEOUT_KEY, TRANSACTION_TIMEOUT_DEFAULT_SEC,
+    TRANSACTION_TIMEOUT_SEC_KEY,
+};
+
+const UNSET_U64: u64 = u64::MAX;
+
+#[derive(Debug)]
+pub struct TestDynamicConfiguration {
+    send_shutdown_responses: AtomicBool,
+    allow_transaction_snapshot: AtomicBool,
+    enable_role_crud: AtomicBool,
+    socket_connection_idle_timeout_sec: AtomicU64,
+    enable_graceful_closure_on_cert_rotation: AtomicBool,
+    connection_graceful_closure_interval_sec: AtomicU64,
+}
+
+impl Default for TestDynamicConfiguration {
+    fn default() -> Self {
+        Self {
+            send_shutdown_responses: AtomicBool::new(false),
+            allow_transaction_snapshot: AtomicBool::new(false),
+            enable_role_crud: AtomicBool::new(false),
+            socket_connection_idle_timeout_sec: AtomicU64::new(UNSET_U64),
+            enable_graceful_closure_on_cert_rotation: AtomicBool::new(false),
+            connection_graceful_closure_interval_sec: AtomicU64::new(UNSET_U64),
+        }
+    }
+}
+
+impl TestDynamicConfiguration {
+    pub fn set_send_shutdown_responses(&self, value: bool) {
+        self.send_shutdown_responses.store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_enable_role_crud(&self, value: bool) {
+        self.enable_role_crud.store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_socket_connection_idle_timeout_sec(&self, value: u64) {
+        self.socket_connection_idle_timeout_sec
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_enable_graceful_closure_on_cert_rotation(&self, value: bool) {
+        self.enable_graceful_closure_on_cert_rotation
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_connection_graceful_closure_interval_sec(&self, value: u64) {
+        self.connection_graceful_closure_interval_sec
+            .store(value, Ordering::Relaxed);
+    }
+}
+
+impl DynamicConfiguration for TestDynamicConfiguration {
+    fn get_str(&self, _: &str) -> Option<String> {
+        None
+    }
+
+    fn get_bool(&self, key: &str, default: bool) -> bool {
+        match key {
+            "enableRoleCrud" => self.enable_role_crud.load(Ordering::Relaxed),
+            "SendShutdownResponses" => self.send_shutdown_responses.load(Ordering::Relaxed),
+            ENABLE_GRACEFUL_CLOSURE_ON_CERT_ROTATION_KEY => self
+                .enable_graceful_closure_on_cert_rotation
+                .load(Ordering::Relaxed),
+            _ => default,
+        }
+    }
+
+    fn get_i32(&self, _: &str, default: i32) -> i32 {
+        default
+    }
+
+    fn get_u64(&self, key: &str, default: u64) -> u64 {
+        match key {
+            SOCKET_CONNECTION_IDLE_TIMEOUT_KEY => {
+                let value = self
+                    .socket_connection_idle_timeout_sec
+                    .load(Ordering::Relaxed);
+                if value == UNSET_U64 {
+                    default
+                } else {
+                    value
+                }
+            }
+            CONNECTION_GRACEFUL_CLOSURE_INTERVAL_SEC_KEY => {
+                let value = self
+                    .connection_graceful_closure_interval_sec
+                    .load(Ordering::Relaxed);
+                if value == UNSET_U64 {
+                    default
+                } else {
+                    value
+                }
+            }
+            _ => default,
+        }
+    }
+
+    fn equals_value(&self, _: &str, _: &str) -> bool {
+        false
+    }
+
+    fn topology(&self) -> RawBson {
+        rawbson!({})
+    }
+
+    fn max_connections(&self) -> usize {
+        16
+    }
+
+    fn allow_transaction_snapshot(&self) -> bool {
+        self.allow_transaction_snapshot.load(Ordering::Relaxed)
+    }
+
+    fn max_request_timeout_sec(&self) -> u64 {
+        self.get_u64(MAX_REQUEST_TIMEOUT_SEC_KEY, MAX_REQUEST_TIMEOUT_DEFAULT_SEC)
+    }
+
+    fn transaction_timeout_sec(&self) -> u64 {
+        self.get_u64(TRANSACTION_TIMEOUT_SEC_KEY, TRANSACTION_TIMEOUT_DEFAULT_SEC)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn enable_request_metrics(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_connection_idle_timeout_uses_default() {
+        let config = TestDynamicConfiguration::default();
+
+        assert_eq!(
+            config.socket_connection_idle_timeout_sec(),
+            SOCKET_CONNECTION_IDLE_TIMEOUT_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn socket_connection_idle_timeout_uses_override() {
+        let config = TestDynamicConfiguration::default();
+        config.set_socket_connection_idle_timeout_sec(42);
+
+        assert_eq!(config.socket_connection_idle_timeout_sec(), 42);
+    }
+}

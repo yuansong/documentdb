@@ -1,0 +1,243 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
+
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
+
+SET documentdb.next_collection_id TO 1300;
+SET documentdb.next_collection_index_id TO 1300;
+
+-- PG15 writes each accumulator batch directly to the index, so keep this
+-- fixture in one batch. Newer versions can globally sort with a smaller budget.
+SELECT CASE WHEN current_setting('server_version_num')::integer < 160000
+            THEN '64MB' ELSE '1MB' END AS reindex_work_mem \gset
+
+-- set the rum fillfactor to 100
+set documentdb_rum.rum_default_page_fill_factor to 100;
+
+-- now create an empty index.
+SELECT documentdb_api_internal.create_indexes_non_concurrently('filltest',
+    '{ "createIndexes": "fillcoll1", "indexes": [ { "key": { "c": 1, "a": 1 }, "name": "a_1" }, { "key": { "c": 1, "b": 1 }, "name": "b_1" } ] }');
+
+-- now insert 2000 docs into the collection. do it such that "a" is consistently monotonically increasing, and "b" is consistently decreasing.
+SELECT COUNT(documentdb_api.insert_one('filltest', 'fillcoll1', bson_build_document('_id', i, 'a', i, 'b', 2000 - i, 'c', repeat('a', 1024)))) FROM generate_series(1, 2000) i;
+
+\d documentdb_data.documents_1301
+
+VACUUM (FREEZE ON, INDEX_CLEANUP ON) documentdb_data.documents_1301;
+
+-- check the fillfactor of the index pages. "a_1" should be ~100, "b_1" should be ~50% since most of the inserts would be into internal pages.
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1302', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1302', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 115 and 125 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1303', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1303', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+-- reindexing fixes it since serial build will do a sort and insert in order when fill factor is set.
+set maintenance_work_mem to :'reindex_work_mem';
+REINDEX INDEX documentdb_data.documents_rum_index_1303;
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1303', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1303', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 115 and 125 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+-- however if the fill factor doesn't get set, reindex will lose it.
+set documentdb_rum.enable_page_fill_factor to off;
+REINDEX INDEX documentdb_data.documents_rum_index_1303;
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1303', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1303', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+reset documentdb_rum.enable_page_fill_factor;
+
+-- repeat with 50% fill factor
+set documentdb_rum.rum_default_page_fill_factor to 50;
+TRUNCATE documentdb_data.documents_1301;
+SELECT COUNT(documentdb_api.insert_one('filltest', 'fillcoll1', bson_build_document('_id', i, 'a', i, 'b', 2000 - i, 'c', repeat('a', 1024)))) FROM generate_series(1, 2000) i;
+
+VACUUM (FREEZE ON, INDEX_CLEANUP ON) documentdb_data.documents_1301;
+
+-- check the fillfactor of the index pages. "a_1" should be ~50%, "b_1" should be ~50% since most of the inserts would be into non-tail pages.
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1302', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1302', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1303', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1303', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+-- reindexing recovers fill factor here since serial build will restore the sort.
+set maintenance_work_mem to :'reindex_work_mem';
+REINDEX INDEX documentdb_data.documents_rum_index_1303;
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1303', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1303', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+-- drop and create a fresh index (fresh indexes should also respect the fillfactor)
+set documentdb_rum.rum_default_page_fill_factor to 100;
+CALL documentdb_api.drop_indexes('filltest', '{ "dropIndexes": "fillcoll1", "index": "a_1" }');
+CALL documentdb_api.drop_indexes('filltest', '{ "dropIndexes": "fillcoll1", "index": "b_1" }');
+
+reset maintenance_work_mem;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('filltest',
+    '{ "createIndexes": "fillcoll1", "indexes": [ { "key": { "c": 1, "a": 1 }, "name": "a_1" }, { "key": { "c": 1, "b": 1 }, "name": "b_1" } ] }', TRUE);
+
+-- check the fill factor
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1304', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1304', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 115 and 125 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1305', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1305', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 115 and 125 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+
+-- test setting fillfactor via index options
+
+-- set to invalid value (should fail)
+ALTER INDEX documentdb_data.documents_rum_index_1304 SET (fill_factor = 5);
+ALTER INDEX documentdb_data.documents_rum_index_1304 SET (fill_factor = 50);
+REINDEX INDEX documentdb_data.documents_rum_index_1304;
+
+-- check the fill factor
+WITH r1 AS (
+    SELECT documentdb_api_internal.documentdb_rum_get_meta_page_info(public.get_raw_page('documentdb_data.documents_rum_index_1304', 0))->>'totalPages' AS total_pages),
+r2 AS (SELECT documentdb_api_internal.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_1304', i)) AS page_stats FROM generate_series(1, (SELECT total_pages::int4 FROM r1) - 1) i)
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY (page_stats->>'nEntries')::int4) BETWEEN 55 AND 65 FROM r2 WHERE page_stats->>'flagsStr' = 'LEAF';
+
+-- Large unique terms can make the requested split point exceed the physical
+-- page capacity. Cover both the default and maximum fill factors.
+SET documentdb.enable_large_unique_index_keys TO on;
+SELECT string_agg(md5(i::text), '_' ORDER BY i) AS split_long_1
+FROM generate_series(1, 100) i \gset
+SELECT string_agg(md5(i::text), '_' ORDER BY i) AS split_long_2
+FROM generate_series(101, 200) i \gset
+SELECT string_agg(md5(i::text), '_' ORDER BY i) AS split_long_3
+FROM generate_series(201, 300) i \gset
+SET documentdb_rum.rum_default_page_fill_factor TO 90;
+
+SELECT documentdb_api.create_collection('filltest', 'unique_split_90');
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    '{ "_id": "seed", "e": true }');
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'filltest',
+    '{ "createIndexes": "unique_split_90", "indexes": [
+        { "key": { "e": 1 }, "name": "e_1", "unique": true, "sparse": true }
+    ] }',
+    TRUE);
+
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    FORMAT('{ "_id": 1, "e": "%s", "f": 1 }', :'split_long_1')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    FORMAT('{ "_id": 2, "e": [ "%s", "%s" ], "f": 1 }',
+           :'split_long_1', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    FORMAT('{ "_id": 3, "e": [ "%s-withsuffix", "%s" ], "f": 1 }',
+           :'split_long_1', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    FORMAT('{ "_id": 4, "e": "%s-withsuffix", "f": 1 }', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_90',
+    FORMAT('{ "_id": 101, "e": "%s_%s", "f": 1 }',
+           md5('1'), :'split_long_1')::bson);
+
+SET documentdb_rum.rum_default_page_fill_factor TO 100;
+
+SELECT documentdb_api.create_collection('filltest', 'unique_split_100');
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    '{ "_id": "seed", "e": true }');
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'filltest',
+    '{ "createIndexes": "unique_split_100", "indexes": [
+        { "key": { "e": 1 }, "name": "e_1", "unique": true, "sparse": true }
+    ] }',
+    TRUE);
+
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    FORMAT('{ "_id": 1, "e": "%s", "f": 1 }', :'split_long_1')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    FORMAT('{ "_id": 2, "e": [ "%s", "%s" ], "f": 1 }',
+           :'split_long_1', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    FORMAT('{ "_id": 3, "e": [ "%s-withsuffix", "%s" ], "f": 1 }',
+           :'split_long_1', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    FORMAT('{ "_id": 4, "e": "%s-withsuffix", "f": 1 }', :'split_long_2')::bson);
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_100',
+    FORMAT('{ "_id": 101, "e": "%s_%s", "f": 1 }',
+           md5('1'), :'split_long_1')::bson);
+
+-- A low fill factor must also leave enough space for every tuple assigned to
+-- the right page during a rightmost leaf split.
+SET documentdb_rum.rum_default_page_fill_factor TO 10;
+
+SELECT documentdb_api.create_collection('filltest', 'unique_split_10');
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'filltest',
+    '{ "createIndexes": "unique_split_10", "indexes": [
+        { "key": { "e": 1 }, "name": "e_1", "unique": true, "sparse": true }
+    ] }',
+    TRUE);
+
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 1, 'e', 'a' || repeat('a', 350)));
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 2, 'e', 'b' || repeat('b', 390)));
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 3, 'e', 'c' || repeat('c', 50)));
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 4, 'e', 'd_' || :'split_long_1'));
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 5, 'e', 'e_' || :'split_long_2'));
+SELECT documentdb_api.insert_one(
+    'filltest',
+    'unique_split_10',
+    bson_build_document('_id', 6, 'e', 'f_' || :'split_long_3'));
+
+SELECT COUNT(*) FROM documentdb_api.collection('filltest', 'unique_split_10');
+
+RESET documentdb_rum.rum_default_page_fill_factor;
+RESET documentdb.enable_large_unique_index_keys;

@@ -1,0 +1,2828 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * src/commands/users.c
+ *
+ * Implementation of user CRUD functions.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "utils/documentdb_errors.h"
+#include "utils/query_utils.h"
+#include "utils/documentdb_errors.h"
+#include "commands/commands_common.h"
+#include "commands/parse_error.h"
+#include "utils/feature_counter.h"
+#include "libpq/scram.h"
+#include "metadata/metadata_cache.h"
+#include <common/saslprep.h>
+#include <common/scram-common.h>
+#include "api_hooks_def.h"
+#include "users.h"
+#include "aggregation/aggregation_commands.h"
+#include "roles.h"
+#include "api_hooks.h"
+#include "utils/hashset_utils.h"
+#include "miscadmin.h"
+#include "utils/list_utils.h"
+#include "utils/string_view.h"
+#include "utils/role_utils.h"
+#include "utils/version_utils.h"
+
+#define SCRAM_MAX_SALT_LEN 64
+
+/*
+ * PostgreSQL 16 and later automatically records a role membership for the role
+ * that runs CREATE ROLE when that role is not a superuser. The membership
+ * carries ADMIN OPTION but neither INHERIT nor SET, so it only lets the creator
+ * administer the new role and confers none of its privileges. Reporting it
+ * would make every role an administrator defines look like a role they hold, so
+ * the user listings below count a membership only when the member actually has
+ * the privileges of the role.
+ *
+ * pg_has_role answers that question directly, and is preferred over testing the
+ * catalog columns: it does not confuse the automatic membership with an
+ * explicit GRANT ... WITH ADMIN OPTION, which sets the same ADMIN OPTION flag
+ * but does confer the role.
+ *
+ * A membership confers the role when its privileges are inherited, which
+ * pg_has_role reports as USAGE, or when the member may assume the role with
+ * SET ROLE, which it reports as SET. Testing both covers a grant made WITH
+ * INHERIT FALSE, SET TRUE, which does confer the role. The automatic creator
+ * membership has neither option, so it remains excluded.
+ *
+ * PostgreSQL 15 records no automatic membership, so every recorded membership
+ * is an explicit grant that confers the role. It also has no SET privilege
+ * string, which makes a grant to a NOINHERIT member indistinguishable from one
+ * that confers nothing. Testing USAGE there would hide those memberships
+ * without excluding anything, so PostgreSQL 15 keeps the plain membership test.
+ */
+#if PG_VERSION_NUM >= 160000
+#define MEMBERSHIP_CONFERS_ROLE_CLAUSE \
+	" AND (pg_has_role(child.rolname, parent.rolname, 'USAGE') " \
+	" OR pg_has_role(child.rolname, parent.rolname, 'SET')) "
+#else
+#define MEMBERSHIP_CONFERS_ROLE_CLAUSE \
+	" AND pg_has_role(child.rolname, parent.rolname, 'MEMBER') "
+#endif
+
+/* GUC to enable user crud operations */
+extern bool EnableUserCrud;
+
+/* GUC that controls the default salt length*/
+extern int ScramDefaultSaltLen;
+
+/* GUC that controls the max number of users allowed*/
+extern int MaxUserLimit;
+
+/* GUC that controls whether we use password validation*/
+extern bool EnableUsernamePasswordConstraints;
+
+/* GUC that controls whether the usersInfo command returns privileges*/
+extern bool EnableUsersInfoPrivileges;
+
+/* GUC that controls whether native authentication is enabled*/
+extern bool IsNativeAuthEnabled;
+
+/* GUC that controls whether the DB admin check is enabled*/
+extern bool EnableUsersAdminDBCheck;
+
+PG_FUNCTION_INFO_V1(documentdb_extension_create_user);
+PG_FUNCTION_INFO_V1(documentdb_extension_drop_user);
+PG_FUNCTION_INFO_V1(documentdb_extension_update_user);
+PG_FUNCTION_INFO_V1(documentdb_extension_get_users);
+PG_FUNCTION_INFO_V1(command_connection_status);
+PG_FUNCTION_INFO_V1(command_grant_roles_to_user);
+PG_FUNCTION_INFO_V1(command_revoke_roles_from_user);
+
+/* Flag enum of built-in roles; values are bitmask flags that can be OR'd together */
+enum DocumentDB_BuiltInRoles
+{
+	DocumentDB_Role_Invalid = 0x0,
+	DocumentDB_Role_Read_AnyDatabase = 0x1,
+	DocumentDB_Role_ReadWrite_AnyDatabase = 0x2,
+	DocumentDB_Role_Cluster_Admin = 0x4,
+};
+
+typedef struct
+{
+	/* "createUser" field */
+	const char *createUser;
+
+	/* "pwd" field */
+	const char *pwd;
+
+	/* "roles" field */
+	bson_value_t roles;
+
+	/* "identityProvider" field*/
+	bson_value_t identityProviderData;
+
+	/*
+	 * The single pg role that the input roles resolve to. Each accepted request
+	 * maps to exactly one pg role: a lone built-in role, the one accepted
+	 * two-role combination (readWriteAnyDatabase + clusterAdmin together map to
+	 * the admin role), or a single custom role. Any other combination is
+	 * rejected during validation, so this always holds one resolved pg role name.
+	 */
+	char *pgRole;
+
+	bool hasCustomRole;
+
+	/* principalType */
+	char *principalType;
+
+	/* has_identity_provider */
+	bool has_identity_provider;
+} CreateUserSpec;
+
+typedef struct
+{
+	/* "updateUser" field */
+	const char *updateUser;
+
+	/* "pwd" field */
+	const char *pwd;
+} UpdateUserSpec;
+
+typedef struct
+{
+	StringView user;
+	bool showAllUsers;
+	bool showPrivileges;
+} GetUserSpec;
+
+/*
+ * GrantRolesToUserSpec holds the parsed grantRolesToUser command parameters.
+ */
+typedef struct
+{
+	/* Name of the user receiving the roles */
+	const char *userName;
+
+	/* Set of role names to grant to the user */
+	HTAB *grantedRoles;
+} GrantRolesToUserSpec;
+
+/*
+ * RevokeRolesFromUserSpec holds the parsed revokeRolesFromUser command
+ * parameters.
+ */
+typedef struct
+{
+	/* Name of the user losing the roles */
+	const char *userName;
+
+	/* Set of role names to revoke from the user */
+	HTAB *revokedRoles;
+} RevokeRolesFromUserSpec;
+
+/*
+ * Hash entry structure for user roles.
+ */
+typedef struct UserRoleHashEntry
+{
+	char *user;
+	HTAB *roles;
+	bool isExternal;
+} UserRoleHashEntry;
+
+static void ParseCreateUserSpec(pgbson *createUserSpec, CreateUserSpec *spec);
+static void CreateNativeUser(const CreateUserSpec *createUserSpec);
+static char * ParseDropUserSpec(pgbson *dropSpec);
+static void DropNativeUser(const char *dropUser);
+static void ParseUpdateUserSpec(pgbson *updateSpec, UpdateUserSpec *spec);
+static Datum UpdateNativeUser(UpdateUserSpec *spec);
+static void ParseGetUserSpec(pgbson *getSpec, GetUserSpec *spec);
+static bool ParseConnectionStatusSpec(pgbson *connectionStatusSpec);
+
+static bool IsCallingUserExternal(void);
+static char * PrehashPassword(const char *password);
+static char * ValidateAndObtainUserRole(const bson_value_t *rolesDocument,
+										bool *hasCustomRole);
+static Datum GetSingleUserInfo(const char *userName, bool returnDocuments);
+static Datum GetAllUsersInfo(void);
+static void ParseUsersInfoDocument(const bson_value_t *usersInfoBson, GetUserSpec *spec);
+static void WriteSingleUserDocument(UserRoleHashEntry *userEntry, bool showPrivileges,
+									pgbson_array_writer *userArrayWriter);
+static void WriteMultipleRoles(HTAB *rolesTable,
+							   pgbson_array_writer *roleArrayWriter);
+static void WriteBuiltInRoles(const char *parentRole,
+							  pgbson_array_writer *roleArrayWriter);
+static HTAB * BuildUserRoleEntryTable(Datum *userDatums, int userCount,
+									  bool queryAllUsers);
+static void AddCustomRolesFromUsersTable(HTAB *userRolesTable, bool queryAllUsers);
+static pgbson * UsersTableQuerySpec(HTAB *userRolesTable, bool queryAllUsers);
+static void ParseUserTableResponse(HTAB *userRolesTable, Datum responseDatum);
+static UserRoleHashEntry * FindUserRoleEntry(HTAB *userRolesTable,
+											 const char *userName);
+static UserRoleHashEntry * FindOrCreateUserRoleEntry(HTAB *userRolesTable,
+													 const char *userName);
+static void AddRoleToUserEntry(UserRoleHashEntry *userEntry, const char *roleName);
+static void FreeUserRoleEntryTable(HTAB *userRolesTable);
+static HTAB * CreateUserEntryHashSet(void);
+static uint32 UserHashEntryHashFunc(const void *obj, size_t objsize);
+static int UserHashEntryCompareFunc(const void *obj1, const void *obj2,
+									Size objsize);
+static void ParseGrantRolesToUserSpec(pgbson *grantRolesBson,
+									  GrantRolesToUserSpec *grantRolesSpec);
+static void EnsureUserExists(const char *userName);
+static void ParseRevokeRolesFromUserSpec(pgbson *revokeRolesBson,
+										 RevokeRolesFromUserSpec *revokeRolesSpec);
+
+/*
+ * Parses a connectionStatus spec, executes the connectionStatus command, and returns the result.
+ */
+Datum
+command_connection_status(PG_FUNCTION_ARGS)
+{
+	pgbson *connectionStatusSpec = PG_GETARG_PGBSON(0);
+
+	Datum response = connection_status(connectionStatusSpec);
+
+	PG_RETURN_DATUM(response);
+}
+
+
+/*
+ * documentdb_extension_create_user implements the
+ * core logic to create a user
+ */
+Datum
+documentdb_extension_create_user(PG_FUNCTION_ARGS)
+{
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("The CreateUser operation is currently unsupported."),
+						errdetail_log(
+							"The CreateUser operation is currently unsupported.")));
+	}
+
+	if (PG_ARGISNULL(0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg(
+							"'createUser', 'pwd' and 'roles' fields must be specified.")));
+	}
+
+	if (!IsMetadataCoordinator())
+	{
+		StringInfo createUserQuery = makeStringInfo();
+		appendStringInfo(createUserQuery,
+						 "SELECT %s.create_user(%s::%s.bson)",
+						 ApiSchemaNameV2,
+						 quote_literal_cstr(PgbsonToHexadecimalString(PG_GETARG_PGBSON(
+																		  0))),
+						 CoreSchemaNameV2);
+		DistributedRunCommandResult result = RunCommandOnMetadataCoordinator(
+			createUserQuery->data);
+
+		if (!result.success)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Internal error creating user in metadata coordinator %s",
+								text_to_cstring(result.response)),
+							errdetail_log(
+								"Internal error creating user in metadata coordinator via distributed call %s",
+								text_to_cstring(result.response))));
+		}
+
+		pgbson_writer finalWriter;
+		PgbsonWriterInit(&finalWriter);
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+	}
+
+	/*
+	 * Verify that we have not yet hit the limit of users allowed. A user is any
+	 * login role that has been granted a role, excluding the internal system
+	 * login roles. We intentionally do not restrict the parent role to a subset
+	 * of the built-in roles here: previously only members of the admin and
+	 * read-only roles were counted, so a user granted only readWriteAnyDatabase
+	 * bypassed the limit entirely.
+	 */
+	const char *cmdStr = FormatSqlQuery(
+		"SELECT COUNT(DISTINCT child.oid) "
+		"FROM pg_roles parent "
+		"JOIN pg_auth_members am ON parent.oid = am.roleid "
+		"JOIN pg_roles child ON am.member = child.oid "
+		"WHERE child.rolcanlogin = true "
+		"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
+		"  AND NOT pg_catalog.starts_with(child.rolname, '%s');",
+		ApiAdminRole, ApiAdminRoleV2, ApiAdminRoleV3,
+		ApiBgWorkerRole, ApiBgWorkerRoleV3,
+		ApiReplicationRole, ApiSettingsManagerRole,
+		API_RBAC_API_ROLE_PREFIX);
+
+	bool readOnly = true;
+	bool isNull = false;
+	Datum userCountDatum = ExtensionExecuteQueryViaSPI(cmdStr, readOnly,
+													   SPI_OK_SELECT, &isNull);
+	int userCount = 0;
+
+	if (!isNull)
+	{
+		userCount = DatumGetInt32(userCountDatum);
+	}
+	else
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Failed to get current user count.")));
+	}
+
+	if (userCount >= MaxUserLimit)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_USERCOUNTLIMITEXCEEDED),
+						errmsg("Exceeded the limit of %d user roles.", MaxUserLimit)));
+	}
+
+	pgbson *createUserBson = PG_GETARG_PGBSON(0);
+	CreateUserSpec createUserSpec = { 0 };
+	ParseCreateUserSpec(createUserBson, &createUserSpec);
+
+	if (createUserSpec.has_identity_provider)
+	{
+		if (!CreateUserWithExternalIdentityProvider(createUserSpec.createUser,
+													createUserSpec.pgRole,
+													createUserSpec.identityProviderData))
+		{
+			pgbson_writer finalWriter;
+			PgbsonWriterInit(&finalWriter);
+			PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 0);
+			PgbsonWriterAppendUtf8(&finalWriter, "errmsg", 6,
+								   "External identity providers are currently unsupported");
+			PgbsonWriterAppendInt32(&finalWriter, "code", 4, 115);
+			PgbsonWriterAppendUtf8(&finalWriter, "codeName", 8,
+								   "CommandNotSupported");
+			PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+		}
+	}
+	else
+	{
+		CreateNativeUser(&createUserSpec);
+	}
+
+	/* CreateUser only supports 1 role */
+	EnsureRoleMembershipLimits(createUserSpec.createUser, 1);
+
+	/* Grant pgRole to user created */
+	readOnly = false;
+	const char *queryGrant = psprintf("GRANT %s TO %s",
+									  quote_identifier(createUserSpec.pgRole),
+									  quote_identifier(createUserSpec.createUser));
+
+	ExtensionExecuteQueryViaSPI(queryGrant, readOnly, SPI_OK_UTILITY, &isNull);
+
+	/* Only add the Explicit grant if we're under DocDB V1.1 since that is now done via
+	 * the cluster-wide read role in later versions.
+	 */
+	if (strcmp(createUserSpec.pgRole, ApiReadOnlyRole) == 0 &&
+		!IsClusterVersionAtleast(DocDB_V0, 117, 3))
+	{
+		/* This is needed to grant ApiReadOnlyRole */
+		/* read access to all new and existing collections */
+		StringInfo grantReadOnlyPermissions = makeStringInfo();
+		resetStringInfo(grantReadOnlyPermissions);
+		appendStringInfo(grantReadOnlyPermissions,
+						 "GRANT pg_read_all_data TO %s",
+						 quote_identifier(createUserSpec.createUser));
+		readOnly = false;
+		isNull = false;
+		ExtensionExecuteQueryViaSPI(grantReadOnlyPermissions->data, readOnly,
+									SPI_OK_UTILITY,
+									&isNull);
+	}
+
+	if (createUserSpec.hasCustomRole)
+	{
+		ReportFeatureUsage(FEATURE_USER_CREATE_CUSTOM_ROLE);
+	}
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+}
+
+
+/*
+ * ParseCreateUserSpec parses the wire
+ * protocol message createUser() which creates a user
+ */
+static void
+ParseCreateUserSpec(pgbson *createSpec, CreateUserSpec *spec)
+{
+	bson_iter_t createIter;
+	PgbsonInitIterator(createSpec, &createIter);
+
+	bool userFound = false;
+	bool passwordFound = false;
+	bool rolesFound = false;
+	bool dbFound = false;
+	while (bson_iter_next(&createIter))
+	{
+		const char *key = bson_iter_key(&createIter);
+		if (strcmp(key, "createUser") == 0)
+		{
+			EnsureTopLevelFieldType(key, &createIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			spec->createUser = bson_iter_utf8(&createIter, &strLength);
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"'createUser' is a required field.")));
+			}
+
+			if (strlen(spec->createUser) != strLength)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"'createUser' field contains invalid UTF-8 characters.")));
+			}
+
+			if (strLength >= NAMEDATALEN)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The user name is too long. Try a user name shorter than %d characters.",
+									NAMEDATALEN)));
+			}
+
+			if (IsReservedRoleName(spec->createUser))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"Username is reserved, use a different username.")));
+			}
+
+			userFound = true;
+		}
+		else if (strcmp(key, "pwd") == 0)
+		{
+			EnsureTopLevelFieldType(key, &createIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			spec->pwd = bson_iter_utf8(&createIter, &strLength);
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The password field must not be left empty.")));
+			}
+
+			passwordFound = true;
+		}
+		else if (strcmp(key, "roles") == 0)
+		{
+			if (!BSON_ITER_HOLDS_ARRAY(&createIter))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The 'roles' attribute is required to be in an array format")));
+			}
+
+			spec->roles = *bson_iter_value(&createIter);
+
+			if (IsBsonValueEmptyDocument(&spec->roles))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The 'roles' field is mandatory.")));
+			}
+
+			/* Check if it's in the right format */
+			spec->pgRole = ValidateAndObtainUserRole(&spec->roles, &spec->hasCustomRole);
+			rolesFound = true;
+		}
+		else if (strcmp(key, "$db") == 0 && EnableUsersAdminDBCheck)
+		{
+			EnsureTopLevelFieldType(key, &createIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *db_name = bson_iter_utf8(&createIter, &strLength);
+
+			dbFound = true;
+			if (strcmp(db_name, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"CreateUser must be called from 'admin' database.")));
+			}
+		}
+		else if (strcmp(key, "customData") == 0)
+		{
+			const bson_value_t *customDataDocument = bson_iter_value(&createIter);
+			if (customDataDocument->value_type != BSON_TYPE_DOCUMENT)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						 errmsg(
+							 "The 'customData' parameter is required to be provided as a BSON document.")));
+			}
+
+			if (!IsBsonValueEmptyDocument(customDataDocument))
+			{
+				bson_iter_t customDataIterator;
+				BsonValueInitIterator(customDataDocument, &customDataIterator);
+				while (bson_iter_next(&customDataIterator))
+				{
+					const char *customDataKey = bson_iter_key(&customDataIterator);
+
+					if (strcmp(customDataKey, "IdentityProvider") == 0)
+					{
+						spec->identityProviderData = *bson_iter_value(
+							&customDataIterator);
+						spec->has_identity_provider = true;
+					}
+					else
+					{
+						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+										errmsg(
+											"The specified field in the custom data is not supported: '%s'.",
+											customDataKey)));
+					}
+				}
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("Unsupported field specified : '%s'.", key)));
+		}
+	}
+
+	if (!dbFound && EnableUsersAdminDBCheck)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (spec->has_identity_provider)
+	{
+		if (!userFound || !rolesFound)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"'createUser' and 'roles' are required fields.")));
+		}
+
+		if (passwordFound)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"Password is not allowed when using an external identity provider.")));
+		}
+	}
+	else
+	{
+		if (!userFound || !rolesFound || !passwordFound)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"'createUser', 'roles' and 'pwd' are required fields.")));
+		}
+
+		if (EnableUsernamePasswordConstraints && !IsPasswordValid(spec->createUser,
+																  spec->pwd))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("Invalid password, use a different password.")));
+		}
+	}
+}
+
+
+/*
+ * CreateNativeUser creates a native PostgreSQL login role for the user
+ */
+static void
+CreateNativeUser(const CreateUserSpec *createUserSpec)
+{
+	/*Verify that native authentication is enabled*/
+	if (!IsNativeAuthEnabled)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg(
+							"Native authentication is not enabled. Enable native authentication on this cluster to perform native user management operations.")));
+	}
+
+	ReportFeatureUsage(FEATURE_USER_CREATE);
+
+	/*Verify that the calling user is also native*/
+	if (IsCallingUserExternal())
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INSUFFICIENTPRIVILEGE),
+						errmsg(
+							"Only native users can create other native users. Authenticate as a built-in native administrative user to perform native user management operations.")));
+	}
+
+	StringInfo createUserInfo = makeStringInfo();
+	appendStringInfo(createUserInfo,
+					 "CREATE ROLE %s WITH LOGIN PASSWORD %s;",
+					 quote_identifier(createUserSpec->createUser),
+					 quote_literal_cstr(PrehashPassword(createUserSpec->pwd)));
+
+	bool readOnly = false;
+	bool isNull = false;
+	ExtensionExecuteQueryViaSPI(createUserInfo->data, readOnly, SPI_OK_UTILITY,
+								&isNull);
+}
+
+
+/*
+ * documentdb_extension_drop_user implements the
+ * core logic to drop a user
+ */
+Datum
+documentdb_extension_drop_user(PG_FUNCTION_ARGS)
+{
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("The DropUser operation is currently unsupported."),
+						errdetail_log(
+							"The DropUser operation is currently unsupported.")));
+	}
+
+	if (PG_ARGISNULL(0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The field 'dropUser' is mandatory.")));
+	}
+
+	if (!IsMetadataCoordinator())
+	{
+		StringInfo dropUserQuery = makeStringInfo();
+		appendStringInfo(dropUserQuery,
+						 "SELECT %s.drop_user(%s::%s.bson)",
+						 ApiSchemaNameV2,
+						 quote_literal_cstr(PgbsonToHexadecimalString(PG_GETARG_PGBSON(
+																		  0))),
+						 CoreSchemaNameV2);
+		DistributedRunCommandResult result = RunCommandOnMetadataCoordinator(
+			dropUserQuery->data);
+
+		if (!result.success)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Internal error dropping user in metadata coordinator %s",
+								text_to_cstring(result.response)),
+							errdetail_log(
+								"Internal error dropping user in metadata coordinator via distributed call %s",
+								text_to_cstring(result.response))));
+		}
+
+		pgbson_writer finalWriter;
+		PgbsonWriterInit(&finalWriter);
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+	}
+
+	pgbson *dropUserSpec = PG_GETARG_PGBSON(0);
+	char *dropUser = ParseDropUserSpec(dropUserSpec);
+
+	if (IsUserExternal(dropUser))
+	{
+		if (!DropUserWithExternalIdentityProvider(dropUser))
+		{
+			pgbson_writer finalWriter;
+			PgbsonWriterInit(&finalWriter);
+			PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 0);
+			PgbsonWriterAppendUtf8(&finalWriter, "errmsg", 6,
+								   "External identity providers are currently unsupported");
+			PgbsonWriterAppendInt32(&finalWriter, "code", 4, 115);
+			PgbsonWriterAppendUtf8(&finalWriter, "codeName", 8,
+								   "CommandNotSupported");
+			PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+		}
+	}
+	else
+	{
+		DropNativeUser(dropUser);
+	}
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+}
+
+
+/*
+ * ParseDropUserSpec parses the wire
+ * protocol message dropUser() which drops a user
+ */
+static char *
+ParseDropUserSpec(pgbson *dropSpec)
+{
+	bson_iter_t dropIter;
+	PgbsonInitIterator(dropSpec, &dropIter);
+
+	char *dropUser = NULL;
+	bool dbFound = false;
+	while (bson_iter_next(&dropIter))
+	{
+		const char *key = bson_iter_key(&dropIter);
+		if (strcmp(key, "dropUser") == 0)
+		{
+			EnsureTopLevelFieldType(key, &dropIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			dropUser = (char *) bson_iter_utf8(&dropIter, &strLength);
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The field 'dropUser' is mandatory.")));
+			}
+
+			/*
+			 * PostgreSQL truncates identifiers longer than NAMEDATALEN - 1 bytes, so an
+			 * overlong name could otherwise drop an existing user whose name is its prefix.
+			 */
+			if (strLength >= NAMEDATALEN)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The user name is too long. Try a user name shorter than %d characters.",
+									NAMEDATALEN)));
+			}
+
+			if (IsReservedRoleName(dropUser))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg("User '%s' is reserved and cannot be dropped.",
+									   dropUser)));
+			}
+		}
+		else if (strcmp(key, "$db") == 0 && EnableUsersAdminDBCheck)
+		{
+			EnsureTopLevelFieldType(key, &dropIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *db_name = bson_iter_utf8(&dropIter, &strLength);
+
+			dbFound = true;
+			if (strcmp(db_name, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"DropUser must be called from 'admin' database.")));
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("The specified field '%s' is not supported.", key)));
+		}
+	}
+
+	if (!dbFound && EnableUsersAdminDBCheck)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (dropUser == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The field 'dropUser' is mandatory.")));
+	}
+
+	return dropUser;
+}
+
+
+/*
+ * DropNativeUser drops a native PostgreSQL role for the user
+ */
+static void
+DropNativeUser(const char *dropUser)
+{
+	/*Verify that native authentication is enabled*/
+	if (!IsNativeAuthEnabled)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg(
+							"Native authentication is not enabled. Enable native authentication on this cluster to perform native user management operations.")));
+	}
+
+	ReportFeatureUsage(FEATURE_USER_DROP);
+
+	/*Verify that the calling user is also native*/
+	if (IsCallingUserExternal())
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INSUFFICIENTPRIVILEGE),
+						errmsg(
+							"Only native users can create other native users. Authenticate as a built-in native administrative user to perform native user management operations.")));
+	}
+
+	StringInfo dropUserInfo = makeStringInfo();
+	appendStringInfo(dropUserInfo, "DROP ROLE %s;", quote_identifier(dropUser));
+
+	bool readOnly = false;
+	bool isNull = false;
+	ExtensionExecuteQueryViaSPI(dropUserInfo->data, readOnly, SPI_OK_UTILITY,
+								&isNull);
+}
+
+
+/*
+ * documentdb_extension_update_user implements the
+ * core logic to update a user
+ */
+Datum
+documentdb_extension_update_user(PG_FUNCTION_ARGS)
+{
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("The UpdateUser command is currently unsupported."),
+						errdetail_log(
+							"The UpdateUser command is currently unsupported.")));
+	}
+
+	if (PG_ARGISNULL(0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'updateUser' and 'pwd' are required fields.")));
+	}
+
+	if (!IsMetadataCoordinator())
+	{
+		StringInfo updateUserQuery = makeStringInfo();
+		appendStringInfo(updateUserQuery,
+						 "SELECT %s.update_user(%s::%s.bson)",
+						 ApiSchemaNameV2,
+						 quote_literal_cstr(PgbsonToHexadecimalString(PG_GETARG_PGBSON(
+																		  0))),
+						 CoreSchemaNameV2);
+		DistributedRunCommandResult result = RunCommandOnMetadataCoordinator(
+			updateUserQuery->data);
+
+		if (!result.success)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Internal error updating user in metadata coordinator %s",
+								text_to_cstring(result.response)),
+							errdetail_log(
+								"Internal error updating user in metadata coordinator via distributed call %s",
+								text_to_cstring(result.response))));
+		}
+
+		pgbson_writer finalWriter;
+		PgbsonWriterInit(&finalWriter);
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+	}
+
+	pgbson *updateUserSpec = PG_GETARG_PGBSON(0);
+	UpdateUserSpec spec = { 0 };
+	ParseUpdateUserSpec(updateUserSpec, &spec);
+
+	if (IsUserExternal(spec.updateUser))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg(
+							"UpdateUser command is not supported for a non-native user.")));
+	}
+	else
+	{
+		return UpdateNativeUser(&spec);
+	}
+}
+
+
+/*
+ * ParseUpdateUserSpec parses the wire
+ * protocol message updateUser() which drops a user
+ */
+static void
+ParseUpdateUserSpec(pgbson *updateSpec, UpdateUserSpec *spec)
+{
+	bson_iter_t updateIter;
+	PgbsonInitIterator(updateSpec, &updateIter);
+
+	bool userFound = false;
+	bool dbFound = false;
+	while (bson_iter_next(&updateIter))
+	{
+		const char *key = bson_iter_key(&updateIter);
+		if (strcmp(key, "updateUser") == 0)
+		{
+			EnsureTopLevelFieldType(key, &updateIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			spec->updateUser = bson_iter_utf8(&updateIter, &strLength);
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"'updateUser' is a required field.")));
+			}
+
+			/*
+			 * PostgreSQL truncates identifiers longer than NAMEDATALEN - 1 bytes, so an
+			 * overlong name could otherwise update an existing user whose name is its prefix.
+			 */
+			if (strLength >= NAMEDATALEN)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The user name is too long. Try a user name shorter than %d characters.",
+									NAMEDATALEN)));
+			}
+
+			if (IsReservedRoleName(spec->updateUser))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg("User '%s' is reserved and cannot be modified.",
+									   spec->updateUser)));
+			}
+
+			userFound = true;
+		}
+		else if (strcmp(key, "pwd") == 0)
+		{
+			EnsureTopLevelFieldType(key, &updateIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			spec->pwd = bson_iter_utf8(&updateIter, &strLength);
+		}
+		else if (strcmp(key, "$db") == 0 && EnableUsersAdminDBCheck)
+		{
+			EnsureTopLevelFieldType(key, &updateIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *db_name = bson_iter_utf8(&updateIter, &strLength);
+
+			dbFound = true;
+			if (strcmp(db_name, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"UpdateUser must be called from 'admin' database.")));
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else if (strcmp(key, "roles") == 0)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("Role updates are currently unsupported.")));
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("Unsupported field specified : '%s'.", key)));
+		}
+	}
+
+	if (!dbFound && EnableUsersAdminDBCheck)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (!userFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'updateUser' is a required field.")));
+	}
+}
+
+
+/*
+ * Update native user
+ */
+static Datum
+UpdateNativeUser(UpdateUserSpec *spec)
+{
+	/*Verify that native authentication is enabled*/
+	if (!IsNativeAuthEnabled)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg(
+							"Native authentication is not enabled. Enable native authentication on this cluster to perform native user management operations.")));
+	}
+
+	ReportFeatureUsage(FEATURE_USER_UPDATE);
+
+	/*Verify that the calling user is also native*/
+	if (IsCallingUserExternal())
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INSUFFICIENTPRIVILEGE),
+						errmsg(
+							"Only native users can create other native users. Authenticate as a built-in native administrative user to perform native user management operations.")));
+	}
+
+	if (spec->pwd == NULL || spec->pwd[0] == '\0')
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The password field must not be left empty.")));
+	}
+
+	/* Verify password meets complexity requirements */
+	if (EnableUsernamePasswordConstraints && !IsPasswordValid(spec->updateUser,
+															  spec->pwd))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("Invalid password, use a different password.")));
+	}
+
+	StringInfo updateUserInfo = makeStringInfo();
+	appendStringInfo(updateUserInfo, "ALTER USER %s WITH PASSWORD %s;", quote_identifier(
+						 spec->updateUser), quote_literal_cstr(PrehashPassword(
+																   spec->pwd)));
+
+	bool readOnly = false;
+	bool isNull = false;
+	ExtensionExecuteQueryViaSPI(updateUserInfo->data, readOnly, SPI_OK_UTILITY,
+								&isNull);
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	PG_RETURN_POINTER(PgbsonWriterGetPgbson(&finalWriter));
+}
+
+
+/*
+ * documentdb_extension_get_users implements the
+ * core logic to get user info
+ */
+Datum
+documentdb_extension_get_users(PG_FUNCTION_ARGS)
+{
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("UsersInfo command is not supported."),
+						errdetail_log("UsersInfo command is not supported.")));
+	}
+
+	ReportFeatureUsage(FEATURE_USER_GET);
+
+	if (PG_ARGISNULL(0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'usersInfo' must be provided.")));
+	}
+
+	GetUserSpec userSpec = { 0 };
+	ParseGetUserSpec(PG_GETARG_PGBSON(0), &userSpec);
+	const char *userName = userSpec.user.length > 0 ? userSpec.user.string : NULL;
+	const bool showAllUsers = userSpec.showAllUsers;
+	const bool showPrivileges = userSpec.showPrivileges;
+
+	if (showAllUsers && showPrivileges)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg(
+							"The 'showPrivileges' option is not supported when 'usersInfo' is set to 1.")));
+	}
+
+	Datum userInfoDatum;
+	if (showAllUsers)
+	{
+		userInfoDatum = GetAllUsersInfo();
+	}
+	else
+	{
+		bool returnDocuments = true;
+		userInfoDatum = GetSingleUserInfo(userName, returnDocuments);
+	}
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+
+	if (userInfoDatum == (Datum) 0)
+	{
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		pgbson *result = PgbsonWriterGetPgbson(&finalWriter);
+		PG_RETURN_POINTER(result);
+	}
+
+	ArrayType *userArray = DatumGetArrayTypeP(userInfoDatum);
+	Datum *userDatums;
+	bool *userIsNullMarker;
+	int userCount;
+
+	bool arrayByVal = false;
+	int elementLength = -1;
+	Oid arrayElementType = ARR_ELEMTYPE(userArray);
+	deconstruct_array(userArray,
+					  arrayElementType, elementLength, arrayByVal,
+					  TYPALIGN_INT, &userDatums, &userIsNullMarker,
+					  &userCount);
+
+	HTAB *userRolesTable = BuildUserRoleEntryTable(userDatums, userCount, showAllUsers);
+
+	pgbson_array_writer userArrayWriter;
+	PgbsonWriterStartArray(&finalWriter, "users", 5, &userArrayWriter);
+
+	HASH_SEQ_STATUS userStatus;
+	UserRoleHashEntry *userEntry;
+
+	hash_seq_init(&userStatus, userRolesTable);
+	while ((userEntry = hash_seq_search(&userStatus)) != NULL)
+	{
+		WriteSingleUserDocument(userEntry, showPrivileges, &userArrayWriter);
+	}
+	PgbsonWriterEndArray(&finalWriter, &userArrayWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	pgbson *result = PgbsonWriterGetPgbson(&finalWriter);
+
+	FreeUserRoleEntryTable(userRolesTable);
+
+	PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * ParseGetUserSpec parses the wire
+ * protocol message getUser() which gets user info
+ */
+static void
+ParseGetUserSpec(pgbson *getSpec, GetUserSpec *spec)
+{
+	bson_iter_t getIter;
+	PgbsonInitIterator(getSpec, &getIter);
+
+	spec->user = (StringView) {
+		0
+	};
+	spec->showAllUsers = false;
+	spec->showPrivileges = false;
+	bool getUsersFieldFound = false;
+	bool dbFound = false;
+	while (bson_iter_next(&getIter))
+	{
+		const char *key = bson_iter_key(&getIter);
+		if (strcmp(key, "usersInfo") == 0)
+		{
+			getUsersFieldFound = true;
+			if (bson_iter_type(&getIter) == BSON_TYPE_INT32)
+			{
+				if (bson_iter_as_int64(&getIter) != 1)
+				{
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+									errmsg(
+										"The 'usersInfo' field contains an unsupported value.")));
+				}
+
+				spec->showAllUsers = true;
+			}
+			else if (bson_iter_type(&getIter) == BSON_TYPE_UTF8)
+			{
+				uint32_t strLength = 0;
+				const char *userString = bson_iter_utf8(&getIter, &strLength);
+				spec->user = (StringView) {
+					.string = userString,
+					.length = strLength
+				};
+			}
+			else if (BSON_ITER_HOLDS_DOCUMENT(&getIter))
+			{
+				const bson_value_t usersInfoBson = *bson_iter_value(&getIter);
+				ParseUsersInfoDocument(&usersInfoBson, spec);
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg("Unsupported value specified for 'usersInfo'.")));
+			}
+		}
+		else if (strcmp(key, "getUser") == 0)
+		{
+			getUsersFieldFound = true;
+			EnsureTopLevelFieldType(key, &getIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *userString = bson_iter_utf8(&getIter, &strLength);
+			spec->user = (StringView) {
+				.string = userString,
+				.length = strLength
+			};
+		}
+		else if (strcmp(key, "showPrivileges") == 0)
+		{
+			if (BSON_ITER_HOLDS_BOOL(&getIter))
+			{
+				spec->showPrivileges = bson_iter_as_bool(&getIter);
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"'showPrivileges' must be a boolean value")));
+			}
+		}
+		else if (strcmp(key, "$db") == 0 && EnableUsersAdminDBCheck)
+		{
+			EnsureTopLevelFieldType(key, &getIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *db_name = bson_iter_utf8(&getIter, &strLength);
+
+			dbFound = true;
+			if (strcmp(db_name, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"UsersInfo must be called from 'admin' database.")));
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("The specified field '%s' is not supported.", key)));
+		}
+	}
+
+	if (!dbFound && EnableUsersAdminDBCheck)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (!getUsersFieldFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+							"'usersInfo' must be provided.")));
+	}
+}
+
+
+/*
+ * connection_status implements the
+ * core logic for connectionStatus command
+ */
+Datum
+connection_status(pgbson *showPrivilegesSpec)
+{
+	ReportFeatureUsage(FEATURE_CONNECTION_STATUS);
+
+	bool showPrivileges = false;
+	if (showPrivilegesSpec != NULL)
+	{
+		showPrivileges = ParseConnectionStatusSpec(showPrivilegesSpec);
+	}
+
+	bool noError = true;
+	const char *currentUser = GetUserNameFromId(GetUserId(), noError);
+
+	bool returnDocuments = false;
+	Datum userInfoDatum = GetSingleUserInfo(currentUser, returnDocuments);
+
+	if (userInfoDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg(
+							"Cannot find logged-in user")));
+	}
+
+	const char *parentRole = text_to_cstring(DatumGetTextP(userInfoDatum));
+	if (parentRole == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg(
+							"Unable to locate appropriate role for the specified user")));
+	}
+
+	/*
+	 * Example output structure:
+	 * {
+	 *   authInfo: {
+	 *     authenticatedUsers: [ { user: ..., db: ... } ], // always 1 element
+	 *     authenticatedUserRoles: [ { role: ..., db: ... }, ... ],
+	 *     authenticatedUserPrivileges: [ { privilege }, ... ] // if showPrivileges
+	 *   },
+	 *   ok: 1
+	 * }
+	 *
+	 * privilege: { resource: { db:, collection: }, actions: [...] }
+	 */
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	pgbson_writer authInfoWriter;
+	PgbsonWriterStartDocument(&finalWriter, "authInfo", 8,
+							  &authInfoWriter);
+
+	pgbson_array_writer usersArrayWriter;
+	PgbsonWriterStartArray(&authInfoWriter, "authenticatedUsers", 18, &usersArrayWriter);
+	pgbson_writer userWriter;
+	PgbsonArrayWriterStartDocument(&usersArrayWriter, &userWriter);
+	PgbsonWriterAppendUtf8(&userWriter, "user", 4, currentUser);
+	PgbsonWriterAppendUtf8(&userWriter, "db", 2, "admin");
+	PgbsonArrayWriterEndDocument(&usersArrayWriter, &userWriter);
+	PgbsonWriterEndArray(&authInfoWriter, &usersArrayWriter);
+
+	pgbson_array_writer roleArrayWriter;
+	PgbsonWriterStartArray(&authInfoWriter, "authenticatedUserRoles", 22,
+						   &roleArrayWriter);
+
+	/*
+	 * TODO: Build the complete role set so users with both custom and built-in
+	 * memberships report every role and the matching privileges.
+	 */
+	if (IS_BUILTIN_ROLE(parentRole))
+	{
+		WriteBuiltInRoles(parentRole, &roleArrayWriter);
+	}
+	else
+	{
+		HTAB *userRolesTable = CreateUserEntryHashSet();
+		FindOrCreateUserRoleEntry(userRolesTable, currentUser);
+		bool queryAllUsers = false;
+		AddCustomRolesFromUsersTable(userRolesTable, queryAllUsers);
+
+		UserRoleHashEntry *userEntry = FindUserRoleEntry(userRolesTable, currentUser);
+		if (userEntry != NULL)
+		{
+			WriteMultipleRoles(userEntry->roles, &roleArrayWriter);
+		}
+
+		FreeUserRoleEntryTable(userRolesTable);
+	}
+	PgbsonWriterEndArray(&authInfoWriter, &roleArrayWriter);
+
+	if (showPrivileges)
+	{
+		StringView parentRoleView = CreateStringViewFromString(parentRole);
+		pgbson_array_writer privilegesArrayWriter;
+		PgbsonWriterStartArray(&authInfoWriter, "authenticatedUserPrivileges", 27,
+							   &privilegesArrayWriter);
+		WritePrivileges(&parentRoleView, &privilegesArrayWriter);
+		PgbsonWriterEndArray(&authInfoWriter, &privilegesArrayWriter);
+	}
+
+	PgbsonWriterEndDocument(&finalWriter, &authInfoWriter);
+
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	pgbson *result = PgbsonWriterGetPgbson(&finalWriter);
+	return PointerGetDatum(result);
+}
+
+
+/*
+ * ParseConnectionStatusSpec parses the connectionStatus command parameters
+ * validates the parameters and returns the boolean flag of whether to show privileges.
+ */
+static bool
+ParseConnectionStatusSpec(pgbson *connectionStatusSpec)
+{
+	bson_iter_t connectionIter;
+	PgbsonInitIterator(connectionStatusSpec, &connectionIter);
+
+	bool showPrivileges = false;
+	bool connectionStatusFound = false;
+	bool dbFound = false;
+	while (bson_iter_next(&connectionIter))
+	{
+		const char *key = bson_iter_key(&connectionIter);
+
+		if (strcmp(key, "connectionStatus") == 0)
+		{
+			if (bson_iter_type(&connectionIter) == BSON_TYPE_INT64)
+			{
+				if (bson_iter_as_int64(&connectionIter) != 1)
+				{
+					elog(DEBUG1,
+						 "The 'connectionStatus' field contains an integer not equal to 1, got %ld",
+						 bson_iter_as_int64(&connectionIter));
+				}
+			}
+			else
+			{
+				elog(DEBUG1,
+					 "The 'connectionStatus' field contains a non-integer value, got %s",
+					 BsonIterTypeName(&connectionIter));
+			}
+
+			/* We accept all values and types */
+			connectionStatusFound = true;
+		}
+		else if (strcmp(key, "showPrivileges") == 0)
+		{
+			if (BSON_ITER_HOLDS_BOOL(&connectionIter))
+			{
+				showPrivileges = bson_iter_as_bool(&connectionIter);
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg("'showPrivileges' must be a boolean value")));
+			}
+		}
+		else if (strcmp(key, "$db") == 0 && EnableUsersAdminDBCheck)
+		{
+			EnsureTopLevelFieldType(key, &connectionIter, BSON_TYPE_UTF8);
+
+			dbFound = true;
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("The specified field '%s' is not supported.", key)));
+		}
+	}
+
+	if (!dbFound && EnableUsersAdminDBCheck)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (!connectionStatusFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+							"'connectionStatus' must be provided.")));
+	}
+
+	return showPrivileges;
+}
+
+
+/*
+ * This method is mostly copied from pg_be_scram_build_secret in PG. However,
+ * unlike pg_be_scram_build_secret, reject passwords that fail SASLprep so
+ * wire-protocol clients can use the resulting credentials. The default salt
+ * length is 28 rather than 16 for driver compatibility.
+ */
+static char *
+PrehashPassword(const char *password)
+{
+	char *prep_password;
+	pg_saslprep_rc rc;
+	char_uint8_compat saltbuf[SCRAM_MAX_SALT_LEN];
+	char *result;
+	const char *errstr = NULL;
+
+	/*
+	 * Validate that the default salt length is not greater than the max salt length allowed
+	 */
+	if (ScramDefaultSaltLen > SCRAM_MAX_SALT_LEN)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("Salt length value is invalid.")));
+	}
+
+	rc = pg_saslprep(password, &prep_password);
+	switch (rc)
+	{
+		case SASLPREP_SUCCESS:
+		{
+			password = (const char *) prep_password;
+			break;
+		}
+
+		case SASLPREP_INVALID_UTF8:
+		case SASLPREP_PROHIBITED:
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg(
+								"Password contains prohibited characters. Use a different password.")));
+			break;
+		}
+
+		case SASLPREP_OOM:
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"An unexpected internal error has occurred, please try again.")));
+			break;
+		}
+	}
+
+	/* Generate random salt */
+	if (!pg_strong_random(saltbuf, ScramDefaultSaltLen))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("Could not generate random salt.")));
+	}
+
+	#if PG_VERSION_NUM >= 160000  /* PostgreSQL 16.0 or higher */
+	result = scram_build_secret(PG_SHA256, SCRAM_SHA_256_KEY_LEN,
+								saltbuf, ScramDefaultSaltLen,
+								scram_sha_256_iterations, password,
+								&errstr);
+	#else
+	result = scram_build_secret(saltbuf, ScramDefaultSaltLen,
+								SCRAM_DEFAULT_ITERATIONS, password,
+								&errstr);
+	#endif
+
+	if (prep_password)
+	{
+		pfree(prep_password);
+	}
+
+	return result;
+}
+
+
+/*
+ * Verify that the calling user is native
+ */
+static bool
+IsCallingUserExternal(void)
+{
+	const char *currentUser = GetUserNameFromId(GetUserId(), true);
+	return IsUserExternal(currentUser);
+}
+
+
+/*
+ * WriteSingleUserDocument creates and writes a BSON document for a single user
+ * to the provided array writer.
+ */
+static void
+WriteSingleUserDocument(UserRoleHashEntry *userEntry, bool showPrivileges,
+						pgbson_array_writer *userArrayWriter)
+{
+	pgbson_writer userWriter;
+	PgbsonWriterInit(&userWriter);
+
+	PgbsonWriterAppendUtf8(&userWriter, "_id", 3, psprintf(
+							   "admin.%s",
+							   userEntry->user));
+	PgbsonWriterAppendUtf8(&userWriter, "userId", 6,
+						   psprintf("admin.%s", userEntry->user));
+	PgbsonWriterAppendUtf8(&userWriter, "user", 4, userEntry->user);
+	PgbsonWriterAppendUtf8(&userWriter, "db", 2, "admin");
+
+	pgbson_array_writer roleArrayWriter;
+	PgbsonWriterStartArray(&userWriter, "roles", 5,
+						   &roleArrayWriter);
+	WriteMultipleRoles(userEntry->roles, &roleArrayWriter);
+	PgbsonWriterEndArray(&userWriter, &roleArrayWriter);
+
+	if (EnableUsersInfoPrivileges && showPrivileges && userEntry->roles != NULL)
+	{
+		pgbson_array_writer privilegesArrayWriter;
+		PgbsonWriterStartArray(&userWriter, "inheritedPrivileges", 19,
+							   &privilegesArrayWriter);
+		WriteMultipleRolePrivileges(userEntry->roles, &privilegesArrayWriter);
+		PgbsonWriterEndArray(&userWriter, &privilegesArrayWriter);
+	}
+
+	if (userEntry->isExternal)
+	{
+		PgbsonWriterAppendDocument(&userWriter, "customData", 10,
+								   GetUserInfoFromExternalIdentityProvider(
+									   userEntry->user));
+	}
+
+	PgbsonArrayWriterWriteDocument(userArrayWriter, PgbsonWriterGetPgbson(
+									   &userWriter));
+}
+
+
+/*
+ * Validates and maps the "roles" array from createUser to an internal PG role.
+ *
+ * Currently only a single internal PG role is supported per user, whether it is
+ * a built-in role or a custom role created through create_role.
+ *
+ * Accepted built-in role combinations:
+ *  1. { "clusterAdmin", "readWriteAnyDatabase" } → ApiAdminRoleV2
+ *  2. { "readWriteAnyDatabase" }                 → read-write-any-database role
+ *  3. { "readAnyDatabase" }                      → ApiReadOnlyRole
+ *
+ * Any other combination of built-in roles is rejected rather than being
+ * silently reduced to one of the above, and a custom role may not be combined
+ * with any built-in role.
+ */
+static char *
+ValidateAndObtainUserRole(const bson_value_t *rolesDocument, bool *hasCustomRole)
+{
+	bson_iter_t rolesIterator;
+	BsonValueInitIterator(rolesDocument, &rolesIterator);
+	int userRoles = DocumentDB_Role_Invalid;
+	char *customRoleName = NULL;
+
+	while (bson_iter_next(&rolesIterator))
+	{
+		bson_iter_t roleIterator;
+
+		BsonValueInitIterator(bson_iter_value(&rolesIterator), &roleIterator);
+		while (bson_iter_next(&roleIterator))
+		{
+			const char *key = bson_iter_key(&roleIterator);
+
+			if (strcmp(key, "role") == 0)
+			{
+				EnsureTopLevelFieldType(key, &roleIterator, BSON_TYPE_UTF8);
+				uint32_t strLength = 0;
+				const char *role = bson_iter_utf8(&roleIterator, &strLength);
+				if (strcmp(role, "readAnyDatabase") == 0)
+				{
+					/*This would indicate the ApiReadOnlyRole provided the db is "admin" */
+					userRoles |= DocumentDB_Role_Read_AnyDatabase;
+				}
+				else if (strcmp(role, "readWriteAnyDatabase") == 0)
+				{
+					/*This would indicate the ApiAdminRole provided the db is "admin" and there is another role "clusterAdmin" */
+					userRoles |= DocumentDB_Role_ReadWrite_AnyDatabase;
+				}
+				else if (strcmp(role, "clusterAdmin") == 0)
+				{
+					/*This would indicate the ApiAdminRole provided the db is "admin" and there is another role "readWriteAnyDatabase" */
+					userRoles |= DocumentDB_Role_Cluster_Admin;
+				}
+				else
+				{
+					/*
+					 * createRole is gated on 0.116-0, so no custom role can
+					 * exist before then.
+					 */
+					bool isCustomRole = false;
+					if (IsClusterVersionAtleast(DocDB_V0, 116, 0))
+					{
+						isCustomRole = IsCustomRole(role);
+					}
+
+					if (isCustomRole)
+					{
+						/* For now, we only allow single roles to be assigned */
+						if (customRoleName != NULL)
+						{
+							ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+											errmsg(
+												"Only one custom role may be specified.")));
+						}
+						customRoleName = pstrdup(role);
+					}
+					else
+					{
+						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_ROLENOTFOUND),
+										errmsg(
+											"The specified value for the role is invalid: '%s'.",
+											role),
+										errdetail_log(
+											"The specified value for the role is invalid: '%s'.",
+											role)));
+					}
+				}
+			}
+			else if (strcmp(key, "db") == 0 || strcmp(key, "$db") == 0)
+			{
+				EnsureTopLevelFieldType(key, &roleIterator, BSON_TYPE_UTF8);
+				uint32_t strLength = 0;
+				const char *db = bson_iter_utf8(&roleIterator, &strLength);
+				if (strcmp(db, "admin") != 0)
+				{
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+										"Unsupported value specified for db. Only 'admin' is allowed.")));
+				}
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg("The specified field '%s' is not supported.",
+									   key),
+								errdetail_log(
+									"The specified field '%s' is not supported.",
+									key)));
+			}
+		}
+	}
+
+	/*
+	 * Resolve the system role from the exact set of built-in role bits. Only the
+	 * accepted combinations map to a role; any other combination (for example
+	 * readAnyDatabase together with readWriteAnyDatabase, or clusterAdmin on its
+	 * own) is rejected rather than silently reduced to a single role, so the
+	 * privileges granted are always exactly what the caller requested.
+	 */
+	char *systemRoleName = NULL;
+	switch (userRoles)
+	{
+		case DocumentDB_Role_Invalid:
+		{
+			/*
+			 * No built-in role was supplied. This is only valid when a custom
+			 * role was given; the check after the switch reports the error
+			 * otherwise.
+			 */
+			break;
+		}
+
+		case DocumentDB_Role_Read_AnyDatabase:
+		{
+			systemRoleName = ApiReadOnlyRole;
+			break;
+		}
+
+		case DocumentDB_Role_ReadWrite_AnyDatabase:
+		{
+			if (!IsReadWriteAnyDatabaseRoleAvailable())
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_ROLENOTFOUND),
+								errmsg(
+									"Roles specified are invalid. Only readAnyDatabase or readWriteAnyDatabase+clusterAdmin are allowed built-in roles."),
+								errdetail_log(
+									"Roles specified are invalid. Only readAnyDatabase or readWriteAnyDatabase+clusterAdmin are allowed built-in roles.")));
+			}
+
+			systemRoleName = API_RBAC_READWRITE_ANYDB_ROLE;
+			break;
+		}
+
+		case (DocumentDB_Role_ReadWrite_AnyDatabase | DocumentDB_Role_Cluster_Admin):
+		{
+			systemRoleName = ApiAdminRoleV2;
+			break;
+		}
+
+		default:
+		{
+			if (IsReadWriteAnyDatabaseRoleAvailable())
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_ROLENOTFOUND),
+								errmsg(
+									"Roles specified are invalid. Only readAnyDatabase, readWriteAnyDatabase, or readWriteAnyDatabase+clusterAdmin are allowed built-in roles."),
+								errdetail_log(
+									"Roles specified are invalid. Only readAnyDatabase, readWriteAnyDatabase, or readWriteAnyDatabase+clusterAdmin are allowed built-in roles.")));
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_ROLENOTFOUND),
+								errmsg(
+									"Roles specified are invalid. Only readAnyDatabase or readWriteAnyDatabase+clusterAdmin are allowed built-in roles."),
+								errdetail_log(
+									"Roles specified are invalid. Only readAnyDatabase or readWriteAnyDatabase+clusterAdmin are allowed built-in roles.")));
+			}
+			break;
+		}
+	}
+
+	/*
+	 * A user resolves to exactly one role, so a custom role cannot be combined
+	 * with the built-in roles.
+	 */
+	if (customRoleName != NULL && systemRoleName != NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg(
+							"Cannot specify both a custom role '%s' and built-in roles.",
+							customRoleName)));
+	}
+
+	/*
+	 * Neither a built-in nor a custom role was supplied, which means the roles
+	 * array carried no usable "role" field at all. That is a distinct failure
+	 * from an unsupported built-in combination, so it gets its own message.
+	 */
+	if (customRoleName == NULL && systemRoleName == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_ROLENOTFOUND),
+						errmsg(
+							"No role specified."),
+						errdetail_log(
+							"No role specified.")));
+	}
+
+	*hasCustomRole = customRoleName != NULL;
+	return customRoleName != NULL ? customRoleName : systemRoleName;
+}
+
+
+/*
+ * ParseUsersInfoDocument extracts and processes the fields of the BSON document
+ * for the usersInfo command.
+ */
+static void
+ParseUsersInfoDocument(const bson_value_t *usersInfoBson, GetUserSpec *spec)
+{
+	bson_iter_t iter;
+	BsonValueInitIterator(usersInfoBson, &iter);
+
+	bool forAllDBsFound = false;
+	bool userFound = false;
+	bool dbFound = false;
+	while (bson_iter_next(&iter))
+	{
+		const char *bsonDocKey = bson_iter_key(&iter);
+		if (strcmp(bsonDocKey, "forAllDBs") == 0)
+		{
+			if (!BSON_ITER_HOLDS_BOOL(&iter) || bson_iter_as_bool(&iter) != true)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"Unsupported value specified for 'forAllDBs'.")));
+			}
+
+			/* Because we only support users provisioned at admin database level, forAllDBs doesn't have any impact, so we only set spec->showAllUsers to true */
+			spec->showAllUsers = true;
+			forAllDBsFound = true;
+		}
+		else if (strcmp(bsonDocKey, "db") == 0 && BSON_ITER_HOLDS_UTF8(&iter))
+		{
+			dbFound = true;
+			uint32_t strLength;
+			const char *db = bson_iter_utf8(&iter, &strLength);
+			if (strcmp(db, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"Unsupported value specified for 'db' field. Only 'admin' is allowed."),
+								errdetail_log(
+									"Unsupported value specified for 'db' field. Only 'admin' is allowed.")));
+			}
+		}
+		else if (strcmp(bsonDocKey, "user") == 0 && BSON_ITER_HOLDS_UTF8(
+					 &iter))
+		{
+			userFound = true;
+			uint32_t strLength;
+			const char *userString = bson_iter_utf8(&iter, &strLength);
+			spec->user = (StringView) {
+				.string = userString,
+				.length = strLength
+			};
+		}
+	}
+
+	/* The usersInfo document must contain either 'forAllDBs' or (exclusive) 'user' and 'db' together*/
+	if (userFound ^ dbFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg(
+							"'usersInfo' document must contain both 'user' and 'db' together.")));
+	}
+
+	if (!(forAllDBsFound ^ userFound))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg(
+							"'usersInfo' document must contain either 'forAllDBs: true', or 'user' and 'db'.")));
+	}
+}
+
+
+/*
+ * GetAllUsersInfo queries and returns all users information, including their id, name, and roles.
+ * We need to exclude system pg login roles.
+ * Returns the user info datum containing the query result.
+ */
+static Datum
+GetAllUsersInfo(void)
+{
+	const char *cmdStr = FormatSqlQuery(
+		"WITH r AS ("
+		"  SELECT child.rolname::text AS child_role, "
+		"         CASE WHEN parent.rolname = '%s' "
+		"              THEN '%s' "
+		"              ELSE parent.rolname::text "
+		"         END AS parent_role "
+		"  FROM pg_roles parent "
+		"  JOIN pg_auth_members am ON parent.oid = am.roleid "
+		"  JOIN pg_roles child ON am.member = child.oid "
+		"  WHERE child.rolcanlogin = true "
+		MEMBERSHIP_CONFERS_ROLE_CLAUSE
+		"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
+		") "
+		"SELECT ARRAY_AGG(%s.row_get_bson(r) ORDER BY r.child_role, r.parent_role) "
+		"FROM r;",
+		ApiRootInternalRole, ApiRootRole,
+		ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
+		ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+		API_RBAC_API_COLLECTION_CREATE_ROLE,
+		CoreSchemaName);
+
+	bool readOnly = true;
+	bool isNull = false;
+	return ExtensionExecuteQueryViaSPI(cmdStr, readOnly, SPI_OK_SELECT,
+									   &isNull);
+}
+
+
+/*
+ * GetSingleUserInfo queries and processes user role information for a given user.
+ * Returns the user info datum containing the query result.
+ */
+static Datum
+GetSingleUserInfo(const char *userName, bool returnDocuments)
+{
+	if (userName == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Username is null")));
+	}
+
+	const char *cmdStr;
+
+	if (returnDocuments)
+	{
+		cmdStr = FormatSqlQuery(
+			"WITH r AS ("
+			"  SELECT child.rolname::text AS child_role, "
+			"         CASE WHEN parent.rolname = '%s' "
+			"              THEN '%s' "
+			"              ELSE parent.rolname::text "
+			"         END AS parent_role "
+			"  FROM pg_roles parent "
+			"  JOIN pg_auth_members am ON parent.oid = am.roleid "
+			"  JOIN pg_roles child ON am.member = child.oid "
+			"  WHERE child.rolcanlogin = true "
+			MEMBERSHIP_CONFERS_ROLE_CLAUSE
+			"    AND child.rolname = $1"
+			"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
+			") "
+			"SELECT ARRAY_AGG(%s.row_get_bson(r) ORDER BY r.parent_role) "
+			"FROM r;",
+			ApiRootInternalRole, ApiRootRole,
+			ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
+			ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+			API_RBAC_API_COLLECTION_CREATE_ROLE,
+			CoreSchemaName);
+	}
+	else
+	{
+		cmdStr = FormatSqlQuery(
+			"SELECT CASE WHEN parent.rolname = '%s' "
+			"            THEN '%s' "
+			"            ELSE parent.rolname::text "
+			"       END "
+			"FROM pg_roles parent "
+			"JOIN pg_auth_members am ON parent.oid = am.roleid "
+			"JOIN pg_roles child ON am.member = child.oid "
+			"WHERE child.rolcanlogin = true "
+			MEMBERSHIP_CONFERS_ROLE_CLAUSE
+			"  AND child.rolname = $1 "
+			"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
+			"ORDER BY parent.rolname "
+			"LIMIT 1;",
+			ApiRootInternalRole, ApiRootRole,
+			ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
+			ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+			API_RBAC_API_COLLECTION_CREATE_ROLE);
+	}
+
+	int argCount = 1;
+	Oid argTypes[1];
+	Datum argValues[1];
+
+	argTypes[0] = TEXTOID;
+	argValues[0] = CStringGetTextDatum(userName);
+
+	bool readOnly = true;
+	bool isNull = false;
+
+	Datum result = ExtensionExecuteQueryWithArgsViaSPI(cmdStr, argCount,
+													   argTypes, argValues, NULL,
+													   readOnly, SPI_OK_SELECT,
+													   &isNull);
+	if (isNull)
+	{
+		return (Datum) 0;
+	}
+	else
+	{
+		return result;
+	}
+}
+
+
+/*
+ * WriteMultipleRoles iterates through the roles HTAB and writes each role to the provided BSON array writer.
+ * This is used to write roles for usersInfo and connectionStatus commands.
+ */
+static void
+WriteMultipleRoles(HTAB *rolesTable, pgbson_array_writer *roleArrayWriter)
+{
+	if (rolesTable == NULL)
+	{
+		return;
+	}
+
+	HASH_SEQ_STATUS status;
+	StringView *roleEntry;
+	hash_seq_init(&status, rolesTable);
+	while ((roleEntry = hash_seq_search(&status)) != NULL)
+	{
+		if (IS_BUILTIN_ROLE(roleEntry->string))
+		{
+			WriteBuiltInRoles(roleEntry->string, roleArrayWriter);
+		}
+		else
+		{
+			pgbson_writer roleWriter;
+			PgbsonWriterInit(&roleWriter);
+			PgbsonWriterAppendUtf8(&roleWriter, "role", 4, roleEntry->string);
+			PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+			PgbsonArrayWriterWriteDocument(
+				roleArrayWriter, PgbsonWriterGetPgbson(&roleWriter));
+		}
+	}
+}
+
+
+/*
+ * WriteBuiltInRoles writes built-in role information based on the parent role.
+ * This consolidates the role mapping logic used by both usersInfo and connectionStatus commands.
+ */
+static void
+WriteBuiltInRoles(const char *parentRole, pgbson_array_writer *roleArrayWriter)
+{
+	if (parentRole == NULL)
+	{
+		return;
+	}
+
+	pgbson_writer roleWriter;
+	PgbsonWriterInit(&roleWriter);
+	if (strcmp(parentRole, ApiReadOnlyRole) == 0)
+	{
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4, "readAnyDatabase");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+	}
+	else if (strcmp(parentRole, ApiReadWriteRole) == 0 ||
+			 strcmp(parentRole, API_RBAC_READWRITE_ANYDB_ROLE) == 0)
+	{
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4,
+							   "readWriteAnyDatabase");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+	}
+	else if (strcmp(parentRole, ApiAdminRoleV2) == 0)
+	{
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4,
+							   "readWriteAnyDatabase");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+		PgbsonWriterInit(&roleWriter);
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4,
+							   "clusterAdmin");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+	}
+	else if (strcmp(parentRole, ApiUserAdminRole) == 0)
+	{
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4,
+							   "userAdminAnyDatabase");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+	}
+	else if (strcmp(parentRole, ApiRootRole) == 0)
+	{
+		PgbsonWriterAppendUtf8(&roleWriter, "role", 4,
+							   "root");
+		PgbsonWriterAppendUtf8(&roleWriter, "db", 2, "admin");
+		PgbsonArrayWriterWriteDocument(roleArrayWriter,
+									   PgbsonWriterGetPgbson(
+										   &roleWriter));
+	}
+	else
+	{
+		return;
+	}
+}
+
+
+/*
+ * BuildUserRoleEntryTable creates a hash table keyed by user name. Each value contains
+ * the user's role-name hash set and whether the user has an external identity.
+ */
+static HTAB *
+BuildUserRoleEntryTable(Datum *userDatums, int userCount, bool queryAllUsers)
+{
+	HTAB *userRolesTable = CreateUserEntryHashSet();
+
+	for (int i = 0; i < userCount; i++)
+	{
+		/* Convert Datum to a bson_t object */
+		pgbson *bson_doc = DatumGetPgBson(userDatums[i]);
+		bson_iter_t getIter;
+		PgbsonInitIterator(bson_doc, &getIter);
+
+		if (!bson_iter_find(&getIter, "child_role"))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("User role metadata is missing a child role")));
+		}
+
+		if (!BSON_ITER_HOLDS_UTF8(&getIter))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("User role metadata has an invalid child role")));
+		}
+
+		const char *user = bson_iter_utf8(&getIter, NULL);
+		UserRoleHashEntry *userEntry =
+			FindOrCreateUserRoleEntry(userRolesTable, user);
+
+		if (!bson_iter_find(&getIter, "parent_role"))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("User role metadata is missing a parent role")));
+		}
+
+		if (!BSON_ITER_HOLDS_UTF8(&getIter))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("User role metadata has an invalid parent role")));
+		}
+
+		const char *parentRole = bson_iter_utf8(&getIter, NULL);
+		if (!IS_BUILTIN_ROLE(parentRole))
+		{
+			/* Custom roles are added from the catalog-backed system.users view. */
+			continue;
+		}
+
+		AddRoleToUserEntry(userEntry, parentRole);
+	}
+
+	AddCustomRolesFromUsersTable(userRolesTable, queryAllUsers);
+
+	return userRolesTable;
+}
+
+
+/*
+ * Adds the caller-visible custom roles returned by admin.system.users.
+ */
+static void
+AddCustomRolesFromUsersTable(HTAB *userRolesTable, bool queryAllUsers)
+{
+	if (!IsClusterVersionAtleast(DocDB_V0, 116, 0))
+	{
+		return;
+	}
+
+	pgbson *usersTableQuerySpec = UsersTableQuerySpec(userRolesTable, queryAllUsers);
+	Datum responseDatum =
+		find_cursor_first_page(cstring_to_text("admin"), usersTableQuerySpec, 0);
+
+	ParseUserTableResponse(userRolesTable, responseDatum);
+}
+
+
+static pgbson *
+UsersTableQuerySpec(HTAB *userRolesTable, bool queryAllUsers)
+{
+	pgbson_writer findSpecWriter;
+	PgbsonWriterInit(&findSpecWriter);
+	PgbsonWriterAppendUtf8(&findSpecWriter, "find", 4, "system.users");
+	PgbsonWriterAppendInt32(&findSpecWriter, "batchSize", 9, INT_MAX);
+
+	if (!queryAllUsers)
+	{
+		pgbson_writer filterWriter;
+		PgbsonWriterStartDocument(&findSpecWriter, "filter", 6, &filterWriter);
+		pgbson_writer userFilterWriter;
+		PgbsonWriterStartDocument(&filterWriter, "user", 4, &userFilterWriter);
+		pgbson_array_writer requestedUsersWriter;
+		PgbsonWriterStartArray(&userFilterWriter, "$in", 3, &requestedUsersWriter);
+
+		HASH_SEQ_STATUS userStatus;
+		UserRoleHashEntry *requestedUser;
+		hash_seq_init(&userStatus, userRolesTable);
+		while ((requestedUser = hash_seq_search(&userStatus)) != NULL)
+		{
+			PgbsonArrayWriterWriteUtf8(&requestedUsersWriter, requestedUser->user);
+		}
+
+		PgbsonWriterEndArray(&userFilterWriter, &requestedUsersWriter);
+		PgbsonWriterEndDocument(&filterWriter, &userFilterWriter);
+		PgbsonWriterEndDocument(&findSpecWriter, &filterWriter);
+	}
+
+	return PgbsonWriterGetPgbson(&findSpecWriter);
+}
+
+
+static void
+ParseUserTableResponse(HTAB *userRolesTable, Datum responseDatum)
+{
+	HeapTupleHeader responseTuple = DatumGetHeapTupleHeader(responseDatum);
+	bool cursorPageIsNull = false;
+	Datum cursorPageDatum = GetAttributeByNum(responseTuple, 1, &cursorPageIsNull);
+	if (cursorPageIsNull)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("System users query returned a null cursor page")));
+	}
+
+	pgbson *response = DatumGetPgBson(cursorPageDatum);
+	bson_iter_t firstBatchIterator;
+	if (!PgbsonInitIteratorAtPath(response, "cursor.firstBatch", &firstBatchIterator))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("System users response is missing cursor.firstBatch")));
+	}
+	if (!BSON_ITER_HOLDS_ARRAY(&firstBatchIterator))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg(
+							"System users response has an invalid cursor.firstBatch")));
+	}
+
+	bson_iter_t documentArrayIterator;
+	bson_iter_recurse(&firstBatchIterator, &documentArrayIterator);
+	while (bson_iter_next(&documentArrayIterator))
+	{
+		if (!BSON_ITER_HOLDS_DOCUMENT(&documentArrayIterator))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"System users response contains an invalid user entry")));
+		}
+
+		bson_iter_t documentIterator;
+		bson_iter_recurse(&documentArrayIterator, &documentIterator);
+		if (!bson_iter_find(&documentIterator, "user"))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("System users response is missing a user name")));
+		}
+		if (!BSON_ITER_HOLDS_UTF8(&documentIterator))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("System users response has an invalid user name")));
+		}
+
+		const char *documentUser = bson_iter_utf8(&documentIterator, NULL);
+		UserRoleHashEntry *userEntry = FindUserRoleEntry(userRolesTable, documentUser);
+		if (userEntry == NULL)
+		{
+			continue;
+		}
+
+		bson_iter_recurse(&documentArrayIterator, &documentIterator);
+		if (!bson_iter_find(&documentIterator, "roles"))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("System users response is missing a roles array")));
+		}
+		if (!BSON_ITER_HOLDS_ARRAY(&documentIterator))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("System users response has an invalid roles array")));
+		}
+
+		bson_iter_t roleArrayIterator;
+		bson_iter_recurse(&documentIterator, &roleArrayIterator);
+		while (bson_iter_next(&roleArrayIterator))
+		{
+			if (!BSON_ITER_HOLDS_DOCUMENT(&roleArrayIterator))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+								errmsg(
+									"System users response contains an invalid role entry")));
+			}
+
+			bson_iter_t roleDocumentIterator;
+			bson_iter_recurse(&roleArrayIterator, &roleDocumentIterator);
+			if (!bson_iter_find(&roleDocumentIterator, "role"))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+								errmsg("System users response is missing a role name")));
+			}
+			if (!BSON_ITER_HOLDS_UTF8(&roleDocumentIterator))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+								errmsg(
+									"System users response has an invalid role name")));
+			}
+
+			const char *roleName = bson_iter_utf8(&roleDocumentIterator, NULL);
+			AddRoleToUserEntry(userEntry, roleName);
+		}
+	}
+}
+
+
+static UserRoleHashEntry *
+FindUserRoleEntry(HTAB *userRolesTable, const char *userName)
+{
+	UserRoleHashEntry searchEntry = {
+		.user = (char *) userName,
+	};
+	bool userFound = false;
+	UserRoleHashEntry *userEntry = hash_search(userRolesTable, &searchEntry,
+											   HASH_FIND, &userFound);
+
+	return userFound ? userEntry : NULL;
+}
+
+
+static UserRoleHashEntry *
+FindOrCreateUserRoleEntry(HTAB *userRolesTable, const char *userName)
+{
+	UserRoleHashEntry *userEntry = FindUserRoleEntry(userRolesTable, userName);
+	if (userEntry != NULL)
+	{
+		return userEntry;
+	}
+
+	UserRoleHashEntry newEntry = {
+		.user = pstrdup(userName),
+		.roles = NULL,
+		.isExternal = IsUserExternal(userName)
+	};
+	bool entryCreated = false;
+	userEntry = hash_search(userRolesTable, &newEntry, HASH_ENTER, &entryCreated);
+
+	return userEntry;
+}
+
+
+static void
+AddRoleToUserEntry(UserRoleHashEntry *userEntry, const char *roleName)
+{
+	if (userEntry->roles == NULL)
+	{
+		userEntry->roles = CreateStringViewHashSet();
+	}
+
+	char *roleNameCopy = pstrdup(roleName);
+	StringView roleStringView = {
+		.string = roleNameCopy,
+		.length = strlen(roleNameCopy)
+	};
+	bool roleFound = false;
+	hash_search(userEntry->roles, &roleStringView, HASH_ENTER, &roleFound);
+	if (roleFound)
+	{
+		pfree(roleNameCopy);
+	}
+}
+
+
+/*
+ * Creates a hash table that maps strings to HTAB pointers.
+ */
+static HTAB *
+CreateUserEntryHashSet(void)
+{
+	HASHCTL hashInfo = CreateExtensionHashCTL(
+		sizeof(UserRoleHashEntry),
+		sizeof(UserRoleHashEntry),
+		UserHashEntryCompareFunc,
+		UserHashEntryHashFunc
+		);
+	return hash_create("User Entry Hash Table", 32, &hashInfo,
+					   DefaultExtensionHashFlags);
+}
+
+
+/*
+ * UserHashEntryHashFunc is the (HASHCTL.hash) callback used to hash a UserRoleHashEntry
+ */
+static uint32
+UserHashEntryHashFunc(const void *obj, size_t objsize)
+{
+	const UserRoleHashEntry *hashEntry = obj;
+	return hash_bytes((const unsigned char *) hashEntry->user, strlen(hashEntry->user));
+}
+
+
+/*
+ * UserHashEntryCompareFunc is the (HASHCTL.match) callback used to determine if two string keys are same.
+ * Returns 0 if those two string keys are same, non-zero otherwise.
+ */
+static int
+UserHashEntryCompareFunc(const void *obj1, const void *obj2, Size objsize)
+{
+	const UserRoleHashEntry *hashEntry1 = obj1;
+	const UserRoleHashEntry *hashEntry2 = obj2;
+
+	return strcmp(hashEntry1->user, hashEntry2->user);
+}
+
+
+/*
+ * FreeUserRoleEntryTable cleans up the user roles hash table and all nested role hash tables.
+ */
+static void
+FreeUserRoleEntryTable(HTAB *userRolesTable)
+{
+	if (userRolesTable != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		UserRoleHashEntry *userRoleEntry;
+		hash_seq_init(&status, userRolesTable);
+		while ((userRoleEntry = hash_seq_search(&status)) != NULL)
+		{
+			if (userRoleEntry->roles != NULL)
+			{
+				hash_destroy(userRoleEntry->roles);
+			}
+		}
+
+		hash_destroy(userRolesTable);
+	}
+}
+
+
+/*
+ * Parses a grantRolesToUser spec, executes it, and returns the result.
+ */
+Datum
+command_grant_roles_to_user(PG_FUNCTION_ARGS)
+{
+	pgbson *grantRolesSpec = PG_GETARG_PGBSON(0);
+
+	Datum response = grant_roles_to_user(grantRolesSpec);
+
+	PG_RETURN_DATUM(response);
+}
+
+
+/*
+ * grant_roles_to_user implements the core logic for the grantRolesToUser
+ * command, which adds roles to an existing user.
+ */
+Datum
+grant_roles_to_user(pgbson *grantRolesBson)
+{
+	ReportFeatureUsage(FEATURE_ROLE_GRANT_ROLES_TO_USER);
+
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("The GrantRolesToUser command is currently unsupported."),
+						errdetail_log(
+							"The GrantRolesToUser command is currently unsupported.")));
+	}
+
+	if (!IsMetadataCoordinator())
+	{
+		StringInfo grantRolesQuery = makeStringInfo();
+		appendStringInfo(grantRolesQuery,
+						 "SELECT %s.grant_roles_to_user(%s::%s.bson)",
+						 ApiSchemaNameV2,
+						 quote_literal_cstr(PgbsonToHexadecimalString(grantRolesBson)),
+						 CoreSchemaNameV2);
+		DistributedRunCommandResult result = RunCommandOnMetadataCoordinator(
+			grantRolesQuery->data);
+
+		if (!result.success)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Grant roles to user operation failed: %s",
+								text_to_cstring(result.response)),
+							errdetail_log(
+								"Grant roles to user operation failed: %s",
+								text_to_cstring(result.response))));
+		}
+
+		pgbson_writer finalWriter;
+		PgbsonWriterInit(&finalWriter);
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		return PointerGetDatum(PgbsonWriterGetPgbson(&finalWriter));
+	}
+
+	GrantRolesToUserSpec grantRolesSpec = {
+		.userName = NULL,
+		.grantedRoles = CreateStringViewHashSet()
+	};
+	ParseGrantRolesToUserSpec(grantRolesBson, &grantRolesSpec);
+
+	EnsureUserExists(grantRolesSpec.userName);
+	EnsureRoleMembershipLimits(grantRolesSpec.userName, hash_get_num_entries(
+								   grantRolesSpec.grantedRoles));
+
+	bool allowCustomRoles = true;
+	ValidateAndGrantParentRoles(grantRolesSpec.userName, grantRolesSpec.grantedRoles,
+								allowCustomRoles);
+
+	hash_destroy(grantRolesSpec.grantedRoles);
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	return PointerGetDatum(PgbsonWriterGetPgbson(&finalWriter));
+}
+
+
+/*
+ * Parses a revokeRolesFromUser spec, executes it, and returns the result.
+ */
+Datum
+command_revoke_roles_from_user(PG_FUNCTION_ARGS)
+{
+	pgbson *revokeRolesSpec = PG_GETARG_PGBSON(0);
+
+	Datum response = revoke_roles_from_user(revokeRolesSpec);
+
+	PG_RETURN_DATUM(response);
+}
+
+
+/*
+ * revoke_roles_from_user implements the core logic for the revokeRolesFromUser
+ * command, which removes roles from an existing user.
+ */
+Datum
+revoke_roles_from_user(pgbson *revokeRolesBson)
+{
+	ReportFeatureUsage(FEATURE_ROLE_REVOKE_ROLES_FROM_USER);
+
+	if (!EnableUserCrud)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg(
+							"The RevokeRolesFromUser command is currently unsupported."),
+						errdetail_log(
+							"The RevokeRolesFromUser command is currently unsupported.")));
+	}
+
+	if (!IsMetadataCoordinator())
+	{
+		StringInfo revokeRolesQuery = makeStringInfo();
+		appendStringInfo(revokeRolesQuery,
+						 "SELECT %s.revoke_roles_from_user(%s::%s.bson)",
+						 ApiSchemaNameV2,
+						 quote_literal_cstr(PgbsonToHexadecimalString(revokeRolesBson)),
+						 CoreSchemaNameV2);
+		DistributedRunCommandResult result = RunCommandOnMetadataCoordinator(
+			revokeRolesQuery->data);
+
+		if (!result.success)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Revoke roles from user operation failed: %s",
+								text_to_cstring(result.response)),
+							errdetail_log(
+								"Revoke roles from user operation failed: %s",
+								text_to_cstring(result.response))));
+		}
+
+		pgbson_writer finalWriter;
+		PgbsonWriterInit(&finalWriter);
+		PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+		return PointerGetDatum(PgbsonWriterGetPgbson(&finalWriter));
+	}
+
+	RevokeRolesFromUserSpec revokeRolesSpec = {
+		.userName = NULL,
+		.revokedRoles = CreateStringViewHashSet()
+	};
+	ParseRevokeRolesFromUserSpec(revokeRolesBson, &revokeRolesSpec);
+
+	EnsureUserExists(revokeRolesSpec.userName);
+
+	ValidateAndRevokeParentRoles(revokeRolesSpec.userName,
+								 revokeRolesSpec.revokedRoles);
+
+	hash_destroy(revokeRolesSpec.revokedRoles);
+
+	pgbson_writer finalWriter;
+	PgbsonWriterInit(&finalWriter);
+	PgbsonWriterAppendInt32(&finalWriter, "ok", 2, 1);
+	return PointerGetDatum(PgbsonWriterGetPgbson(&finalWriter));
+}
+
+
+/*
+ * ParseRevokeRolesFromUserSpec parses the revokeRolesFromUser command
+ * parameters.
+ */
+static void
+ParseRevokeRolesFromUserSpec(pgbson *revokeRolesBson,
+							 RevokeRolesFromUserSpec *revokeRolesSpec)
+{
+	bson_iter_t revokeRolesIter;
+	PgbsonInitIterator(revokeRolesBson, &revokeRolesIter);
+
+	bool dbFound = false;
+	bool rolesFound = false;
+
+	while (bson_iter_next(&revokeRolesIter))
+	{
+		const char *key = bson_iter_key(&revokeRolesIter);
+
+		if (strcmp(key, "revokeRolesFromUser") == 0)
+		{
+			EnsureTopLevelFieldType(key, &revokeRolesIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			revokeRolesSpec->userName = bson_iter_utf8(&revokeRolesIter, &strLength);
+
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The 'revokeRolesFromUser' field must not be left empty.")));
+			}
+
+			if (strLength >= NAMEDATALEN)
+			{
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+								errmsg("The specified user does not exist.")));
+			}
+		}
+		else if (strcmp(key, "roles") == 0)
+		{
+			rolesFound = true;
+			ParseParentRolesArray(&revokeRolesIter, revokeRolesSpec->revokedRoles);
+		}
+		else if (strcmp(key, "$db") == 0)
+		{
+			EnsureTopLevelFieldType(key, &revokeRolesIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *dbName = bson_iter_utf8(&revokeRolesIter, &strLength);
+			ValidateNamespaceStringForEmbeddedNull(dbName, strLength);
+
+			dbFound = true;
+			if (strcmp(dbName, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"RevokeRolesFromUser must be called from 'admin' database.")));
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("The specified field '%s' is not supported.", key)));
+		}
+	}
+
+	if (!dbFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (revokeRolesSpec->userName == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'revokeRolesFromUser' is a required field.")));
+	}
+
+	if (!rolesFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'roles' is a required field.")));
+	}
+
+	if (hash_get_num_entries(revokeRolesSpec->revokedRoles) == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'roles' must not be empty.")));
+	}
+}
+
+
+/*
+ * ParseGrantRolesToUserSpec parses the grantRolesToUser command parameters.
+ */
+static void
+ParseGrantRolesToUserSpec(pgbson *grantRolesBson, GrantRolesToUserSpec *grantRolesSpec)
+{
+	bson_iter_t grantRolesIter;
+	PgbsonInitIterator(grantRolesBson, &grantRolesIter);
+
+	bool dbFound = false;
+	bool rolesFound = false;
+
+	while (bson_iter_next(&grantRolesIter))
+	{
+		const char *key = bson_iter_key(&grantRolesIter);
+
+		if (strcmp(key, "grantRolesToUser") == 0)
+		{
+			EnsureTopLevelFieldType(key, &grantRolesIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			grantRolesSpec->userName = bson_iter_utf8(&grantRolesIter, &strLength);
+
+			if (strLength == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"The 'grantRolesToUser' field must not be left empty.")));
+			}
+
+			if (strLength >= NAMEDATALEN)
+			{
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+								errmsg("The specified user does not exist.")));
+			}
+		}
+		else if (strcmp(key, "roles") == 0)
+		{
+			rolesFound = true;
+			ParseParentRolesArray(&grantRolesIter, grantRolesSpec->grantedRoles);
+		}
+		else if (strcmp(key, "$db") == 0)
+		{
+			EnsureTopLevelFieldType(key, &grantRolesIter, BSON_TYPE_UTF8);
+			uint32_t strLength = 0;
+			const char *dbName = bson_iter_utf8(&grantRolesIter, &strLength);
+			ValidateNamespaceStringForEmbeddedNull(dbName, strLength);
+
+			dbFound = true;
+			if (strcmp(dbName, "admin") != 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"GrantRolesToUser must be called from 'admin' database.")));
+			}
+		}
+		else if (IsCommonSpecIgnoredField(key))
+		{
+			continue;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg("The specified field '%s' is not supported.", key)));
+		}
+	}
+
+	if (!dbFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("The required $db property is missing.")));
+	}
+
+	if (grantRolesSpec->userName == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'grantRolesToUser' is a required field.")));
+	}
+
+	if (!rolesFound)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'roles' is a required field.")));
+	}
+
+	if (hash_get_num_entries(grantRolesSpec->grantedRoles) == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("'roles' must not be empty.")));
+	}
+}
+
+
+/*
+ * EnsureUserExists reports an error unless userName names an existing login
+ * role that the user commands manage.
+ */
+static void
+EnsureUserExists(const char *userName)
+{
+	if (IsReservedRoleName(userName))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("User '%s' is reserved and cannot be modified.",
+							   userName)));
+	}
+
+	const char *query =
+		"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) $1 "
+		"AND rolcanlogin";
+
+	int nargs = 1;
+	Oid argTypes[1] = { TEXTOID };
+	Datum argValues[1] = { CStringGetTextDatum(userName) };
+
+	bool readOnly = true;
+	bool isNull = false;
+	ExtensionExecuteQueryWithArgsViaSPI(query, nargs, argTypes, argValues, NULL,
+										readOnly, SPI_OK_SELECT, &isNull);
+
+	if (isNull)
+	{
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("The specified user does not exist.")));
+	}
+}

@@ -1,0 +1,1921 @@
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
+SET documentdb_core.enableCollation TO on;
+
+-- ==============================================================================
+-- SECTION 1: find — basic queries on coll_strings
+-- ==============================================================================
+
+-- Insert fixtures.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 1, "a": "Cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 2, "a": "dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 3, "a": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 4, "a": "Dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 5, "a": "caT" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 6, "a": "doG" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 7, "a": "goat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 8, "a": "Goat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 9, "b": "Cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 10, "b": "dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 11, "b": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 12, "b": "Dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 13, "b": "caT", "a" : "raBbIt" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 14, "b": "doG" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 15, "b": "goat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 16, "b": "Goat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 17, "a": ["Cat", "CAT", "dog"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 18, "a": ["dog", "cat", "CAT"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 19, "a": ["cat", "rabbit", "bAt"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 20, "a": ["Cat"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 21, "a": ["dog"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 22, "a": ["cat"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 23, "a": ["CAT"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 24, "a": ["cAt"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 25, "a": { "b" : "cAt"} }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_strings', '{ "_id": 26, "a": [{ "b": "CAT"}] }');
+
+SET documentdb_core.enableCollation TO off;
+
+-- enableCollation = off, skipFailOnCollation = off (default): collation is rejected.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_strings", "pipeline": [ { "$sort": { "_id": 1 } }, { "$match": { "a": { "$eq": "cat" } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "b": { "$eq": "cat" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_strings", "key":"a", "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"en","strength":1}}');
+
+-- enableCollation = off, skipFailOnCollation = on: collation is accepted but ignored (binary match).
+SET documentdb.skipFailOnCollation TO on;
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_strings", "pipeline": [ { "$sort": { "_id": 1 } }, { "$match": { "a": { "$eq": "cat" } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "b": { "$eq": "cat" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_strings", "key":"a", "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"en","strength":1}}');
+RESET documentdb.skipFailOnCollation;
+
+SET documentdb_core.enableCollation TO on;
+
+-- $eq with strength-1 collation matches all case variants.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": { "$eq": "cat" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "b": { "$eq": "cat" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- $or across paths with collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "a": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 10, "collation": { "locale": "en", "strength" : 1 } }');
+
+-- $all and $in with collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": { "$all": ["cAt", "DOG"] } }, "skip": 0, "limit":
+ 5, "collation": { "locale": "en", "strength": 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a" : {"$in" : ["cat", "DOG" ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 100, "collation": { "locale": "en", "strength" : 5} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a" : {"$in" : ["cat", "DOG" ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 100, "collation": { "locale": "en", "strength" : 1} }');
+
+-- Range query ($gt + $lt) on path "a" without an index.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": { "$gt": "CAT" }, "a" : {"$lt" : "RABBIT"} }, "collation": { "locale": "en", "strength" : 1.93 } }');
+
+-- ==============================================================================
+-- SECTION 2: find — multi-collation results on coll_multi_collation
+-- ==============================================================================
+
+-- Insert fixtures.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 1, "a": "Cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 2, "a": "dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 3, "a": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 4, "a": "CaT" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 5, "b": "Dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_multi_collation', '{ "_id": 6, "b": "DoG" }');
+
+-- $eq and $or under varying collation options (strength, caseLevel, caseFirst, numericOrdering).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "a": { "$eq": "cat" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3, "caseLevel": true, "caseFirst": "off", "numericOrdering": true } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1.93 } }');
+
+-- $regex ignores collation (regex matching is byte-level).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "a": { "$regex": "^c", "$options": "" } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1 } }');
+
+-- Same $or filter under different ICU locales (en, fr, de, bn).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 2, "caseLevel": false, "caseFirst": "lower", "numericOrdering": true } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "fr", "strength" : 1, "caseLevel": false, "caseFirst": "lower", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "de", "strength" : 1, "caseLevel": false, "caseFirst": "lower", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "bn", "strength" : 1, "caseLevel": false, "caseFirst": "lower", "numericOrdering": true} }');
+
+-- ==============================================================================
+-- SECTION 3: find — sort / orderBy under collation
+-- ==============================================================================
+
+-- Sort by `b` (mixed-case strings) under varying strength + caseFirst.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests0', '{"_id": "CaT", "a": "cat", "b": "CaT"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests0', '{"_id": "CAt", "a": "cat", "b": "CAt"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests0', '{"_id": "CAT", "a": "cat", "b": "CAT"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests0', '{"_id": "cAT", "a": "cat", "b": "cAT"}');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "b": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "b": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "b": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "b": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$gte": "cat"} }, "sort": { "b": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$gte": "cat"} }, "sort": { "b": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower" } }');
+
+-- Sort by `_id` (collation-aware string _id values).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "_id": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$lte": "cat"} }, "sort": { "_id": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$gte": "cat"} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests0", "filter": { "a": {"$gte": "cat"} }, "sort": { "_id": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower" } }');
+
+-- numericOrdering: lexical ("10" < "2") vs numeric ("2" < "10") sort order.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests1', '{"_id": 1, "a": "cat", "b": "10"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests1', '{"_id": 2, "a": "cat", "b": "2"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_order_tests1', '{"_id": 3, "a": "cat", "b": "3"}');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests1", "filter": { "a": "cat" }, "sort": { "b": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "numericOrdering" : false } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests1", "filter": { "a": "cat" }, "sort": { "b": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "numericOrdering" : true } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests1", "filter": { "a": "cat" }, "sort": { "b": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "numericOrdering" : false } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_order_tests1", "filter": { "a": "cat" }, "sort": { "b": -1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "numericOrdering" : true } }');
+
+-- $setWindowFields uses the sortBy collation when ordering.
+SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_order_tests1", "pipeline":  [{"$setWindowFields": { "sortBy": {"b": -1}, "output": {"res": { "$push": "$b", "window": {"documents": ["unbounded", "unbounded"]}}}}}], "collation": { "locale": "en", "numericOrdering" : false } }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_order_tests1", "pipeline":  [{"$setWindowFields": { "sortBy": {"b": -1}, "output": {"res": { "$push": "$b", "window": {"documents": ["unbounded", "unbounded"]}}}}}], "collation": { "locale": "en", "numericOrdering" : true } }');
+
+-- ==============================================================================
+-- SECTION 4: find — _id filters under collation
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "Cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "CaT" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "Dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": "DoG" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": { "a" : "cat" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids',' { "_id": { "a": "CAT"} }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "a": { "a": "Dog" } } ');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_string_ids', '{ "_id": [ "cat", "CAT "] }');
+
+-- $or on _id (case-insensitive match across mixed-case ids).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_string_ids", "filter": { "$or" : [{ "_id": { "$eq": "cat" } }, { "_id": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+-- Dotted-path _id.a.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_string_ids", "filter": { "$or" : [{ "_id.a": { "$eq": "cat" } }, { "_id.a": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- ==============================================================================
+-- SECTION 5: aggregation — array fields under collation
+-- ==============================================================================
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_strings", "pipeline": [ { "$sort": { "_id": 1 } }, { "$addFields": { "e": {  "f": "$a" } } }, { "$replaceRoot": { "newRoot": "$e" } }, { "$match" : { "f": { "$elemMatch": {"$eq": "cAt"} } } }, {"$project": { "items" : { "$filter" : { "input" : "$f", "as" : "animal", "cond" : { "$eq" : ["$$animal", "CAT"] } }} }} ],
+ "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+
+-- ==============================================================================
+-- SECTION 6: aggregation — $expr and ICU locale semantics
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": 1, "a": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": 2, "a": "dog" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": 3, "a": "cAt" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": 4, "a": "dOg" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": "hen", "a": "hen" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_agg_proj', '{ "_id": "bat", "a": "bat" }');
+
+-- $expr with $eq/$ne/$lte/$gte/$gt under various locales.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "hi", "strength" : 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$ne": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fi", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$lte": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$gte": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$gte": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr_CA", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$gte": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "es@collation=search", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$gt": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$or": [{"$gte": [ "$a", "DOG" ]}, {"$gte": [ "$a", "CAT" ]}] } }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$and": [{"$lte": [ "$a", "DOG" ]}, {"$lte": [ "$a", "CAT" ]}] } }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr", "strength" : 2 } }');
+
+-- en_US_POSIX uses C-style byte comparison: case-sensitive even at strength 1 (per ICU semantics).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en_US_POSIX", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en_US_POSIX", "strength" : 1 } }');
+
+-- locale "simple": pure binary comparison (no ICU collation).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "CAT"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple"} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple"} }');
+
+-- locale "simple": ignores all other collation options.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple", "strength": 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple", "strength": 3} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple", "caseFirst": "upper"} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj",  "filter": { "$expr": {"$eq": ["$a", "cat"]} }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "simple", "caseFirst": "lower"} }');
+
+-- ==============================================================================
+-- SECTION 7: aggregation — expression operators ($filter, $in, $indexOf*, $strcasecmp)
+-- ==============================================================================
+
+-- $filter — element-wise predicate honors collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$a"], { "$filter": { "input": ["$a"], "as": "item", "cond": { "$eq": [ "$$item", "CAT" ] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$a"], { "$filter": { "input": ["$a"], "as": "item", "cond": { "$eq": [ "$$item", "CAT" ] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$a"], { "$filter": { "input": ["$a"], "as": "item", "cond": { "$ne": [ "$$item", "CAT" ] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$a"], { "$filter": { "input": ["$a"], "as": "item", "cond": { "$or": [{"$gte": [ "$$item", "DOG" ]}, {"$gte": [ "$$item", "CAT" ]}] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$a"], { "$filter": { "input": ["$a"], "as": "item", "cond": { "$and": [{"$gte": [ "$$item", "DOG" ]}, {"$gte": [ "$$item", "CAT" ]}] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": { "$eq": [["$_id"], { "$filter": { "input": ["$_id"], "as": "item", "cond": { "$and": [{"$gte": [ "$$item", "HEN" ]}, {"$gte": [ "$$item", "BAT" ]}] } } } ] } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+
+-- $in — set membership honors collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$in": ["$a", ["CAT", "DOG"]]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "fr", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$in": ["$a", ["CAT", "DOG"]]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$in": ["$a", ["CAT", "DOG"]]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$in": ["$_id", ["HEN", "BAT"]]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$in": ["$_id", ["HEN", "BAT"]]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+
+-- $indexOfArray — element comparison honors collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfArray": [ ["CAT", "DOG"], "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfArray": [ ["CAT", "DOG"], "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+
+-- $indexOfBytes — byte-level operator; ignores collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfBytes": [ "cAtALoNa", "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfBytes": [ "cAtALoNa", "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfBytes": [ "$a", "aT" ] }, 1]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfBytes": [ "$a", "AT" ] }, -1]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+
+-- $indexOfCP — code-point operator; ignores collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfCP": [ "cAtALoNa", "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfCP": [ "cAtALoNa", "$a" ] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfCP": [ "$a", "at" ] }, 1]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$indexOfCP": [ "$a", "AT" ] }, 1]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+
+-- $strcasecmp — has its own case-folding; ignores collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$strcasecmp": ["$a", "CAT"] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$strcasecmp": ["$a", "CAT"] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$strcasecmp": ["$a", "CAT"] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 2 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "filter": { "$expr": {"$eq": [{ "$strcasecmp": ["$a", "CAT"] }, 0]} }, "sort": { "_id": 1 }, "skip": 0, "collation": { "locale": "en", "strength" : 3 } }');
+
+-- ==============================================================================
+-- SECTION 8: aggregation — projection stages and set operators
+-- ==============================================================================
+
+-- $addFields with $ne / $lte / $gte under fr-strength-1/3.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$addFields": { "newField": { "$ne": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$addFields": { "newField": { "$lte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$addFields": { "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 3} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$addFields": { "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+
+-- $set (alias of $addFields).
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$set": { "newField": { "$ne": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$set": { "newField": { "$lte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$set": { "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 3} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$set": { "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+
+-- $project (and the bson_dollar_project helper) with collation-aware predicates.
+SELECT documentdb_api_internal.bson_dollar_project(document, '{ "newField": { "$eq": ["$a", "CAT"] } }', '{}', 'en-u-ks-level1') FROM documentdb_api.collection('coll_q_db', 'coll_agg_proj');
+SELECT documentdb_api_internal.bson_dollar_project(document, '{ "newField": { "$eq": ["$a", "DOG"] } }', '{}', 'en-u-ks-level1') FROM documentdb_api.collection('coll_q_db', 'coll_agg_proj');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$ne": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$lte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 3} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$gte": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+
+-- $replaceRoot — comparison inside the new root document.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceRoot": { "newRoot": { "a": "$a", "newField": { "$eq": ["$a", "CAT"] } } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceRoot": { "newRoot": { "a": "$a", "newField": { "$ne": ["$a", "CAT"] } } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceRoot": { "newRoot": { "a": "$a", "newField": { "$lte": ["$a", "DoG"] } } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceRoot": { "newRoot": { "a": "$a", "newField": { "$gte": ["$a", "doG"] } } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $replaceWith (alias of $replaceRoot).
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceWith": { "a": "$a", "newField": { "$eq": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceWith": { "a": "$a", "newField": { "$ne": ["$a", "CAT"] } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$replaceWith": { "a": "$a", "newField": { "$lte": ["$a", "DoG"] } } } ], "cursor": {}, "collation": { "locale": "fr", "strength" : 1} }');
+
+-- $documents — collection-less pipeline source; predicate inside $cond honors collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": { "$cond": { "if": { "$eq": [ "CaT", "cAt" ] }, "then": [{"result": "case insensitive"}] , "else": [{"res": "case sensitive"}] }} } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": { "$cond": { "if": { "$eq": [ "CaT", "cAt" ] }, "then": [{"result": "case insensitive"}] , "else": [{"res": "case sensitive"}] }} } ], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $sortArray — element ordering inside an array uses command collation (and numericOrdering).
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_sortArray', '{"_id":1,"a":"one", "b":["10","1"]}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_sortArray', '{"_id":2,"a":"two", "b":["2","020"]}', NULL);
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_sortArray", "pipeline": [ { "$project": { "sortedArray": { "$sortArray": { "input": ["cat", "dog", "DOG"], "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_sortArray", "pipeline": [ { "$project": { "sortedArray": { "$sortArray": { "input": ["cat", "dog", "DOG"], "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{
+  "find": "coll_sortArray",
+  "filter": { "a": {"$lte": "two"} },
+  "projection": {
+    "sortedArray": { "$sortArray": { "input": "$b", "sortBy": 1 } }
+  },
+  "collation": { "locale": "en", "numericOrdering" : false },
+  "limit": 5
+}');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{
+  "find": "coll_sortArray",
+  "filter": { "a": {"$lte": "two"} },
+  "projection": {
+    "sortedArray": { "$sortArray": { "input": "$b", "sortBy": 1 } }
+  },
+  "collation": { "locale": "en", "numericOrdering" : true },
+  "limit": 5
+}');
+
+-- find with computed projection ($eq/$ne/$gte) under different strengths.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "projection": { "a": 1, "newField": { "$eq": ["$a", "CAT"] } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "projection": { "a": 1, "newField": { "$ne": ["$a", "CAT"] } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "projection": { "a": 1, "newField": { "$ne": ["$a", "CAT"] } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "projection": { "a": 1, "newField": { "$gte": ["$a", "CAT"] } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_agg_proj", "projection": { "a": 1, "newField": { "$gte": ["$a", "CAT"] } }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $redact — $$KEEP / $$PRUNE / $$DESCEND decisions made under collation.
+SELECT documentdb_api.insert_one('coll_q_db','coll_redact','{ "_id": 1, "level": "public", "content": "content 1", "details": { "level": "public", "value": "content 1.1", "moreDetails": { "level": "restricted", "info": "content 1.1.1" } } }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_redact','{ "_id": 2, "level": "restricted", "content": "content 2", "details": { "level": "public", "value": "content 2.1", "moreDetails": { "level": "restricted", "info": "content 2.1.1" } } }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_redact','{ "_id": 3, "level": "public", "content": "content 3", "details": { "level": "restricted", "value": "content 3.1", "moreDetails": { "level": "public", "info": "content 3.1.1" } } }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_redact','{ "_id": 4, "content": "content 4", "details": { "level": "public", "value": "content 4.1" } }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_redact','{ "_id": 5, "level": "public", "content": "content 5", "details": { "level": "public", "value": "content 5.1", "moreDetails": [{ "level": "restricted", "info": "content 5.1.1" }, { "level": "public", "info": "content 5.1.2" }] } }', NULL);
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_redact", "pipeline": [ { "$redact": { "$cond": { "if": { "$eq": ["$level", "PUBLIC"] }, "then": "$$KEEP", "else": "$$PRUNE" } } }  ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_redact", "pipeline": [ { "$redact": { "$cond": { "if": { "$eq": ["$level", "puBliC"] }, "then": "$$DESCEND", "else": "$$PRUNE" } } }  ], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_redact", "pipeline": [ { "$redact": { "$switch": { "branches": [ { "case": { "$eq": ["$level", "PUBLIC"] }, "then": "$$PRUNE" }, { "case": { "$eq": ["$classification", "RESTRICTED"] }, "then": { "$cond": { "if": { "$eq": ["$content", null] }, "then": "$$KEEP", "else": "$$PRUNE" } } }], "default": "$$KEEP" } }  }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_redact", "pipeline": [ { "$redact": { "$switch": { "branches": [ { "case": { "$eq": ["$level", "PUBLIC"] }, "then": "$$PRUNE" }, { "case": { "$eq": ["$classification", "RESTRICTED"] }, "then": { "$cond": { "if": { "$eq": ["$content", null] }, "then": "$$KEEP", "else": "$$PRUNE" } } }], "default": "$$KEEP" } }  }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+
+-- $setEquals — set equality compares elements under collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a"], ["CAT"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a"], ["DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a"], ["DOG", "dOg"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setEquals": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $setIntersection.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a"], ["CAT"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a"], ["DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a"], ["DOG", "dOg"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIntersection": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $setUnion.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a"], ["CAT"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a"], ["DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a"], ["DOG", "dOg"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setUnion": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $setUnion — the "simple" locale hashes like no collation (binary), so the two results below must be byte-identical.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$setUnion": [ [ "cat", "Cat", "CAT", "caT", "dog", "Dog", "DOG", "bird", "Bird", "BIRD" ] ] } } } ], "cursor": {}, "collation": { "locale": "simple" } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$setUnion": [ [ "cat", "Cat", "CAT", "caT", "dog", "Dog", "DOG", "bird", "Bird", "BIRD" ] ] } } } ], "cursor": {} }');
+
+-- Collation applies to utf8 and symbol, and to strings nested in documents and arrays.
+-- Code, code with scope, and db pointers compare byte-wise, in hashing as in comparison.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$setUnion": [ [ { "$symbol": "cat" }, { "$symbol": "CAT" }, "Cat" ] ] } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$code": "cat" }, { "$code": "CAT" } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$code": "cat", "$scope": { "s": 1 } }, { "$code": "CAT", "$scope": { "s": 1 } } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+-- Strings inside a scope document are not collated either.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$code": "c", "$scope": { "s": "cat" } }, { "$code": "c", "$scope": { "s": "CAT" } } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$dbPointer": { "$ref": "cat", "$id": { "$oid": "111111111111111111111111" } } }, { "$dbPointer": { "$ref": "CAT", "$id": { "$oid": "111111111111111111111111" } } } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+-- Equality filters follow the same rule.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "string", "v": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "symbol", "v": { "$symbol": "cat" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "code", "v": { "$code": "cat" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "codeWithScopeSource", "v": { "$code": "cat", "$scope": { "x": 1 } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "codeWithScopeValue", "v": { "$code": "return x", "$scope": { "x": "cat" } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_code_collation', '{ "_id": "dbPointer", "v": { "$dbPointer": { "$ref": "cat", "$id": { "$oid": "111111111111111111111111" } } } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_code_collation", "filter": { "v": "CAT" }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_code_collation", "filter": { "v": { "$code": "CAT" } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_code_collation", "filter": { "v": { "$code": "CAT", "$scope": { "x": 1 } } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_code_collation", "filter": { "v": { "$code": "return x", "$scope": { "x": "CAT" } } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_code_collation", "filter": { "v": { "$dbPointer": { "$ref": "CAT", "$id": { "$oid": "111111111111111111111111" } } } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT documentdb_api.count_query('coll_q_db', '{ "count": "coll_code_collation", "query": { "v": "CAT" }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT documentdb_api.count_query('coll_q_db', '{ "count": "coll_code_collation", "query": { "v": { "$symbol": "CAT" } }, "collation": { "locale": "en", "strength": 1 } }');
+-- Code and code-with-scope remain byte-wise under collation.
+SELECT documentdb_api.count_query('coll_q_db', '{ "count": "coll_code_collation", "query": { "v": { "$code": "CAT" } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT documentdb_api.count_query('coll_q_db', '{ "count": "coll_code_collation", "query": { "v": { "$code": "cat" } }, "collation": { "locale": "en", "strength": 1 } }');
+SELECT documentdb_api.count_query('coll_q_db', '{ "count": "coll_code_collation", "query": { "v": { "$code": "return x", "$scope": { "x": "CAT" } } }, "collation": { "locale": "en", "strength": 1 } }');
+-- Strength 3 keeps case significant, so the same values stay distinct.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$symbol": "cat" }, { "$symbol": "CAT" }, "Cat" ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 3 } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$code": "cat" }, { "$code": "CAT" } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 3 } }');
+-- The binary "simple" locale never folds case for these types either.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "u": { "$sortArray": { "input": { "$setUnion": [ [ { "$symbol": "cat" }, { "$symbol": "CAT" } ] ] }, "sortBy": 1 } } } } ], "cursor": {}, "collation": { "locale": "simple" } }');
+
+-- Sort keys larger than the stack scratch buffer must fall back to the heap and still
+-- collate correctly. 600 characters is well past the scratch size.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', ('{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "n": { "$size": { "$setUnion": [ [ "' || repeat('ab', 300) || '", "' || repeat('AB', 300) || '" ] ] } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }')::bson);
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', ('{ "aggregate": 1, "pipeline": [ { "$documents": [ {} ] }, { "$project": { "n": { "$size": { "$setUnion": [ [ "' || repeat('ab', 300) || '", "' || repeat('AB', 300) || '" ] ] } } } } ], "cursor": {}, "collation": { "locale": "en", "strength": 3 } }')::bson);
+
+-- $setDifference.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a"], ["CAT"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a"], ["DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a"], ["DOG", "dOg"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setDifference": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }, { "$project": { "a": 1, "newField": {"$sortArray": {"input": "$newField", "sortBy": 1}} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $setIsSubset.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a"], ["CAT"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a"], ["DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a"], ["DOG", "dOg"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 2} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": {"$setIsSubset": [["$a", "cAT", "dog"], ["CAT", "DOG"]]} } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $let — variable bindings; the $cond inside `in` honors collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$let": { "vars": { "var1": "$a" }, "in": { "$cond": { "if": { "$eq": ["$$var1", "CAT"] }, "then": 1, "else": 0 } } } } } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$let": { "vars": { "var1": "$a" }, "in": { "$cond": { "if": { "$eq": ["$$var1", "CAT"] }, "then": 1, "else": 0 } } } } } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- $zip — collation reaches expressions inside the `inputs` clause.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$zip": { "inputs": [ {"$cond": [{"$eq": ["CAT", "$a"]}, ["$a"], ["null"]]}, ["$a"]] } } } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_agg_proj", "pipeline": [ { "$project": { "a": 1, "newField": { "$zip": { "inputs": [ {"$cond": [{"$eq": ["CAT", "$a"]}, ["$a"], ["null"]]}, ["$a"]] } } } }], "cursor": {}, "collation": { "locale": "en", "strength" : 3} }');
+
+-- ==============================================================================
+-- SECTION 9: aggregation — $lookup, $facet, $unionWith, $graphLookup
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "DOG", "a" : { "b" : "DOG" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "dog", "a" : { "b" : "dog" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "Cat", "a" : { "b" : "Cat" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "Dog", "a" : { "b" : "Dog" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "cAT", "a" : { "b" : "cAT" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "DoG", "a" : { "b" : "DoG" }}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_lookup_src', '{"_id": "dOg", "a" : { "b" : "dOg" }}', NULL);
+
+-- $lookup with _id join — nested $match honors collation; the _id equality itself stays exact.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+    '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$lookup": { "from": "coll_lookup_src", "as": "matched_docs", "localField": "_id", "foreignField": "_id", "pipeline": [ { "$match": { "$or" : [ { "a.b": "cat" }, { "a.b": "dog" } ] } } ] } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+
+-- $lookup with _id join (repeat) — verifies _id-join optimization keeps the same result.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+    '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$lookup": { "from": "coll_lookup_src", "as": "matched_docs", "localField": "_id", "foreignField": "_id", "pipeline": [ { "$match": { "$or" : [ { "a.b": "cat" }, { "a.b": "dog" } ] } } ] } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+
+-- $lookup on non-_id field — both the join key match and the nested $match honor collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+    '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$lookup": { "from": "coll_lookup_src", "as": "matched_docs", "localField": "a.b", "foreignField": "a.b", "pipeline": [ { "$match": { "$or" : [ { "a.b": "cat" }, { "a.b": "dog" } ] } } ] } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+
+-- $lookup joining a non-_id localField to the _id foreignField. Because the foreign key is
+-- _id this exercises the right-side _id-join path; under a collation the match is collation-
+-- aware (never byte-wise), so each a.b value matches every _id the collation deems equal.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+    '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$lookup": { "from": "coll_lookup_src", "as": "matched_docs", "localField": "a.b", "foreignField": "_id" } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}  }');
+
+-- $facet — sub-pipelines inherit command collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$facet": { "a" : [ { "$match": { "a.b": "cat" } }, { "$count": "catCount" } ], "b" : [ { "$match": { "a.b": "dog" } }, { "$count": "dogCount" } ]  } } ], "cursor": {}, "collation": { "locale": "en", "strength" : 1}}');
+
+-- $unionWith — sub-pipeline $match honors command collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$unionWith": { "coll": "coll_lookup_src", "pipeline" : [ { "$match": { "a.b": "cat" }}] } }], "cursor": {}, "collation": { "locale": "en", "strength" : 1} }');
+
+-- $graphLookup — traversal across `connectFromField`/`connectToField` uses command collation.
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_src', '{"_id": "alice", "pet" : "dog" }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_src', '{"_id": "bob", "pet" : "cat" }', NULL);
+
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_target', '{"_id": "DOG", "name" : "DOG" }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_target', '{"_id": "dog", "name" : "dog" }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_target', '{"_id": "CAT", "name" : "CAT" }', NULL);
+SELECT documentdb_api.insert_one('coll_q_db','coll_graph_target', '{"_id": "cAT", "name" : "cAT" }', NULL);
+
+-- en/strength=3 — case-sensitive: only exact-case matches connect.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 3} }');
+
+-- Self-join graphLookup on a.b at strength=1 — full case-insensitive component traversal.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_lookup_src", "pipeline": [ { "$graphLookup": { "from": "coll_lookup_src", "startWith": "$a.b", "connectFromField": "a.b", "connectToField": "a.b", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 1} }');
+
+-- en/strength=1 / 2: case-insensitive across DOG/dog/Dog and CAT/cAT.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 2} }');
+
+-- Locale + alternate / caseFirst variants.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "fr", "strength" : 1, "alternate": "shifted" } }');
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "hi", "strength" : 2, "caseFirst": "lower" } }');
+
+-- $graphLookup at en/strength=3 — repeat for stability.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+    '{ "aggregate": "coll_graph_src", "pipeline": [ { "$graphLookup": { "from": "coll_graph_target", "startWith": "$pet", "connectFromField": "name", "connectToField": "_id", "as": "destinations", "depthField": "depth" } } ],  "collation": { "locale": "en", "strength" : 3} }');
+
+-- ==============================================================================
+-- SECTION 10: operators — bson_query_match
+-- ==============================================================================
+
+-- enableCollation = off: collation argument is ignored (no error, no match).
+SET documentdb_core.enableCollation TO off;
+
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{"a": "CAT"}', '{}', 'en-u-ks-level1');
+
+-- enableCollation = on: collation argument is honored.
+SET documentdb_core.enableCollation TO on;
+
+-- _id field is collation-aware in bson_query_match.
+SELECT documentdb_api_internal.bson_query_match('{"_id": "cat"}', '{"_id": "CAT"}', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"_id": "cat"}', '{"_id": "CAT"}', '{}', 'en-u-ks-level2');
+SELECT documentdb_api_internal.bson_query_match('{"_id": "cat"}', '{"_id": "CAT"}', '{}', 'en-US-u-ks-level2');
+
+-- $eq with various locales/strengths.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{"a": "CAT"}', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$eq" : "CAT"} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$eq" : "càt"} }', '{}', 'fr-u-ks-level3');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat", "b": "dog"}', '{"a": "CAT", "b": "DOG"}', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat", "b": "dog"}', '{"a": "CAT", "b": "DOG"}', '{}', 'sv-u-ks-level1');
+
+-- $ne — negation under collation.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$ne" : "CAT"} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$ne" : "càt"} }', '{}', 'fr-u-ks-level3');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat", "b": "dog"}', '{"a": "CAT", "b": "DOG"}', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat", "b": "dog"}', '{"a": "CAT", "b": "DOG"}', '{}', 'sv-u-ks-level1');
+
+-- $gt / $gte.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$gt" : "CAT"} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$gte" : "CAT"} }', '{}', 'en-u-ks-level1');
+
+-- $lt / $lte.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$lte" : "CAT"} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$lte" : "càt"} }', '{}', 'fr-u-ks-level3');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$lte" : "càt"} }', '{}', 'fr-CA-u-ks-level3');
+
+-- $in.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$in" : ["CAT", "DOG"]} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$in" : ["càt", "dòg"]} }', '{}', 'fr-u-ks-level3');
+
+-- $nin.
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$nin" : ["CAT", "DOG"]} }', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": "cat"}', '{ "a": {"$nin" : ["càt", "dòg"]} }', '{}', 'fr-u-ks-level3');
+
+-- Nested arrays — array element comparison honors collation.
+SELECT documentdb_api_internal.bson_query_match('{"a": ["cat"]}', '{ "a": {"$in" : [["CAT"], "DOG"]} }', '{}', 'de-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": ["cat"]}', '{ "a": {"$in" : [["CAT"], ["DOG"]] } }', '{}', 'de-u-ks-level3');
+
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays', '{ "_id": 1, "a": ["dog"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays', '{ "_id": 2, "a": ["cat", "dog"] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays', '{ "_id": 3, "a": [[["cat"]]] }');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_arrays", "filter": { "a" : {"$in" : [ ["dOG"] ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_arrays", "filter": { "a" : {"$in" : [ [["CAT"]] ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_arrays", "filter": { "a" : {"$in" : [["CAT"], ["DOG"]] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- Nested documents — string values inside sub-documents honor collation.
+SELECT documentdb_api_internal.bson_query_match('{"a": {"b": "cat"}}', '{ "a": {"b": "CAT"} }', '{}', 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_query_match('{"a": {"b": {"c": "cat"}}}', '{ "a": {"b": {"c": "CAT"}} }', '{}', 'en-u-ks-level2');
+
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_docs', '{ "_id": 1, "a": { "b": "cat" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_docs', '{ "_id": 2, "a": { "b": "dog" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_docs', '{ "_id": 3, "a": { "b": { "c": "cat" } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_docs', '{ "_id": 4, "a": { "b": { "c": "dog" } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_docs', '{ "_id": 5, "a": { "b": { "c": { "d": "cat" } } } }');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_docs", "filter": { "a" : {"$in" : [ {"b": "dOG"} ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_docs", "filter": { "a" : {"$in" : [ {"b": { "c": "dOg" }} ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_docs", "filter": { "a" : {"$in" : [ {"b": { "c": { "d": "dOg" }}} ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- Nested document keys are collation-agnostic ("B" ≠ "b" even at strength 1).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_docs", "filter": { "a" : {"$in" : [ {"B": "dOG"} ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- Mix of nested arrays and documents.
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 1, "a": { "b": ["cat"] } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 2, "a": { "b": ["dog"] } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 3, "a": { "b": ["cat", "dog"] } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 4, "a": {"b": [["dog"]] } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 5, "a": { "b": [[["cat"]]] } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'nested_arrays_docs', '{ "_id": 6, "a": "cat" }');
+
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_arrays_docs", "filter": { "a" : {"$in" : [ {"b": ["dOG"]}, "CAT" ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "nested_arrays_docs", "filter": { "a" : {"$in" : [ {"b": [["dOg"]] } ] }}, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1} }');
+
+-- ==============================================================================
+-- SECTION 11: operators — positional projection and bson_dollar_* family
+-- ==============================================================================
+
+-- find with positional projection (`b.$`) — collation drives both the top-level $eq and the $elemMatch.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_find_positional', '{"_id":1, "a":"cat", "b":[{"a":"cat"},{"a":"caT"}], "c": ["cat"]}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_find_positional', '{"_id":2, "a":"dog", "b":[{"a":"dog"},{"a":"doG"}], "c": ["dog"]}', NULL);
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_find_positional', '{"_id":3, "a":"caT", "b":[{"a":"caT"},{"a":"cat"}], "c": ["caT"]}', NULL);
+
+-- strength 3: case-sensitive — only exact-case "CAT" matches (none here).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{
+  "find": "coll_find_positional",
+  "filter": { "a": "CAT", "b": { "$elemMatch": { "a": "CAT" } } },
+  "projection": { "_id": 1, "b.$": 1 },
+  "sort": { "_id": 1 },
+  "skip": 0,
+  "limit": 5,
+  "collation": { "locale": "en", "strength" : 3}
+}');
+
+-- strength 1: case-insensitive — matches both cat and caT docs.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{
+  "find": "coll_find_positional",
+  "filter": { "a": "CAT", "b": { "$elemMatch": { "a": "CAT" } } },
+  "projection": { "_id": 1, "b.$": 1 },
+  "sort": { "_id": 1 },
+  "skip": 0,
+  "limit": 5,
+  "collation": { "locale": "en", "strength" : 1 }
+}');
+
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_find_positional');
+
+-- ----------------------------------------------------------------
+-- $in: [] short-circuit through bson_dollar_* helpers.
+-- ----------------------------------------------------------------
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_in_empty', '{"_id": 1, "name": "cat", "sound": "meow"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_in_empty', '{"_id": 2, "name": "dog", "sound": "woof"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_in_empty', '{"_id": 3, "sound": "moo"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_in_empty', '{"_id": 4, "name": "sheep", "sound": "baa"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_in_empty', '{"_id": 5, "name": "duck"}');
+
+-- $addFields downstream — baseline / +let / +collation / +let+collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] }}}, { "$addFields": { "newField": "animal" } } ], 
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] }}}, { "$addFields": { "newField": "animal" } } ], 
+  "let": { "varRef": "lion"},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] }}}, { "$addFields": { "newField": "animal" } } ], 
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"sound": "moo", "_id": { "$in": [] }}}, { "$addFields": { "newField": "$$varRef" } } ], 
+  "let": { "varRef": "lion"},
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+-- $redact downstream — baseline / +let / +collation / +let+collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] }}}, { "$redact": { "$cond": [ { "$eq": [ "$sound", "meow" ] }, "$$KEEP", "$$PRUNE" ] } } ], 
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"owner": { "$in": [] }}}, { "$redact": { "$cond": [ { "$eq": [ "$sound", "meow" ] }, "$$KEEP", "$$PRUNE" ] } } ], 
+  "let": { "varRef": "lion"},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"sound": { "$in": [] }}}, { "$redact": { "$cond": [ { "$eq": [ "$sound", "meow" ] }, "$$KEEP", "$$PRUNE" ] } } ], 
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] }}}, { "$redact": { "$cond": [ { "$eq": [ "$sound", "meow" ] }, "$$KEEP", "$$PRUNE" ] } } ], 
+  "let": { "varRef": "lion"},
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+-- $project downstream (bson_dollar_project) — baseline / +let / +collation / +let+collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"name": { "$in": [] }}}, { "$project": { "_id": 0, "sound": 1 } } ], 
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] } }}, { "$project": { "_id": 0, "name": 1, "varEcho": "$$varRef" } } ], 
+  "let": { "varRef": "lion"},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] } }}, { "$project": { "_id": 0, "name": 1 } } ], 
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"_id": { "$in": [] } }}, { "$project": { "_id": 0, "name": 1, "varEcho": "$$varRef" } } ], 
+  "let": { "varRef": "lion"},
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+-- $replaceRoot downstream (bson_dollar_replace_root) — baseline / +let / +collation / +let+collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"name": {"$in": [] } }}, { "$replaceRoot": { "newRoot": { "animal": "$name", "call": "$sound" } } } ], 
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"name": {"$in": [] } }}, { "$replaceRoot": { "newRoot": { "animal": "$$varRef", "call": "$sound" } } } ], 
+  "let": { "varRef": "lion"},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"name": {"$in": [] } }}, { "$replaceRoot": { "newRoot": { "animal": "$name", "call": "$sound" } } } ], 
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ 
+  "aggregate": "coll_in_empty", 
+  "pipeline": [ {"$match": {"name": {"$in": [] } }}, { "$replaceRoot": { "newRoot": { "animal": "$$varRef", "call": "$sound" } } } ], 
+  "let": { "varRef": "lion"},
+  "collation": { "locale": "en", "strength" : 1},
+  "cursor": {} }');
+
+-- find-projection (bson_dollar_project_find) with let + collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{
+  "find": "coll_in_empty",
+  "filter": {
+    "_id": { "$in": [] }
+  },
+  "projection": { "name": true },
+  "let": { "varRef": "lion" },
+  "collation": { "locale": "en", "strength" : 1 }
+}');
+
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_in_empty');
+
+-- ==============================================================================
+-- SECTION 12: operators — bson_expression_get / bson_expression_partition_get
+-- ==============================================================================
+
+-- $eq.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $ne.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$ne": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$ne": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $cmp.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cmp": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cmp": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $gt.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "cat" }'::bson, '{ "result": { "$gt": ["$a", "Cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "cat" }'::bson, '{ "result": { "$gt": ["$a", "Cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $gte.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$gte": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$gte": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $lt.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$lt": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$lt": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $lte.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "cat" }'::bson, '{ "result": { "$lte": ["$a", "Cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "cat" }'::bson, '{ "result": { "$lte": ["$a", "Cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $cond — predicate inside the conditional honors collation.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cond": [{ "$eq": ["$a", "cat"] }, "matched", "no_match"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cond": [{ "$eq": ["$a", "cat"] }, "matched", "no_match"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $in (expression operator) — set membership honors collation.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$in": ["$a", ["cat", "dog"]] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$in": ["$a", ["cat", "dog"]] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- $and — both branches evaluated under collation.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat", "b": "Dog" }'::bson, '{ "result": { "$and": [{ "$eq": ["$a", "cat"] }, { "$eq": ["$b", "dog"] }] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- Strength variation: 2 (case-insensitive) vs 3 (case-sensitive).
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level2');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level3');
+
+-- bson_expression_partition_get — the partitioning variant also honors collation.
+SELECT documentdb_api_internal.bson_expression_partition_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_partition_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$eq": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_partition_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cmp": ["$a", "cat"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_partition_get(
+  '{ "a": "Cat" }'::bson, '{ "result": { "$cmp": ["$a", "cat"] } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- ==============================================================================
+-- SECTION 13: write — delete with collation
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete', '{"_id": "dog", "a":"dog"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete', '{"_id": "DOG", "a":"DOG"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete', '{"_id": "cat", "a":"cat"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete', '{"_id": "CAT", "a":"CAT"}');
+
+-- enableCollation = off: collation argument silently ignored, delete uses byte-exact match.
+SET documentdb_core.enableCollation TO off;
+
+BEGIN;
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"_id": "DoG" }, "limit": 0, "collation": { "locale": "fr", "strength" : 2}} ]}');
+ROLLBACK;
+
+-- enableCollation = on for the rest of the section.
+SET documentdb_core.enableCollation TO on;
+
+-- _id equality pushes down, but a string _id still uses the supplied collation
+-- for the comparison ("DoG"/"cAT" match "dog"/"cat" at strength=2/3).
+BEGIN;
+SET citus.log_remote_commands TO ON;
+
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"_id": 1 }, "limit": 0, "collation": { "locale": "fr", "strength" : 2}} ]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"_id": "DoG" }, "limit": 0, "collation": { "locale": "fr", "strength" : 2}} ]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"_id": "cAT" }, "limit": 0, "collation": { "locale": "fr", "strength" : 3}} ]}');
+ROLLBACK;
+
+-- deleteMany on a non-_id field — strength 1 vs strength 3 controls how many rows match.
+BEGIN;
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "CaT" }, "limit": 0, "collation": { "locale": "en", "strength" : 3}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "CaT" }, "limit": 0, "collation": { "locale": "en", "strength" : 1}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "DoG" }, "limit": 0, "collation": { "locale": "en", "strength" : 3}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "DoG" }, "limit": 0, "collation": { "locale": "en", "strength" : 1}}]}');
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+ROLLBACK;
+
+-- deleteOne (limit: 1) — same matching, but at most one row removed per call.
+BEGIN;
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "CaT" }, "limit": 1, "collation": { "locale": "en", "strength" : 1}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "CaT" }, "limit": 1, "collation": { "locale": "en", "strength" : 3}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "DoG" }, "limit": 1, "collation": { "locale": "en", "strength" : 1}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"a": "DoG" }, "limit": 1, "collation": { "locale": "en", "strength" : 3}}]}');
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+ROLLBACK;
+
+-- Range / multi-operator query predicates ($lt, $gt, $exists) under collation.
+BEGIN;
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"a": {"$lt": "DeG"} },"limit": 1, "collation": { "locale": "fr", "strength" : 1} }] }');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"a": {"$lt": "DoG"}, "a": {"$lt": "Goat"} },"limit": 1, "collation": { "locale": "fr", "strength" : 2} }] }');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ {"q": {"a": { "$exists": true }, "a": {"$gt": "DoG"}, "a": {"$lt": "goat"} },"limit": 1, "collation": { "locale": "fr", "strength" : 1 } }] }');
+
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+ROLLBACK;
+
+-- delete with sort: sort ordering uses collation, so deleteOne picks the right row.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete_sort', '{"_id": "dog", "a": "dog"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete_sort', '{"_id": "DOG", "a": "dog"}');
+
+-- Sort ASC by `_id` — strength 3 picks the case-sensitively smaller _id.
+BEGIN;
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+
+SELECT collection_id AS coll_delete_sort FROM documentdb_api_catalog.collections WHERE database_name = 'coll_q_db' AND collection_name = 'coll_delete_sort' \gset
+SELECT documentdb_api_internal.delete_worker(
+    p_collection_id=>:coll_delete_sort,
+    p_shard_key_value=>:coll_delete_sort,
+    p_shard_oid => 0,
+    p_update_internal_spec => '{ "deleteOne": { "query": { "a": "dog" }, "collation": "en-u-ks-level3",  "sort": { "_id": 1 }, "returnDocument": 1, "returnFields": { "a": 0} } }'::bson,
+    p_update_internal_docs=>null::bsonsequence,
+    p_transaction_id=>null::text
+) FROM documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+    
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+ROLLBACK;
+
+-- Sort DESC by `_id` — strength 3 picks the case-sensitively larger _id.
+BEGIN;
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+
+SELECT collection_id AS coll_delete_sort FROM documentdb_api_catalog.collections WHERE database_name = 'coll_q_db' AND collection_name = 'coll_delete_sort' \gset
+SELECT documentdb_api_internal.delete_worker(
+    p_collection_id=>:coll_delete_sort,
+    p_shard_key_value=>:coll_delete_sort,
+    p_shard_oid => 0,
+    p_update_internal_spec => '{ "deleteOne": { "query": { "a": "dog" }, "collation": "en-u-ks-level3",  "sort": { "_id": -1 }, "returnDocument": 1, "returnFields": { "a": 0} } }'::bson,
+    p_update_internal_docs=>null::bsonsequence,
+    p_transaction_id=>null::text
+) FROM documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+    
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete_sort');
+ROLLBACK;
+
+-- $in: [] short-circuit on delete — matches nothing regardless of collation.
+BEGIN;
+SELECT document from documentdb_api.collection('coll_q_db', 'coll_delete');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"_id": {"$in": []} }, "limit": 0, "collation": { "locale": "en", "strength" : 1}}]}');
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete", "deletes": [ { "q": {"_id": {"$in": []} }, "limit": 1, "collation": { "locale": "en", "strength" : 1}}]}');
+ROLLBACK;
+
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_delete');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_delete_sort');
+
+-- ==============================================================================
+-- SECTION 14: errors — invalid collation options
+-- ==============================================================================
+
+-- Each query exercises a different invalid combination (alternate, locale, caseFirst, strength).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper", "numericOrdering": true, "alternate": "none"} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en_DB", "strength" : 1, "caseLevel": true, "caseFirst": "upper", "numericOrdering": true, "alternate": "shifted"} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "bad", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 0, "caseLevel": true, "caseFirst": "bad", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : -1, "caseLevel": true, "caseFirst": "bad", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 6, "caseLevel": true, "caseFirst": "bad", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "abcd", "strength" : 1, "caseLevel": true, "caseFirst": "upper", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "fr_FR", "strength" : 1, "caseLevel": true, "caseFirst": "lower", "numericOrdering": true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "upper", "numericOrdering": true, "alternate": "shifted", "backwards" : "0"} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower", "numericOrdering": true, "alternate": "non-ignorable", "backwards" : true, "normalization" : 1} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 1, "caseLevel": true, "caseFirst": "lower", "numericOrdering": true, "alternate": "non-ignorable", "backwards" : true, "normalization" : true} }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_multi_collation", "filter": { "$or" : [{ "a": { "$eq": "cat" } }, { "b": { "$eq": "DOG" } }] }, "sort": { "_id": 1 }, "skip": 0, "limit": 5, "collation": { "locale": "en", "strength" : 0.9 } }');
+
+-- ==============================================================================
+-- SECTION 15: collation parsing
+-- ==============================================================================
+
+-- Missing locale: must be rejected.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": {}, "sort": { "_id": 1 }, "limit": 1, "collation": { "strength": 1 } }');
+
+-- alternate / maxVariable / backwards: parse, validate, and apply.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "en", "alternate": "shifted" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "en", "alternate": "shifted", "maxVariable": "space" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "fr", "strength": 2, "backwards": true } }');
+
+-- maxVariable without alternate parses; -kv- is suppressed (only meaningful with shifted).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "en", "maxVariable": "space" } }');
+
+-- Invalid enums and wrong types: rejected at parse time.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": {}, "collation": { "locale": "en", "alternate": "bogus" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": {}, "collation": { "locale": "en", "alternate": "shifted", "maxVariable": "bogus" } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": {}, "collation": { "locale": "en", "backwards": "true" } }');
+
+-- Locale lookup table entries.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "sr_Latn", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "ko@collation=unihan", "strength": 1 } }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_strings", "filter": { "a": "cat" }, "sort": { "_id": 1 }, "limit": 1, "collation": { "locale": "zh@collation=zhuyin", "strength": 1 } }');
+
+-- @collation= suffix is stripped from the ICU language tag (see explain output).
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_phonebook', '{ "_id": 1, "name": "Mueller" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_phonebook', '{ "_id": 2, "name": "Müller" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_phonebook', '{ "_id": 3, "name": "Schmidt" }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_phonebook", "filter": { "name": "Mueller" }, "sort": { "_id": 1 }, "collation": { "locale": "de@collation=phonebook", "strength": 1 } }');
+
+-- ==============================================================================
+-- SECTION 19: unsupported — aggregation stages
+-- ==============================================================================
+
+-- $bucket
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+'{
+    "aggregate": "coll_strings",
+    "pipeline": [
+        {
+            "$bucket": {
+                "groupBy": "$price",
+                "boundaries": [0, 10, 20, 30],
+                "default": "Other",
+                "output": {
+                    "categoryMatch": {
+                        "$sum": {
+                            "$cond": [
+                                { "$eq": ["$a", "PETS"] },
+                                1,
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    ],
+    "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- $geoNear
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+'{ "aggregate": "coll_strings",
+   "pipeline": [
+     {
+       "$geoNear": {
+         "near": { "type": "Point", "coordinates": [ 0 , 10 ] },
+         "distanceField": "dist.calculated",
+         "maxDistance": 2,
+         "query": { "a": "cAT" }
+       }
+     }
+   ],
+   "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- $fill
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', 
+'{
+    "aggregate": "coll_strings",
+    "pipeline": [
+        {
+            "$fill": {
+                "sortBy": { "timestamp": 1 },
+                "partitionBy": "$status",
+                "output": {
+                     "$cond": {
+                        "if": { "$eq": ["$a", "cAt"] },
+                        "then": { "type": "feline" },
+                        "else": { "type": "other" }
+                      }
+                }
+            }
+        }
+    ],
+    "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- $setWindowFields
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+'{ "aggregate": "coll_strings",
+   "pipeline": [
+     { "$setWindowFields": {
+         "sortBy": { "_id": 1 },
+         "output": {
+             "total": { "$eq": ["$a", "cAt"] }
+         }
+     }}
+   ],
+   "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- $sortByCount
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+'{ "aggregate": "coll_strings",
+   "pipeline": [
+     { "$sortByCount": {
+         "input": "$a",
+         "as": "a",
+         "by": { "$cond": { 
+           "if": { "$eq": [ "$a", "caT" ] }, 
+           "then": [{"x": 30}] , 
+           "else": [{"x": 30}] }}
+     }}
+   ],
+   "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- ==============================================================================
+-- SECTION 20: count command
+-- ==============================================================================
+
+-- Feature-gate behavior is covered alongside find and aggregate in Section 1.
+-- String, Symbol, Code, and Code-with-scope comparison behavior is covered in
+-- Section 8 so each BSON type can be compared across command surfaces.
+
+-- 20.1: Collation strength and both count response paths.
+-- Count with strength-1 collation matches all case variants.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"en","strength":1}}');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_count('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"en","strength":1}}');
+
+-- ==============================================================================
+-- SECTION 20.2: distinct command
+-- ==============================================================================
+-- Distinct applies collation to filtering and value deduplication.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":1,"value":"cafe","nested":{"value":"cafe"},"array":["cafe","Tea"],"items":[{"label":"cafe"},{"label":"Tea"}],"object":{"value":"cafe"},"numeric":"2","punct":"ab"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":2,"value":"CAF\u00c9","nested":{"value":"CAF\u00c9"},"array":["CAF\u00c9","tea"],"items":[{"label":"CAF\u00c9"},{"label":"tea"}],"object":{"value":"CAF\u00c9"},"numeric":"02","punct":"a-b"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":3,"value":"Cafe","nested":{"value":"Cafe"},"array":["Cafe"],"items":[{"label":"coffee"}],"object":{"value":"Cafe"},"numeric":"10","punct":"a b"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":4,"value":"tea","nested":{"value":"tea"},"array":[null,1],"object":{"value":"tea"},"numeric":"a2","punct":"a_b"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":5,"value":"TEA","nested":{},"array":[],"object":{"value":"TEA"},"numeric":"a10","punct":"ab"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":6,"value":null,"array":[null],"object":null,"numeric":2,"punct":null}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":7,"value":"\ud83d\ude00a","nested":{"value":"\ud83d\ude00a"},"array":["\ud83d\ude00a"],"object":{"value":"\ud83d\ude00a"}}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{"_id":8,"value":"\ud83d\ude00A","nested":{"value":"\ud83d\ude00A"},"array":["\ud83d\ude00A"],"object":{"value":"\ud83d\ude00A"}}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 9, "typed": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 10, "typed": { "$symbol": "CAT" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 11, "typed": { "$code": "cat" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 12, "typed": { "$code": "CAT" } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 13, "typed": { "$code": "return x", "$scope": { "x": "cat" } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 14, "typed": { "$code": "return x", "$scope": { "x": "CAT" } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 15, "typed": { "$dbPointer": { "$ref": "cat", "$id": { "$oid": "111111111111111111111111" } } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct', '{ "_id": 16, "typed": { "$dbPointer": { "$ref": "CAT", "$id": { "$oid": "111111111111111111111111" } } } }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct_visible', '{ "_id": 1, "value": "cafe" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct_visible', '{ "_id": 2, "value": "caf\u00e9" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_distinct_visible', '{ "_id": 3, "value": "th\u00e9" }');
+
+-- Binary, empty, null, and simple collations preserve all byte-distinct values.
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value"}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":null}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"simple","strength":1}}');
+
+-- Scalar values in separate equivalence classes have a stable full response.
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct_visible","key":"value","collation":{"locale":"fr","strength":2}}');
+
+-- Strength, case level, numeric ordering, and alternate handling change equivalence classes.
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":2}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":3}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":1,"caseLevel":true}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"numeric","collation":{"locale":"en","numericOrdering":true}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"punct","collation":{"locale":"en","strength":1,"alternate":"shifted","maxVariable":"punct"}}');
+
+-- Dotted paths, arrays, documents, supplementary characters, and query filters use the same collation.
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"nested.value","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"array","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"object","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"items.label","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","query":{"value":"\ud83d\ude00A"},"collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"numeric","query":{"value":"CAFE"},"collation":{"locale":"en","strength":1,"numericOrdering":true}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"numeric","query":{"value":{"$in":["CAFE","TEA"]}},"collation":{"locale":"en","strength":1,"numericOrdering":true}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","query":{"numeric":{"$gte":"2","$lt":"10"}},"collation":{"locale":"en","strength":1,"numericOrdering":true}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"missing","key":"value","collation":{"locale":"en","strength":1}}');
+
+-- UTF-8 strings and Symbol values share collated equivalence. Code,
+-- code-with-scope, and database-pointer values remain byte-distinct.
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"typed","collation":{"locale":"en","strength":1}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"typed"}');
+
+-- Command-level collation validation.
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"strength":1}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","unknown":true}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"not-a-real-locale"}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":0}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":6}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":{"locale":"en","strength":"1"}}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":[]}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":"en"}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":true}');
+SELECT document FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_distinct","key":"value","collation":1}');
+
+-- Strength 3 and simple collation retain case-sensitive matching.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"en","strength":3}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"locale":"simple"}}');
+
+-- 20.3: Skip, limit, and metadata-count behavior.
+-- Skip and positive or negative limits apply after the collated match.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "skip":2, "limit":3, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "limit":-3, "collation":{"locale":"en","strength":1}}');
+
+-- Empty and omitted queries accept and validate collation.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "collation":{"locale":"en","strength":1}}');
+
+-- 20.4: Collation options that change predicate semantics.
+-- numericOrdering changes range matching for numeric strings.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_order_tests1", "query":{"b":{"$gt":"2"}}, "collation":{"locale":"en","numericOrdering":false}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_order_tests1", "query":{"b":{"$gt":"2"}}, "collation":{"locale":"en","numericOrdering":true}}');
+
+-- 20.5: Command validation.
+-- Count uses the shared collation validation.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":"en"}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_strings", "query":{"a":"cat"}, "collation":{"strength":1}}');
+
+-- 20.6: Locales other than "en".
+-- Equality under collation is locale dependent, so the same query and strength
+-- return different counts per locale. The values cover Turkish dotted and
+-- dotless i, Swedish treatment of a-umlaut and a-ring as separate letters,
+-- Czech c-caron, and German for contrast. Each document repeats its
+-- string in a nested field and in an array so that dotted paths, $elemMatch,
+-- and $expr can be compared under the same collation.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 1, "s": "i", "n": { "s": "i" }, "arr": [ "i" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 2, "s": "I", "n": { "s": "I" }, "arr": [ "I" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 3, "s": "a", "n": { "s": "a" }, "arr": [ "a" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 4, "s": "A", "n": { "s": "A" }, "arr": [ "A" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 5, "s": "ä", "n": { "s": "ä" }, "arr": [ "ä" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 6, "s": "Ä", "n": { "s": "Ä" }, "arr": [ "Ä" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 7, "s": "aa", "n": { "s": "aa" }, "arr": [ "aa" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 8, "s": "å", "n": { "s": "å" }, "arr": [ "å" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 9, "s": "c", "n": { "s": "c" }, "arr": [ "c" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 10, "s": "č", "n": { "s": "č" }, "arr": [ "č" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 11, "s": "resume", "n": { "s": "resume" }, "arr": [ "resume" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 12, "s": "résumé", "n": { "s": "résumé" }, "arr": [ "résumé" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 13, "s": "o", "n": { "s": "o" }, "arr": [ "o" ] }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_locale', '{ "_id": 14, "s": "ö", "n": { "s": "ö" }, "arr": [ "ö" ] }');
+
+-- Distinct uses locale-specific equivalence for scalar, dotted, and array paths.
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_locale","key":"s","collation":{"locale":"en","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_locale","key":"s","collation":{"locale":"sv","strength":1}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_locale","key":"n.s","query":{"s":{"$in":["i","a"]}},"collation":{"locale":"tr","strength":2}}');
+SELECT bson_dollar_project(document, '{ "count": { "$size": "$values" } }')
+FROM documentdb_api.distinct_query('coll_q_db', '{"distinct":"coll_locale","key":"arr","query":{"s":{"$gte":"a","$lt":"c"}},"collation":{"locale":"cs","strength":1}}');
+
+-- English folds "i" and "I" together at strength 2, while Turkish keeps the
+-- dotted and dotless forms apart and matches only "i".
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"i"}, "collation":{"locale":"en","strength":2}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"i"}, "collation":{"locale":"tr","strength":2}}');
+
+-- English and German treat a-umlaut and a-ring as accented a, so "a" matches
+-- them. Swedish sorts them as separate letters, so only the plain a values match.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"a"}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"a"}, "collation":{"locale":"de","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"a"}, "collation":{"locale":"sv","strength":1}}');
+
+-- Czech treats c-caron as a distinct letter, so "c" does not match it.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"c"}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"c"}, "collation":{"locale":"cs","strength":1}}');
+
+-- The locale rules carry through the query operators, not just equality.
+-- $in and $or over two values.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$in":["a","c"]}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$in":["a","c"]}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$in":["a","c"]}}, "collation":{"locale":"cs","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"$or":[{"s":"a"},{"s":"c"}]}, "collation":{"locale":"sv","strength":1}}');
+-- Negated predicates count the complement under the same rules.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$ne":"a"}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$ne":"a"}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$not":{"$eq":"a"}}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$nin":["a","i"]}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$nin":["a","i"]}}, "collation":{"locale":"tr","strength":1}}');
+-- Range bounds are ordered by the collation, not by byte order.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$gte":"a","$lt":"c"}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$gte":"a","$lt":"c"}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$gt":"i"}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$gt":"i"}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$lte":"c"}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$lte":"c"}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":{"$lte":"c"}}, "collation":{"locale":"cs","strength":1}}');
+-- Dotted paths, $elemMatch, and $expr use the command collation as well.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"n.s":"a"}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"n.s":"a"}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"n.s":{"$in":["a","i"]}}, "collation":{"locale":"tr","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"arr":{"$elemMatch":{"$eq":"a"}}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"arr":{"$elemMatch":{"$eq":"a"}}}, "collation":{"locale":"sv","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"$expr":{"$eq":["$s","a"]}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"$expr":{"$eq":["$s","a"]}}, "collation":{"locale":"sv","strength":1}}');
+-- A non-string predicate is unaffected by the collation.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"arr":{"$size":1}}, "collation":{"locale":"en","strength":1}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"arr":{"$size":1}}, "collation":{"locale":"sv","strength":1}}');
+
+-- Strength 3 restores an exact match in every locale.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"i"}, "collation":{"locale":"tr","strength":3}}');
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"a"}, "collation":{"locale":"sv","strength":3}}');
+-- An unknown locale is rejected.
+SELECT documentdb_api.count_query('coll_q_db', '{"count":"coll_locale", "query":{"s":"a"}, "collation":{"locale":"xx","strength":1}}');
+
+-- ==============================================================================
+-- SECTION 21: aggregation $count and collation-aware index fixtures
+-- ==============================================================================
+-- These collections hold only scalar values so that, when the index variant runs
+-- them, the ordered collation-aware index stays single-key and can serve a
+-- covered $count via an index-only scan (see the explain variant for the plans).
+-- The results must be identical in the runtime (seq scan) and index modes.
+
+SET documentdb_core.enableCollation TO on;
+
+-- coll_ios: scalar `country` field, exercised by covered $count and range queries.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 1, "country": "usa", "provider": "aws" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 2, "country": "USA", "provider": "Aws" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 3, "country": "Usa", "provider": "AWS" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 4, "country": "canada", "provider": "gcp" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 5, "country": "Canada", "provider": "GCP" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 6, "country": "brazil", "provider": "azure" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 7, "country": "BRAZIL", "provider": "Azure" }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_ios', '{ "_id": 8, "country": "mexico", "provider": "aws" }');
+
+-- Case-insensitive $count (strength 1) counts every case variant.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_ios", "pipeline": [ { "$match": { "country": "USA" } }, { "$count": "n" } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+-- Case-sensitive $count (strength 3) matches only the exact byte sequence.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_ios", "pipeline": [ { "$match": { "country": "USA" } }, { "$count": "n" } ], "cursor": {}, "collation": { "locale": "en", "strength": 3 } }');
+-- Covered $count over a range predicate under collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_ios", "pipeline": [ { "$match": { "country": { "$gte": "brazil", "$lt": "mexico" } } }, { "$count": "n" } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+-- find ordered by _id (the trailing key of the compound index).
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_ios", "filter": { "country": "canada" }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+-- Equality on the leading field plus the trailing _id key.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_ios", "filter": { "country": "usa", "_id": 2 }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+
+-- coll_id_ios: scalar string `_id` values that collate equally but differ byte-wise.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "cat", "v": 1 }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "Cat", "v": 2 }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "CAT", "v": 3 }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "dog", "v": 4 }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "Dog", "v": 5 }');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_id_ios', '{ "_id": "goat", "v": 6 }');
+
+-- Equality on _id under collation: strength 1 returns every case variant.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_id_ios", "filter": { "_id": "cat" }, "sort": { "v": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+-- Equality on _id under collation: strength 3 returns only the exact _id.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_id_ios", "filter": { "_id": "cat" }, "sort": { "v": 1 }, "collation": { "locale": "en", "strength": 3 } }');
+-- Covered $count on _id under collation.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_id_ios", "pipeline": [ { "$match": { "_id": "dog" } }, { "$count": "n" } ], "cursor": {}, "collation": { "locale": "en", "strength": 1 } }');
+-- Range on _id under collation.
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_id_ios", "filter": { "_id": { "$gte": "cat", "$lte": "dog" } }, "sort": { "v": 1 }, "collation": { "locale": "en", "strength": 1 } }');
+
+-- ==============================================================================
+-- SECTION 22: expression $max/$min/$maxN/$minN honor collation
+-- ==============================================================================
+
+-- $max / $min over an array — the selected element changes under numericOrdering collation.
+-- Binary: "10" < "2" (lexical, '1' < '2'), so $max="2", $min="10".
+-- numericOrdering (en-u-kn-true): "10" > "2" (numeric), so $max="10", $min="2".
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2"] }'::bson, '{ "result": { "$max": "$a" } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2"] }'::bson, '{ "result": { "$max": "$a" } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2"] }'::bson, '{ "result": { "$min": "$a" } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2"] }'::bson, '{ "result": { "$min": "$a" } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+
+-- $max / $min with a constant array argument — exercises the parse-time constant-folding path under numericOrdering.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$max": ["10", "2"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$max": ["10", "2"] } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$min": ["10", "2"] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$min": ["10", "2"] } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+
+-- $maxN / $minN over an array with numericOrdering — the n selected elements compare as numbers.
+-- Binary: "2" > "10" > "1"; numericOrdering: 10 > 2 > 1.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2", "1"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2", "1"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2", "1"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["10", "2", "1"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+
+-- $maxN / $minN with a constant input array — exercises the parse-time constant-folding path under numericOrdering.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$maxN": { "input": ["10", "2", "1"], "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$minN": { "input": ["10", "2", "1"], "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-kn-true');
+
+-- All-null arrays retain no candidates and return an empty array.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": [null, null] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": [null, null] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- More than the initial heap capacity exercises single-pass heap growth.
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$arrayElemAt": [ { "$maxN": { "input": { "$range": [0, 70] }, "n": 65 } }, -1 ] } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{}'::bson, '{ "result": { "$arrayElemAt": [ { "$minN": { "input": { "$range": [0, 70] }, "n": 65 } }, -1 ] } }'::bson, false, '{}'::bson, '');
+
+-- Equal-under-collation tie handling: strength-1 "en" collates "a" == "A" == "á", all < "b".
+-- The selected equal values follow the operator-specific tie order:
+--   $maxN(n:2) -> ["b", "A"]  ("b" is max; earliest equal "a" is evicted when "b" arrives, leaving "A")
+--   $minN(n:2) -> ["a", "A"]  ("a" is min; "A" is the next equal kept in input order)
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+-- Single $max is unique ("b"); $min ties across "a"/"A"/"á" and keeps the first in input order ("a").
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$max": "$a" } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$min": "$a" } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- More equal values than n forces eviction among the equal keys.
+--   $maxN(n:3) -> ["b","á","A"] (earliest equal "a" is evicted when "b" arrives)
+--   $minN(n:3) -> ["a","A","á"] (the equal trio kept in input order)
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 3 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 3 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+-- n = 1 keeps a single boundary value: $maxN -> ["b"], $minN -> ["a"].
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 1 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 1 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+-- n beyond the array size clamps to it and returns every value in sorted order.
+--   $maxN(n:5) -> ["b","á","A","a"], $minN(n:5) -> ["a","A","á","b"]
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 5 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 5 } } }'::bson, false, '{}'::bson, 'en-u-ks-level1');
+
+-- Strength 2 collates "a" == "A" but keeps "á" distinct (accent-sensitive), so a < á < b.
+--   $maxN(n:2) -> ["b","á"] (no tie in the top two)
+--   $minN(n:2) -> ["a","A"] (the equal pair in input order); $max -> "b"; $min -> "a"
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level2');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, 'en-u-ks-level2');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$max": "$a" } }'::bson, false, '{}'::bson, 'en-u-ks-level2');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": ["a", "A", "á", "b"] }'::bson, '{ "result": { "$min": "$a" } }'::bson, false, '{}'::bson, 'en-u-ks-level2');
+
+-- Equal-by-value across numeric types (binary compare): int 5 == double 5.0 stay distinct.
+-- $maxN keeps the later equal (5.0) when evicting for 7; $minN keeps the earlier equal (5) when evicting for 3.
+--   $maxN(n:2) -> [7, 5.0], $minN(n:2) -> [3, 5]
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": [{ "$numberInt": "5" }, { "$numberDouble": "5.0" }, { "$numberInt": "3" }, { "$numberInt": "7" }] }'::bson, '{ "result": { "$maxN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, '');
+SELECT documentdb_api_internal.bson_expression_get(
+  '{ "a": [{ "$numberInt": "5" }, { "$numberDouble": "5.0" }, { "$numberInt": "3" }, { "$numberInt": "7" }] }'::bson, '{ "result": { "$minN": { "input": "$a", "n": 2 } } }'::bson, false, '{}'::bson, '');
+
+-- End-to-end aggregate: $match on the collated-indexed "grp" field (served by the collated index
+-- in the index variant); $project verifies $max/$min/$maxN/$minN honor the command collation, which
+-- flows command -> pipeline -> expression parse (the bson_expression_get tests above bypass this).
+-- Binary: $max "apple" / $min "Banana"; collation strength 1: $max "Banana" / $min "apple".
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_minmax_idx', '{ "_id": 1, "grp": "r", "vals": ["apple", "Banana"] }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_minmax_idx", "pipeline": [ { "$match": { "grp": "r" } }, { "$project": { "mx": { "$max": "$vals" }, "mn": { "$min": "$vals" }, "mxn": { "$maxN": { "input": "$vals", "n": 1 } }, "mnn": { "$minN": { "input": "$vals", "n": 1 } }, "_id": 0 } } ], "collation": { "locale": "en", "strength": 1 }, "cursor": {} }');
+
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_minmax_idx", "pipeline": [ { "$match": { "grp": "r" } }, { "$project": { "mx": { "$max": "$vals" }, "mn": { "$min": "$vals" }, "mxn": { "$maxN": { "input": "$vals", "n": 1 } }, "mnn": { "$minN": { "input": "$vals", "n": 1 } }, "_id": 0 } } ], "cursor": {} }');
+
+-- ==============================================================================
+-- SECTION 25: unsupported command surfaces
+-- ==============================================================================
+
+-- $merge: collation propagation through writes is not supported.
+SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_lookup_src", "pipeline": [{"$merge" : { "into": "coll_merge_target", "whenMatched" : "replace" }} ], "collation": { "locale": "en", "strength" : 1} }');
+
+-- $bucketAuto
+SELECT document FROM bson_aggregation_pipeline('coll_q_db',
+'{ "aggregate": "coll_strings",
+   "pipeline": [
+     { "$bucketAuto": { "groupBy": "$a", "buckets": 2 } }
+   ],
+   "collation": { "locale": "en", "strength": 1 }
+}');
+
+-- findAndModify with collation.
+SELECT documentdb_api.find_and_modify('fam', '{"findAndModify": "coll_multi_collation", "query": {"a": 1}, "update": {"_id": 1, "b": 1}, "collation" : {"locale" : "en", "strength": 1} }');
+
+-- The returned $elemMatch projection uses the command collation.
+SELECT documentdb_api.find_and_modify('coll_q_db', '{"findAndModify": "coll_multi_collation", "query": {"_id": 1, "a": "CAT"}, "update": {"$set": {"items": [{"label": "cat"}, {"label": "dog"}]}}, "new": true, "fields": {"_id": 1, "a": 1, "items": {"$elemMatch": {"label": "CAT"}}}, "collation": {"locale": "en", "strength": 1}}');
+
+-- update with collation + arrayFilters.
+SELECT documentdb_api.update('coll_q_db', '{"update":"coll_multi_collation", "updates":[{"q":{"_id": 134111, "b": [ 5, 2, 4 ] },"u":{"$set" : {"b.$[a]":3} },"upsert":true,"collation" : {"locale" : "en", "strength": 1}, "arrayFilters": [ { "a": 2 } ]}]}');
+
+-- ==============================================================================
+-- SECTION 26: update document selection with collation
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_select', '{"_id": "cat", "name": "cat", "group": "pet", "tags": ["cat"], "values": ["cat"]}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_select', '{"_id": "CAT", "name": "CAT", "group": "PET", "tags": ["CAT"], "values": ["CAT"]}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_select', '{"_id": "dog", "name": "dog", "group": "pet", "tags": ["dog"], "values": ["dog"]}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_select', '{"_id": "DOG", "name": "DOG", "group": "PET", "tags": ["DOG"], "values": ["DOG"]}');
+
+-- The command remains gated by enableCollation.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO off;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "_id": "DoG" }, "u": { "$set": { "disabled": true } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+ROLLBACK;
+
+-- Collation applies when selecting documents by string _id and non-_id fields.
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "_id": "DoG" }, "u": { "$set": { "selectedById": true } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "group": "PeT" }, "u": { "$set": { "selectedByField": true } }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+-- A let-only updateOne keeps an explicit empty collation argument when its
+-- candidate-selection query uses a generic plan.
+BEGIN;
+SET LOCAL plan_cache_mode TO force_generic_plan;
+SELECT documentdb_api.update(
+    'coll_q_db',
+    '{ "update": "coll_update_select", "updates": [ { "q": { "$expr": { "$eq": [ "$name", "$$target" ] } }, "u": { "$set": { "letSelected": true } }, "multi": false } ], "let": { "target": "cat" } }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+-- A let-only update-many primes the shared function-filter plan before a
+-- collated update-many. Both plan shapes must pass the fifth argument so the
+-- second operation applies collation to its update effects.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_select", "let": { "expected": "cat" }, "updates": [ { "q": { "$expr": { "$eq": [ "$name", "$$expected" ] } }, "u": { "$set": { "name": "cat" } }, "multi": true } ] }');
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "group": "PeT" }, "u": { "$addToSet": { "tags": "cAt" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "name": "CaT" }, "u": [ { "$set": { "collationEqual": { "$eq": [ "$name", "CAT" ] } } } ], "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+-- Let variables and collation are both retained in cached update state.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_select", "let": { "expected": "CAT" }, "updates": [ { "q": { "group": "PeT" }, "u": [ { "$set": { "variableEqual": { "$eq": [ "$name", "$$expected" ] } } } ], "multi": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+-- Array filters and positional matching receive the operation collation.
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "_id": "CaT" }, "u": { "$set": { "values.$[item]": "matched" } }, "arrayFilters": [ { "item": "cAt" } ], "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "_id": "CaT", "values": "cAt" }, "u": { "$set": { "values.$": "matched" } }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT COUNT(*) = 1 AS selected_one_document
+FROM documentdb_api.collection('coll_q_db', 'coll_update_select')
+WHERE document OPERATOR(documentdb_api_catalog.@@) '{ "values": "matched" }';
+ROLLBACK;
+
+-- ==============================================================================
+-- SECTION 27: collation-aware update effects
+-- ==============================================================================
+
+SELECT documentdb_api.insert_one(
+  'coll_q_db',
+  'coll_update_effects',
+  '{ "_id": 1, "minValue": "10", "maxValue": "CAT", "maxDocument": { "label": "CAT" }, "setValues": [ "cat", { "label": "dog" }, "resume" ], "pullValues": [ "cat", "CAT", "dog" ], "pullDocuments": [ { "label": "dog" }, { "label": "cat" } ], "pullPredicateDocuments": [ { "label": "dog" }, { "label": "cat" } ], "pushValues": [ "10", "2" ], "pushDocuments": [ { "name": "10" }, { "name": "2" } ], "positionalValues": [ "cat", "DOG" ], "filteredValues": [ { "name": "cat", "matched": false }, { "name": "DOG", "matched": false } ], "pipelineValue": "cat" }');
+SELECT documentdb_api.coll_mod(
+  'coll_q_db',
+  'coll_update_effects',
+  '{ "collMod": "coll_update_effects", "enableUpdateDescription": true }');
+
+SELECT documentdb_api.insert_one(
+  'coll_q_db',
+  'coll_update_operator_matrix',
+  '{ "_id": 1, "setValue": "cat", "incValue": 2, "unsetValue": true, "appendValues": [ "cat" ], "popFront": [ 1, 2, 3 ], "popBack": [ 1, 2, 3 ], "oldName": "value", "mulValue": 3, "bitValue": 5, "ascending": [ "10", "2" ], "descending": [ "10", "2" ], "compound": [ { "group": "b", "name": "10", "sequence": 0 }, { "group": "A", "name": "2", "sequence": 1 }, { "group": "a", "name": "10", "sequence": 2 } ], "stableTies": [ "cat", "CAT" ], "positioned": [ "a", "d" ], "negativeSlice": [ "a", "b", "c" ], "combinedModifiers": [ "10", "2" ], "allValues": [ { "matched": false }, { "matched": false } ], "groups": [ { "name": "CAT", "values": [ "10", "2" ] }, { "name": "dog", "values": [ "1", "20" ] } ] }');
+
+-- The SQL UDF applies collation directly and preserves binary behavior when
+-- the argument is null.
+SELECT documentdb_api_internal.update_bson_document(
+  '{ "_id": 1, "tags": [ "cat" ] }',
+  '{ "": { "$addToSet": { "tags": "CAT" } } }',
+  '{}',
+  NULL,
+  NULL,
+  'en-u-ks-level2');
+SELECT documentdb_api_internal.update_bson_document(
+  '{ "_id": 1, "tags": [ "cat" ] }',
+  '{ "": { "$addToSet": { "tags": "CAT" } } }',
+  '{}',
+  NULL,
+  NULL,
+  NULL);
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO off;
+SELECT documentdb_api_internal.update_bson_document(
+  '{ "_id": 1, "tags": [ "cat" ] }',
+  '{ "": { "$addToSet": { "tags": "CAT" } } }',
+  '{}',
+  NULL,
+  NULL,
+  'en-u-ks-level2');
+ROLLBACK;
+
+-- Operators that do not compare values retain their normal behavior when the
+-- operation has a collation.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "$set": { "setValue": "CAT" }, "$inc": { "incValue": 3 }, "$unset": { "unsetValue": "" }, "$push": { "appendValues": "CAT" }, "$pop": { "popFront": -1, "popBack": 1 }, "$rename": { "oldName": "newName" }, "$mul": { "mulValue": 4 }, "$bit": { "bitValue": { "or": 2 } } }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix');
+ROLLBACK;
+
+-- $currentDate remains structural under collation. Check its types without
+-- exposing nondeterministic values in the expected output.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "$currentDate": { "dateValue": true, "timestampValue": { "$type": "timestamp" } } }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT bson_dollar_project(
+  document,
+  '{ "dateType": { "$type": "$dateValue" }, "timestampType": { "$type": "$timestampValue" } }')
+FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix');
+ROLLBACK;
+
+-- Replacement updates and $setOnInsert are unaffected by collation.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "replacement": "CAT" }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix');
+ROLLBACK;
+
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "$setOnInsert": { "insertOnly": "CAT" } }, "multi": false, "upsert": true, "collation": { "locale": "en", "strength": 2 } }, { "q": { "_id": 2, "seed": "cat" }, "u": { "$setOnInsert": { "insertOnly": "CAT" } }, "multi": false, "upsert": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix') ORDER BY object_id;
+ROLLBACK;
+
+-- $push covers scalar and compound document sorting in both directions,
+-- collation-equal ties, position, and positive and negative slices.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "$push": { "ascending": { "$each": [ "3" ], "$sort": 1 }, "descending": { "$each": [ "3" ], "$sort": -1 }, "compound": { "$each": [ { "group": "B", "name": "2", "sequence": 3 } ], "$sort": { "group": 1, "name": -1 } }, "stableTies": { "$each": [ "cAt" ], "$sort": 1 }, "positioned": { "$each": [ "b", "c" ], "$position": 1, "$slice": 3 }, "negativeSlice": { "$each": [ "d" ], "$slice": -2 }, "combinedModifiers": { "$each": [ "3" ], "$position": 0, "$sort": 1, "$slice": -2 } } }, "multi": false, "collation": { "locale": "en", "strength": 2, "numericOrdering": true } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix');
+ROLLBACK;
+
+-- All-positional and nested filtered-positional updates preserve one collation
+-- through every array-filter identifier.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_operator_matrix", "updates": [ { "q": { "_id": 1 }, "u": { "$set": { "allValues.$[].matched": true, "groups.$[group].values.$[value]": "matched" } }, "arrayFilters": [ { "group.name": "cat" }, { "value": { "$lt": "3" } } ], "multi": false, "collation": { "locale": "en", "strength": 2, "numericOrdering": true } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_operator_matrix');
+ROLLBACK;
+
+-- Comparison, set, and removal operators share one normalized collation.
+-- Nested documents compare their string values with collation while retaining
+-- byte-exact field-name comparison.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$min": { "minValue": "2" }, "$max": { "maxValue": "cat", "maxDocument": { "label": "cat" } }, "$addToSet": { "setValues": { "$each": [ { "$symbol": "CAT" }, { "label": "DOG" }, { "Label": "dog" }, "résumé", "bird" ] } }, "$pullAll": { "pullValues": [ "CaT" ], "pullDocuments": [ { "label": "DOG" } ] } }, "multi": false, "collation": { "locale": "en", "strength": 2, "numericOrdering": true } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Strength 1 ignores accents and case, strength 2 ignores case, and explicit
+-- simple retains binary comparison.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$addToSet": { "setValues": "résumé" } }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$addToSet": { "setValues": "CAT" } }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$addToSet": { "setValues": "CAT" } }, "multi": false, "collation": { "locale": "simple" } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Strength 3 retains case differences while still using ICU comparison.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$addToSet": { "setValues": "CAT" } }, "multi": false, "collation": { "locale": "en", "strength": 3 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- $pull predicates and $push sorting use the operation collation.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$pull": { "pullValues": { "$in": [ "cAt" ] }, "pullPredicateDocuments": { "label": "DOG" } }, "$push": { "pushValues": { "$each": [ "3" ], "$sort": 1 }, "pushDocuments": { "$each": [ { "name": "3" } ], "$sort": { "name": 1 } } } }, "multi": false, "collation": { "locale": "en", "strength": 2, "numericOrdering": true } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Logical array filters apply collation to scalar values nested in documents.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": { "$set": { "filteredValues.$[item].matched": true } }, "arrayFilters": [ { "$or": [ { "item.name": "CAT" }, { "item.name": "dog" } ] } ], "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- The positional query is re-evaluated with the operation collation.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1, "positionalValues": "cAt" }, "u": { "$set": { "positionalValues.$": "matched" } }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Pipeline expressions receive collation for comparisons and array searches.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": [ { "$set": { "pipelineEqual": { "$eq": [ "$pipelineValue", "CAT" ] }, "pipelineIndex": { "$indexOfArray": [ "$positionalValues", "dog" ] } } } ], "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- $addFields is an alias for $set, while $unset remains structural.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": [ { "$addFields": { "addFieldsEqual": { "$eq": [ "$pipelineValue", "CAT" ] } } }, { "$unset": [ "maxValue", "pipelineValue" ] } ], "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Every expression-bearing pipeline stage receives collation.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": [ { "$project": { "_id": 1, "pipelineValue": 1, "projectEqual": { "$eq": [ "$pipelineValue", "CAT" ] } } } ], "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 1 }, "u": [ { "$replaceRoot": { "newRoot": { "pipelineValue": "$pipelineValue", "rootEqual": { "$eq": [ "$pipelineValue", "CAT" ] } } } }, { "$replaceWith": { "pipelineValue": "$pipelineValue", "rootEqual": "$rootEqual", "withEqual": { "$eq": [ "$pipelineValue", "CAT" ] } } } ], "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects');
+ROLLBACK;
+
+-- Pipeline expressions also receive collation while constructing an upsert.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 2, "seed": "cat" }, "u": [ { "$set": { "pipelineEqual": { "$eq": [ "$seed", "CAT" ] } } } ], "multi": false, "upsert": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects') ORDER BY object_id;
+ROLLBACK;
+
+-- Operator comparisons receive collation while constructing an upsert.
+BEGIN;
+SELECT documentdb_api.update(
+  'coll_q_db',
+  '{ "update": "coll_update_effects", "updates": [ { "q": { "_id": 3, "seed": "CAT" }, "u": { "$max": { "seed": "cat" }, "$setOnInsert": { "inserted": true } }, "multi": false, "upsert": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_effects') ORDER BY object_id;
+ROLLBACK;
+
+-- Sort uses the command collation when choosing a single update candidate.
+-- Binary ordering puts "Banana" first; English collation puts "apple" first.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_sort', '{"_id": 1, "name": "apple", "group": "fruit"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_sort', '{"_id": 2, "name": "Banana", "group": "FRUIT"}');
+
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_sort", "updates": [ { "q": { "group": "FrUiT" }, "u": { "$set": { "selected": true } }, "sort": { "name": 1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_sort') ORDER BY object_id;
+ROLLBACK;
+
+-- Descending sort selects the other document under the same collation.
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_sort", "updates": [ { "q": { "group": "FrUiT" }, "u": { "$set": { "selected": true } }, "sort": { "name": -1 }, "multi": false, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_sort') ORDER BY object_id;
+ROLLBACK;
+
+-- Validator-aware update-many execution applies the command collation before
+-- both successful validation and a rejected update. The command collation
+-- does not affect the collection validator.
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_validator', '{"_id": 1, "name": "cat", "score": 1, "status": "approved", "tags": ["cat"]}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_validator', '{"_id": 2, "name": "CAT", "score": 2, "status": "approved", "tags": ["CAT"]}');
+SET documentdb.enableSchemaValidation TO on;
+SELECT documentdb_api.coll_mod(
+  'coll_q_db',
+  'coll_update_validator',
+  '{"collMod": "coll_update_validator", "validator": {"status": "approved", "$jsonSchema": {"bsonType": "object", "properties": {"score": {"bsonType": "int"}}}}, "validationLevel": "strict", "validationAction": "error", "enableUpdateDescription": true}');
+
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_validator", "updates": [ { "q": { "name": "CaT" }, "u": { "$inc": { "score": 1 }, "$addToSet": { "tags": "cAt" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_validator') ORDER BY object_id;
+ROLLBACK;
+
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_validator", "updates": [ { "q": { "name": "CaT" }, "u": { "$set": { "score": "invalid" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_validator') ORDER BY object_id;
+
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_validator", "updates": [ { "q": { "name": "CaT" }, "u": { "$set": { "status": "APPROVED" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_validator') ORDER BY object_id;
+RESET documentdb.enableSchemaValidation;
+
+-- Upsert still inserts when no document matches under the specified collation.
+BEGIN;
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "updates": [ { "q": { "_id": "fox" }, "u": { "$set": { "name": "fox" } }, "upsert": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_db', 'coll_update_select') ORDER BY object_id;
+ROLLBACK;
+
+-- Invalid collation fails the entire unordered command without applying
+-- either the preceding or following updates.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "ordered": false, "updates": [ { "q": { "_id": "dog" }, "u": { "$set": { "beforeErrors": true } }, "multi": false }, { "q": { "_id": "cat" }, "u": { "$set": { "invalidLocale": true } }, "multi": false, "collation": { "locale": "invalid_locale_xyz" } }, { "q": { "_id": "CAT" }, "u": { "$set": { "missingLocale": true } }, "multi": false, "collation": { "strength": 1 } }, { "q": { "_id": "DOG" }, "u": { "$set": { "afterErrors": true } }, "multi": false } ] }');
+
+-- An invalid collation also fails the entire ordered command.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "ordered": true, "updates": [ { "q": { "_id": "dog" }, "u": { "$set": { "beforeError": true } }, "multi": false }, { "q": { "_id": "cat" }, "u": { "$set": { "invalidLocale": true } }, "multi": false, "collation": { "locale": "invalid_locale_xyz" } }, { "q": { "_id": "DOG" }, "u": { "$set": { "afterError": true } }, "multi": false } ] }');
+
+-- A non-document collation remains a command-level type error, so no write
+-- operation starts.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "ordered": false, "updates": [ { "q": { "_id": "dog" }, "u": { "$set": { "shouldNotRun": true } }, "multi": false }, { "q": { "_id": "cat" }, "u": { "$set": { "invalidType": true } }, "multi": false, "collation": "en" } ] }');
+
+-- Collation parsing fails the command even when the collection does not exist.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_missing", "ordered": false, "updates": [ { "q": { "_id": "cat" }, "u": { "$set": { "invalidLocale": true } }, "multi": false, "collation": { "locale": "invalid_locale_xyz" } }, { "q": { "_id": "dog" }, "u": { "$set": { "validNoop": true } }, "multi": false } ] }');
+
+-- Update-many also fails the entire unordered command on invalid collation.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "ordered": false, "updates": [ { "q": { "group": "PeT" }, "u": { "$set": { "multiBeforeError": true } }, "multi": true, "collation": { "locale": "en", "strength": 1 } }, { "q": { "group": "PeT" }, "u": { "$set": { "multiInvalidLocale": true } }, "multi": true, "collation": { "locale": "invalid_locale_xyz" } }, { "q": { "group": "PeT" }, "u": { "$set": { "multiMissingLocale": true } }, "multi": true, "collation": { "strength": 1 } }, { "q": { "group": "pet" }, "u": { "$set": { "multiAfterErrors": true } }, "multi": true } ] }');
+
+-- An invalid collation also fails the entire ordered update-many command.
+SELECT documentdb_api.update('coll_q_db', '{ "update": "coll_update_select", "ordered": true, "updates": [ { "q": { "group": "PeT" }, "u": { "$set": { "multiBeforeError": true } }, "multi": true, "collation": { "locale": "en", "strength": 1 } }, { "q": { "group": "PeT" }, "u": { "$set": { "multiInvalidLocale": true } }, "multi": true, "collation": { "locale": "invalid_locale_xyz" } }, { "q": { "group": "pet" }, "u": { "$set": { "multiAfterError": true } }, "multi": true } ] }');
+
+-- ==============================================================================
+-- SECTION 28: shard-key targeting under explicit simple
+-- ==============================================================================
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete_simple', '{"_id": 1, "a": "cat"}');
+SELECT documentdb_api.insert_one('coll_q_db', 'coll_delete_simple', '{"_id": 2, "a": "CAT"}');
+SELECT documentdb_api.shard_collection('coll_q_db', 'coll_delete_simple', '{"a":"hashed"}', false);
+
+-- Explicit simple and omitted collation must both target the binary shard key.
+BEGIN;
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete_simple", "deletes": [ { "q": {"a": "cat"}, "limit": 1, "collation": {"locale": "simple"} } ] }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_delete_simple", "filter": {}, "sort": {"_id": 1} }');
+ROLLBACK;
+
+BEGIN;
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete_simple", "deletes": [ { "q": {"a": "cat"}, "limit": 1 } ] }');
+SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "coll_delete_simple", "filter": {}, "sort": {"_id": 1} }');
+ROLLBACK;
+
+-- Non-binary comparison must not target a binary string shard key.
+SELECT documentdb_api.delete('coll_q_db', '{ "delete": "coll_delete_simple", "deletes": [ { "q": {"a": "cat"}, "limit": 1, "collation": {"locale": "en", "strength": 2} } ] }');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_delete_simple');
+
+-- ======================================================================
+-- CLEANUP
+-- ======================================================================
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_agg_proj');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_code_collation');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_delete');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_delete_sort');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_distinct');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_distinct_visible');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_find_positional');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_graph_src');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_graph_target');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_id_ios');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_in_empty');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_ios');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_lookup_src');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_locale');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_minmax_idx');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_multi_collation');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_order_tests0');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_order_tests1');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_phonebook');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_redact');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_string_ids');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_strings');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_effects');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_operator_matrix');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_select');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_sort');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_validator');
+SELECT documentdb_api.drop_collection('coll_q_db', 'nested_arrays');
+SELECT documentdb_api.drop_collection('coll_q_db', 'nested_arrays_docs');
+SELECT documentdb_api.drop_collection('coll_q_db', 'nested_docs');
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_sortArray');
+
+-- ==============================================================================
+-- findAndModify with collation
+-- ==============================================================================
+
+-- findAndModify applies collation to selection, sort, update effects, and projection.
+SELECT documentdb_api.insert_one(
+  'coll_q_db', 'coll_find_modify',
+  '{"_id": 1, "group": "pet", "name": "Zulu", "state": "old", "tags": ["cat"], "items": [{"label": "dog"}]}');
+SELECT documentdb_api.insert_one(
+  'coll_q_db', 'coll_find_modify',
+  '{"_id": 2, "group": "PET", "name": "alpha", "state": "old", "tags": ["cat"], "items": [{"label": "dog"}, {"label": "cat"}]}');
+SELECT documentdb_api.insert_one(
+  'coll_q_db', 'coll_find_modify',
+  '{"_id": 3, "group": "other", "name": "Beta", "state": "old", "tags": [], "items": []}');
+
+-- The command remains gated by enableCollation.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO off;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "update": {"$set": {"state": "disabled"}}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+-- Compatibility mode preserves the existing binary behavior while the feature is disabled.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO off;
+SET LOCAL documentdb.skipFailOnCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "update": {"$set": {"state": "ignored"}}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+-- Validate command collation before document selection.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "pet"}, "update": {"$set": {"state": "invalid"}}, "collation": 1}');
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "pet"}, "update": {"$set": {"state": "invalid"}}, "collation": {"strength": 1}}');
+
+BEGIN;
+-- Without a collation, mixed-case matching remains binary.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "update": {"$set": {"state": "binary"}}, "new": true}');
+
+-- Collated sorting selects "alpha" before "Zulu". The same collation applies
+-- to $addToSet and the $elemMatch returned-document projection.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "sort": {"name": 1}, "update": {"$set": {"state": "updated"}, "$addToSet": {"tags": "CAT"}}, "new": true, "fields": {"_id": 1, "name": 1, "state": 1, "tags": 1, "items": {"$elemMatch": {"label": "CAT"}}}, "collation": {"locale": "en", "strength": 1}}');
+
+-- Returning the old document preserves its pre-update value.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "sort": {"name": -1}, "update": {"$set": {"state": "changed"}}, "new": false, "fields": {"_id": 1, "name": 1, "state": 1}, "collation": {"locale": "en", "strength": 1}}');
+
+-- Explicit simple collation uses binary matching.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "pet"}, "sort": {"name": 1}, "update": {"$set": {"simple": true}}, "new": true, "fields": {"_id": 1, "group": 1, "name": 1, "simple": 1}, "collation": {"locale": "simple"}}');
+
+-- Remove returns the collated, sorted document selected for deletion.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "PeT"}, "sort": {"name": -1}, "remove": true, "fields": {"_id": 1, "name": 1, "state": 1, "items": {"$elemMatch": {"label": "DOG"}}}, "collation": {"locale": "en", "strength": 1}}');
+
+-- Upsert retains the command collation and returns the inserted document.
+SELECT documentdb_api.find_and_modify(
+  'coll_q_db',
+  '{"findAndModify": "coll_find_modify", "query": {"group": "new", "name": "kitten"}, "update": {"$setOnInsert": {"_id": 4}, "$set": {"state": "upserted"}}, "upsert": true, "new": true, "fields": {"_id": 1, "group": 1, "name": 1, "state": 1}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+SELECT documentdb_api.drop_collection('coll_q_db', 'coll_find_modify');
+
+RESET documentdb_core.enableCollation;

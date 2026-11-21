@@ -1,0 +1,668 @@
+SET search_path TO documentdb_core,documentdb_api,documentdb_api_catalog,documentdb_api_internal;
+SET citus.next_shard_id TO 198430000;
+SET documentdb.next_collection_id TO 1984300;
+SET documentdb.next_collection_index_id TO 1984300;
+-- Delete all old create index requests from other tests
+DELETE from documentdb_api_catalog.documentdb_index_queue;
+SET documentdb.enableUniqueReindex TO true;
+---------------------------------------------------------------------
+-- Setup: Create collection with data and unique index
+---------------------------------------------------------------------
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_unique_coll');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('reindex_dist_db', 'reindex_unique_coll', FORMAT('{"_id": %s, "a": %s, "b": %s}', i, i, i)::documentdb_core.bson)) FROM generate_series(1, 20) i;
+ count 
+---------------------------------------------------------------------
+    20
+(1 row)
+
+-- Create an ordered unique index
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_unique_coll", "indexes": [ { "key": { "a": 1 }, "name": "a_1_unique", "unique": true, "storageEngine": { "enableOrderedIndex": true } } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+-- Create a non-unique index for comparison
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_unique_coll", "indexes": [ { "key": { "b": 1 }, "name": "b_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "2" }, "numIndexesAfter" : { "$numberInt" : "3" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+-- Verify indexes before reindex
+SELECT bson_dollar_unwind(cursorpage, '$cursor.firstBatch') FROM documentdb_api.list_indexes_cursor_first_page('reindex_dist_db', '{ "listIndexes": "reindex_unique_coll" }');
+                                                                                                                                                    bson_dollar_unwind                                                                                                                                                     
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "_id" : { "$numberInt" : "1" } }, "name" : "_id_" } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "a" : { "$numberInt" : "1" } }, "name" : "a_1_unique", "unique" : true, "storageEngine" : { "enableOrderedIndex" : true } } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "b" : { "$numberInt" : "1" } }, "name" : "b_1" } }, "ok" : { "$numberDouble" : "1.0" } }
+(3 rows)
+
+---------------------------------------------------------------------
+-- Error: reindex of unique index with feature disabled
+---------------------------------------------------------------------
+-- Error: reindex must be true
+---------------------------------------------------------------------
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "a_1_unique", "reindex": false } }');
+ERROR:  collMod.reindex can only be set to true
+---------------------------------------------------------------------
+-- Error: index not found
+---------------------------------------------------------------------
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "nonexistent_idx", "reindex": true } }');
+ERROR:  cannot find index nonexistent_idx for ns reindex_dist_db.reindex_unique_coll
+---------------------------------------------------------------------
+-- Error: reindex of unique index with feature disabled
+---------------------------------------------------------------------
+SET documentdb.enableUniqueReindex TO false;
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "a_1_unique", "reindex": true } }');
+ERROR:  reindex of unique indexes is not supported
+SET documentdb.enableUniqueReindex TO true;
+---------------------------------------------------------------------
+-- Error: reindex of unordered unique index is not supported
+---------------------------------------------------------------------
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_unordered_coll');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT documentdb_api.insert_one('reindex_dist_db', 'reindex_unordered_coll', '{"_id": 1, "a": 1}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_unordered_coll", "indexes": [ { "key": { "a": 1 }, "name": "a_1_unordered", "unique": true } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unordered_coll', '{ "collMod": "reindex_unordered_coll", "index": { "name": "a_1_unordered", "reindex": true } }');
+ERROR:  reindex of unordered unique indexes is not supported
+---------------------------------------------------------------------
+-- Reindex unique index on unsharded collection via collMod
+---------------------------------------------------------------------
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "a_1_unique", "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+-- Verify the reindex request is in the queue
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type |                                                                                                                                                                                                                      index_cmd                                                                                                                                                                                                                      
+---------------------------------------------------------------------
+ R        | CREATE INDEX CONCURRENTLY documents_rum_index_1984302_ccnew ON documentdb_data.documents_1984301 USING  documentdb_rum (document documentdb_api_internal.bson_rum_composite_path_ops (pathspec='[ "a" ]', tl='2691'), documentdb_api_internal.generate_unique_shard_document(document, shard_key_value, '{ "a" : { "$numberInt" : "1" } }'::documentdb_core.bson, false, true) documentdb_api_internal.bson_rum_unique_shard_path_ops (cmp='true'))
+(1 row)
+
+-- Process the reindex queue
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+-- Verify the queue is empty
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+-- Verify indexes still valid
+SELECT bson_dollar_unwind(cursorpage, '$cursor.firstBatch') FROM documentdb_api.list_indexes_cursor_first_page('reindex_dist_db', '{ "listIndexes": "reindex_unique_coll" }');
+                                                                                                                                                    bson_dollar_unwind                                                                                                                                                     
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "_id" : { "$numberInt" : "1" } }, "name" : "_id_" } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "a" : { "$numberInt" : "1" } }, "name" : "a_1_unique", "unique" : true, "storageEngine" : { "enableOrderedIndex" : true } } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "b" : { "$numberInt" : "1" } }, "name" : "b_1" } }, "ok" : { "$numberDouble" : "1.0" } }
+(3 rows)
+
+-- Verify uniqueness constraint still works
+SELECT documentdb_api.insert_one('reindex_dist_db', 'reindex_unique_coll', '{"_id": 100, "a": 1}');
+                                                                                                                          insert_one                                                                                                                           
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "0" }, "ok" : { "$numberDouble" : "1.0" }, "writeErrors" : [ { "index" : { "$numberInt" : "0" }, "code" : { "$numberInt" : "319029277" }, "errmsg" : "Duplicate key violation on the requested collection: Index 'a_1_unique'" } ] }
+(1 row)
+
+-- Verify data is intact
+SELECT document FROM bson_aggregation_find('reindex_dist_db', '{ "find": "reindex_unique_coll", "filter": { "a": 5 } }');
+                                            document                                            
+---------------------------------------------------------------------
+ { "_id" : { "$numberInt" : "5" }, "a" : { "$numberInt" : "5" }, "b" : { "$numberInt" : "5" } }
+(1 row)
+
+---------------------------------------------------------------------
+-- Shard the collection and test reindex on sharded unique index
+---------------------------------------------------------------------
+SELECT documentdb_api.shard_collection('{ "shardCollection": "reindex_dist_db.reindex_unique_coll", "key": { "_id": "hashed" }, "numInitialChunks": 3 }');
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+-- Reindex the unique index on the sharded collection
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "a_1_unique", "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type |                                                                                                                                                                                                                      index_cmd                                                                                                                                                                                                                      
+---------------------------------------------------------------------
+ R        | CREATE INDEX CONCURRENTLY documents_rum_index_1984307_ccnew ON documentdb_data.documents_1984301 USING  documentdb_rum (document documentdb_api_internal.bson_rum_composite_path_ops (pathspec='[ "a" ]', tl='2691'), documentdb_api_internal.generate_unique_shard_document(document, shard_key_value, '{ "a" : { "$numberInt" : "1" } }'::documentdb_core.bson, false, true) documentdb_api_internal.bson_rum_unique_shard_path_ops (cmp='true'))
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+-- Verify uniqueness still works after sharded reindex
+SELECT documentdb_api.insert_one('reindex_dist_db', 'reindex_unique_coll', '{"_id": 101, "a": 2}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- Verify data is still accessible
+SELECT document FROM bson_aggregation_find('reindex_dist_db', '{ "find": "reindex_unique_coll", "filter": { "a": 10 } }');
+                                             document                                              
+---------------------------------------------------------------------
+ { "_id" : { "$numberInt" : "10" }, "a" : { "$numberInt" : "10" }, "b" : { "$numberInt" : "10" } }
+(1 row)
+
+-- Verify indexes
+SELECT bson_dollar_unwind(cursorpage, '$cursor.firstBatch') FROM documentdb_api.list_indexes_cursor_first_page('reindex_dist_db', '{ "listIndexes": "reindex_unique_coll" }');
+                                                                                                                                                    bson_dollar_unwind                                                                                                                                                     
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "_id" : { "$numberInt" : "1" } }, "name" : "_id_" } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "a" : { "$numberInt" : "1" } }, "name" : "a_1_unique", "unique" : true, "storageEngine" : { "enableOrderedIndex" : true } } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_unique_coll", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "b" : { "$numberInt" : "1" } }, "name" : "b_1" } }, "ok" : { "$numberDouble" : "1.0" } }
+(3 rows)
+
+---------------------------------------------------------------------
+-- Reindex the non-unique index on the sharded collection
+---------------------------------------------------------------------
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "name": "b_1", "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type |                               index_cmd                                
+---------------------------------------------------------------------
+ R        | REINDEX INDEX CONCURRENTLY documentdb_data.documents_rum_index_1984308
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+---------------------------------------------------------------------
+-- Reindex _id_ index on sharded collection via keyPattern
+---------------------------------------------------------------------
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_unique_coll', '{ "collMod": "reindex_unique_coll", "index": { "keyPattern": { "_id": 1 }, "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type |                            index_cmd                             
+---------------------------------------------------------------------
+ R        | REINDEX INDEX CONCURRENTLY documentdb_data.collection_pk_1984301
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+-- Verify data is still accessible after _id_ reindex
+SELECT document FROM bson_aggregation_find('reindex_dist_db', '{ "find": "reindex_unique_coll", "filter": { "_id": 10 } }');
+                                             document                                              
+---------------------------------------------------------------------
+ { "_id" : { "$numberInt" : "10" }, "a" : { "$numberInt" : "10" }, "b" : { "$numberInt" : "10" } }
+(1 row)
+
+---------------------------------------------------------------------
+-- Test: Reindex unique compound index on sharded collection
+---------------------------------------------------------------------
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_compound_sharded');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('reindex_dist_db', 'reindex_compound_sharded', FORMAT('{"_id": %s, "x": %s, "y": %s}', i, i, i)::documentdb_core.bson)) FROM generate_series(1, 10) i;
+ count 
+---------------------------------------------------------------------
+    10
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_compound_sharded", "indexes": [ { "key": { "x": 1, "y": 1 }, "name": "xy_unique", "unique": true, "storageEngine": { "enableOrderedIndex": true } } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+-- Shard the collection
+SELECT documentdb_api.shard_collection('{ "shardCollection": "reindex_dist_db.reindex_compound_sharded", "key": { "_id": "hashed" }, "numInitialChunks": 3 }');
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+-- Reindex compound unique index via collMod
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_compound_sharded', '{ "collMod": "reindex_compound_sharded", "index": { "name": "xy_unique", "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type |                                                                                                                                                                                                                                       index_cmd                                                                                                                                                                                                                                        
+---------------------------------------------------------------------
+ R        | CREATE INDEX CONCURRENTLY documents_rum_index_1984312_ccnew ON documentdb_data.documents_1984303 USING  documentdb_rum (document documentdb_api_internal.bson_rum_composite_path_ops (pathspec='[ "x", "y" ]', tl='2691'), documentdb_api_internal.generate_unique_shard_document(document, shard_key_value, '{ "x" : { "$numberInt" : "1" }, "y" : { "$numberInt" : "1" } }'::documentdb_core.bson, false, true) documentdb_api_internal.bson_rum_unique_shard_path_ops (cmp='true'))
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+-- Verify uniqueness still works on compound index after sharded reindex
+SELECT documentdb_api.insert_one('reindex_dist_db', 'reindex_compound_sharded', '{"_id": 100, "x": 1, "y": 1}');
+                              insert_one                              
+---------------------------------------------------------------------
+ { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- Verify indexes
+SELECT bson_dollar_unwind(cursorpage, '$cursor.firstBatch') FROM documentdb_api.list_indexes_cursor_first_page('reindex_dist_db', '{ "listIndexes": "reindex_compound_sharded" }');
+                                                                                                                                                                     bson_dollar_unwind                                                                                                                                                                      
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_compound_sharded", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "_id" : { "$numberInt" : "1" } }, "name" : "_id_" } }, "ok" : { "$numberDouble" : "1.0" } }
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "reindex_dist_db.reindex_compound_sharded", "firstBatch" : { "v" : { "$numberInt" : "2" }, "key" : { "x" : { "$numberInt" : "1" }, "y" : { "$numberInt" : "1" } }, "name" : "xy_unique", "unique" : true, "storageEngine" : { "enableOrderedIndex" : true } } }, "ok" : { "$numberDouble" : "1.0" } }
+(2 rows)
+
+---------------------------------------------------------------------
+-- Test: skipIndexCleanupOnReindex leaves old index behind
+---------------------------------------------------------------------
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_skip_cleanup');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('reindex_dist_db', 'reindex_skip_cleanup', FORMAT('{"_id": %s, "a": %s}', i, i)::documentdb_core.bson)) FROM generate_series(1, 10) i;
+ count 
+---------------------------------------------------------------------
+    10
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_skip_cleanup", "indexes": [ { "key": { "a": 1 }, "name": "a_1_unique", "unique": true, "storageEngine": { "enableOrderedIndex": true } } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+-- Show table state before reindex
+SELECT collection_id as skip_cleanup_collection_id FROM documentdb_api_catalog.collections WHERE database_name = 'reindex_dist_db' AND collection_name = 'reindex_skip_cleanup' \gset
+\d documentdb_data.documents_:skip_cleanup_collection_id
+         Table "documentdb_data.documents_1984304"
+     Column      |  Type  | Collation | Nullable | Default 
+---------------------------------------------------------------------
+ shard_key_value | bigint |           | not null | 
+ object_id       | bson   |           | not null | 
+ document        | bson   |           | not null | 
+Indexes:
+    "collection_pk_1984304" PRIMARY KEY, btree (shard_key_value, object_id)
+    "documents_rum_index_1984314" EXCLUDE USING documentdb_rum (document bson_rum_composite_path_ops (pathspec='[ "a" ]', tl='2691') WITH =?=, generate_unique_shard_document(document, shard_key_value, '{ "a" : { "$numberInt" : "1" } }'::bson, false, true) bson_rum_unique_shard_path_ops (cmp='true') WITH =#=)
+Check constraints:
+    "shard_key_value_check" CHECK (shard_key_value = '1984304'::bigint)
+
+-- Set the GUC to skip cleanup of old index after reindex
+SET documentdb.skipIndexCleanupOnReindex TO true;
+-- Reindex the unique index
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_skip_cleanup', '{ "collMod": "reindex_skip_cleanup", "index": { "name": "a_1_unique", "reindex": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+-- The old index (_ccold) should still be present on the table
+\d documentdb_data.documents_:skip_cleanup_collection_id
+         Table "documentdb_data.documents_1984304"
+     Column      |  Type  | Collation | Nullable | Default 
+---------------------------------------------------------------------
+ shard_key_value | bigint |           | not null | 
+ object_id       | bson   |           | not null | 
+ document        | bson   |           | not null | 
+Indexes:
+    "collection_pk_1984304" PRIMARY KEY, btree (shard_key_value, object_id)
+    "documents_rum_index_1984314" EXCLUDE USING documentdb_rum (document bson_rum_composite_path_ops (pathspec='[ "a" ]', tl='2691') WITH =?=, generate_unique_shard_document(document, shard_key_value, '{ "a" : { "$numberInt" : "1" } }'::bson, false, true) bson_rum_unique_shard_path_ops (cmp='true') WITH =#=)
+    "documents_rum_index_1984314_ccold" EXCLUDE USING documentdb_rum (document bson_rum_composite_path_ops (pathspec='[ "a" ]', tl='2691') WITH =?=, generate_unique_shard_document(document, shard_key_value, '{ "a" : { "$numberInt" : "1" } }'::bson, false, true) bson_rum_unique_shard_path_ops (cmp='true') WITH =#=)
+Check constraints:
+    "shard_key_value_check" CHECK (shard_key_value = '1984304'::bigint)
+
+RESET documentdb.skipIndexCleanupOnReindex;
+---------------------------------------------------------------------
+-- Test: reindex via create with planner statistics enabled moves the
+-- statistics dependency to the rebuilt index so the old index can be dropped
+-- concurrently. Covers both unsharded and sharded collections, and shows the
+-- statistics objects on the distributed table and on its shards.
+---------------------------------------------------------------------
+SET citus.override_table_visibility TO off;
+SET documentdb.enablePerCollectionPlannerStatistics TO on;
+-- Statistics objects per level, and how many of them depend on an index
+PREPARE reindex_stats_deps(bigint) AS
+SELECT CASE WHEN c.relname = 'documents_' || $1 THEN 'table' ELSE 'shard' END AS level,
+       COUNT(*) AS stats_objects,
+       COUNT(*) FILTER (WHERE EXISTS (
+           SELECT 1 FROM pg_depend d JOIN pg_class i ON i.oid = d.refobjid AND i.relkind = 'i'
+           WHERE d.classid = 'pg_statistic_ext'::regclass AND d.objid = st.oid
+             AND d.refclassid = 'pg_class'::regclass)) AS depends_on_index
+FROM pg_statistic_ext st JOIN pg_class c ON c.oid = st.stxrelid
+WHERE c.relnamespace = 'documentdb_data'::regnamespace
+  AND (c.relname = 'documents_' || $1 OR c.relname LIKE 'documents_' || $1 || '\_%')
+GROUP BY 1 ORDER BY 1;
+-- The index the distributed table's statistics object depends on
+PREPARE reindex_stats_index(bigint) AS
+SELECT st.stxname, d.refobjid::regclass AS depends_on_index, d.deptype
+FROM pg_statistic_ext st
+JOIN pg_depend d ON d.classid = 'pg_statistic_ext'::regclass AND d.objid = st.oid AND d.refclassid = 'pg_class'::regclass
+JOIN pg_class i ON i.oid = d.refobjid AND i.relkind = 'i'
+WHERE st.stxrelid = ('documentdb_data.documents_' || $1)::regclass ORDER BY 1;
+-- Remaining _ccold indexes per level
+PREPARE reindex_ccold_count(bigint) AS
+SELECT CASE WHEN t.relname = 'documents_' || $1 THEN 'table' ELSE 'shard' END AS level, COUNT(*) AS ccold_indexes
+FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class t ON t.oid = x.indrelid
+WHERE t.relnamespace = 'documentdb_data'::regnamespace
+  AND (t.relname = 'documents_' || $1 OR t.relname LIKE 'documents_' || $1 || '\_%')
+  AND i.relname LIKE '%\_ccold%'
+GROUP BY 1 ORDER BY 1;
+-- Unsharded collection
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_with_stats');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('reindex_dist_db', 'reindex_with_stats', FORMAT('{"_id": %s, "a": %s}', i, i)::documentdb_core.bson)) FROM generate_series(1, 10) i;
+ count 
+---------------------------------------------------------------------
+    10
+(1 row)
+
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats', '{ "collMod": "reindex_with_stats", "enableStats": true }');
+             coll_mod              
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_with_stats", "indexes": [ { "key": { "a": 1 }, "name": "a_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT collection_id AS stats_coll_id FROM documentdb_api_catalog.collections WHERE database_name = 'reindex_dist_db' AND collection_name = 'reindex_with_stats' \gset
+EXECUTE reindex_stats_deps(:stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             1 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984316_stats | documentdb_data.documents_rum_index_1984316 | a
+(1 row)
+
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats', '{ "collMod": "reindex_with_stats", "index": { "name": "a_1", "reindex": true, "updateOptions": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_ccold_count(:stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_stats_deps(:stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             1 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984316_stats | documentdb_data.documents_rum_index_1984316 | a
+(1 row)
+
+-- A _ccold index left behind can be dropped concurrently by hand
+SET documentdb.skipIndexCleanupOnReindex TO true;
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats', '{ "collMod": "reindex_with_stats", "index": { "name": "a_1", "reindex": true, "updateOptions": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+RESET documentdb.skipIndexCleanupOnReindex;
+EXECUTE reindex_ccold_count(:stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+ shard |             1
+ table |             1
+(2 rows)
+
+SELECT 'documentdb_data.documents_rum_index_' || index_id || '_ccold' AS ccold_index_name
+FROM documentdb_api_catalog.collection_indexes WHERE collection_id = :stats_coll_id AND (index_spec).index_name = 'a_1' \gset
+DROP INDEX CONCURRENTLY :ccold_index_name;
+EXECUTE reindex_ccold_count(:stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_stats_deps(:stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             1 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984316_stats | documentdb_data.documents_rum_index_1984316 | a
+(1 row)
+
+-- Dropping the rebuilt index removes the statistics objects on the table and its shards
+CALL documentdb_api.drop_indexes('reindex_dist_db', '{ "dropIndexes": "reindex_with_stats", "index": "a_1" }');
+                          retval                          
+---------------------------------------------------------------------
+ { "ok" : true, "nIndexesWas" : { "$numberLong" : "2" } }
+(1 row)
+
+EXECUTE reindex_stats_deps(:stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+(0 rows)
+
+-- Sharded collection
+SELECT documentdb_api.create_collection('reindex_dist_db', 'reindex_with_stats_sharded');
+NOTICE:  creating collection
+ create_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('reindex_dist_db', 'reindex_with_stats_sharded', FORMAT('{"_id": %s, "a": %s}', i, i)::documentdb_core.bson)) FROM generate_series(1, 20) i;
+ count 
+---------------------------------------------------------------------
+    20
+(1 row)
+
+SELECT documentdb_api.shard_collection('reindex_dist_db', 'reindex_with_stats_sharded', '{ "_id": "hashed" }', false);
+ shard_collection 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats_sharded', '{ "collMod": "reindex_with_stats_sharded", "enableStats": true }');
+             coll_mod              
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('reindex_dist_db',
+  '{ "createIndexes": "reindex_with_stats_sharded", "indexes": [ { "key": { "a": 1 }, "name": "a_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT collection_id AS sharded_stats_coll_id FROM documentdb_api_catalog.collections WHERE database_name = 'reindex_dist_db' AND collection_name = 'reindex_with_stats_sharded' \gset
+EXECUTE reindex_stats_deps(:sharded_stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             8 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:sharded_stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984319_stats | documentdb_data.documents_rum_index_1984319 | a
+(1 row)
+
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats_sharded', '{ "collMod": "reindex_with_stats_sharded", "index": { "name": "a_1", "reindex": true, "updateOptions": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+SELECT cmd_type, index_cmd FROM documentdb_api_catalog.documentdb_index_queue WHERE index_id >= 1984300 AND index_id <= 1984400 ORDER BY index_id;
+ cmd_type | index_cmd 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_ccold_count(:sharded_stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_stats_deps(:sharded_stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             8 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:sharded_stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984319_stats | documentdb_data.documents_rum_index_1984319 | a
+(1 row)
+
+SET documentdb.skipIndexCleanupOnReindex TO true;
+SELECT documentdb_api.coll_mod('reindex_dist_db', 'reindex_with_stats_sharded', '{ "collMod": "reindex_with_stats_sharded", "index": { "name": "a_1", "reindex": true, "updateOptions": true } }');
+                                    coll_mod                                    
+---------------------------------------------------------------------
+ { "ok" : { "$numberInt" : "1" }, "reindex_old" : false, "reindex_new" : true }
+(1 row)
+
+CALL documentdb_api_internal.build_index_concurrently(1);
+CALL documentdb_api_internal.build_index_background(1);
+RESET documentdb.skipIndexCleanupOnReindex;
+EXECUTE reindex_ccold_count(:sharded_stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+ shard |             8
+ table |             1
+(2 rows)
+
+SELECT 'documentdb_data.documents_rum_index_' || index_id || '_ccold' AS ccold_index_name
+FROM documentdb_api_catalog.collection_indexes WHERE collection_id = :sharded_stats_coll_id AND (index_spec).index_name = 'a_1' \gset
+DROP INDEX CONCURRENTLY :ccold_index_name;
+EXECUTE reindex_ccold_count(:sharded_stats_coll_id);
+ level | ccold_indexes 
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE reindex_stats_deps(:sharded_stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+ shard |             8 |                0
+ table |             1 |                1
+(2 rows)
+
+EXECUTE reindex_stats_index(:sharded_stats_coll_id);
+              stxname              |              depends_on_index               | deptype 
+---------------------------------------------------------------------
+ documents_rum_index_1984319_stats | documentdb_data.documents_rum_index_1984319 | a
+(1 row)
+
+CALL documentdb_api.drop_indexes('reindex_dist_db', '{ "dropIndexes": "reindex_with_stats_sharded", "index": "a_1" }');
+                          retval                          
+---------------------------------------------------------------------
+ { "ok" : true, "nIndexesWas" : { "$numberLong" : "2" } }
+(1 row)
+
+EXECUTE reindex_stats_deps(:sharded_stats_coll_id);
+ level | stats_objects | depends_on_index 
+---------------------------------------------------------------------
+(0 rows)
+
+DEALLOCATE reindex_stats_deps;
+DEALLOCATE reindex_stats_index;
+DEALLOCATE reindex_ccold_count;
+RESET documentdb.enablePerCollectionPlannerStatistics;
+RESET citus.override_table_visibility;
