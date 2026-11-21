@@ -27,7 +27,10 @@ use pgrx::{
 use tokio::time::Instant;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::gucs::{PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_SETUP_CONFIGURATION};
+use crate::gucs::{
+    PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_GATEWAY_TRANSPORT,
+    PG_DOCUMENTDB_SETUP_CONFIGURATION,
+};
 
 pub fn init() {
     BackgroundWorkerBuilder::new("DocumentDB Gateway Host")
@@ -78,6 +81,18 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
             .unwrap(),
     );
     BackgroundWorker::connect_worker_to_spi(Some(database_name.as_str()), None);
+
+    // Select the backend transport once at worker start: "shmem" enables
+    // the shared-memory ring channel (with automatic network fallback),
+    // anything else keeps the original loopback-socket path.
+    let transport = PG_DOCUMENTDB_GATEWAY_TRANSPORT
+        .get()
+        .map(|value| value.to_str().unwrap_or("network").to_string())
+        .unwrap_or_else(|| "network".to_string());
+    documentdb_gateway_core::postgres::shmem_transport::set_transport_enabled(
+        transport == "shmem",
+    );
+    log!("gateway transport: {transport}");
 
     let shutdown_token = SHUTDOWN_CONTROLLER.token();
     let worker_name = BackgroundWorker::get_name();

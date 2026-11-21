@@ -6,6 +6,12 @@ pub static PG_DOCUMENTDB_GATEWAY_DATABASE: GucSetting<Option<CString>> =
 pub static PG_DOCUMENTDB_SETUP_CONFIGURATION: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+/// "network" (default) keeps the loopback socket transport;
+/// "shmem" lets the pool prefer shared-memory ring channels with
+/// automatic fallback to the network path.
+pub static PG_DOCUMENTDB_GATEWAY_TRANSPORT: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+
 pub fn init() {
     GucRegistry::define_string_guc(
         c"documentdb_gateway.database",
@@ -20,6 +26,15 @@ pub fn init() {
         c"The setup configuration file for the pg_documentdb_gateway BGWorker",
         c"This should be the path to the setup configuration file",
         &PG_DOCUMENTDB_SETUP_CONFIGURATION,
+        GucContext::Postmaster,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
+        c"documentdb_gateway.transport",
+        c"Backend connection transport for the embedded gateway",
+        c"\"network\" uses the loopback socket; \"shmem\" prefers the kernel "
+        c"shared-memory ring channel with network fallback",
+        &PG_DOCUMENTDB_GATEWAY_TRANSPORT,
         GucContext::Postmaster,
         GucFlags::SUPERUSER_ONLY,
     );
