@@ -6,6 +6,8 @@
  *-------------------------------------------------------------------------
  */
 
+use std::io::IoSlice;
+
 use bson::RawDocument;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -49,6 +51,52 @@ fn pack_header(
     buf[4..8].copy_from_slice(&request_id.to_le_bytes());
     buf[8..12].copy_from_slice(&response_to.to_le_bytes());
     buf[12..16].copy_from_slice(&(op_code as i32).to_le_bytes());
+}
+
+/// Writes a wire header immediately followed by a BSON body using vectored I/O.
+///
+/// A MongoDB wire response is a fixed-size header followed by the BSON body. Issuing a
+/// single `write_vectored` lets the socket layer copy both buffers into one send, instead
+/// of two separate `write_all` calls that each enter the async write path and can produce
+/// two syscall/socket-write round trips per response. On the hot path (one response per
+/// request) this removes one async write + syscall per request.
+///
+/// `write_vectored` is allowed to perform a partial write (and sinks without vectored
+/// support write only the first non-empty buffer), so loop until every byte is written,
+/// trimming the consumed prefix of the leading buffer on each iteration. The wire bytes
+/// produced are byte-for-byte identical to two sequential `write_all` calls.
+async fn write_header_and_body<S>(
+    header: &[u8],
+    body: &[u8],
+    stream: &mut S,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut head = header;
+    let mut tail = body;
+    while !head.is_empty() || !tail.is_empty() {
+        let slices = [IoSlice::new(head), IoSlice::new(tail)];
+        let written = stream.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(DocumentDBError::internal_error(
+                "write_vectored made no progress".to_owned(),
+            ));
+        }
+        // Consume `written` bytes from head first, then tail.
+        let mut remaining = written;
+        if remaining >= head.len() {
+            remaining -= head.len();
+            head = &[];
+        } else {
+            head = &head[remaining..];
+            remaining = 0;
+        }
+        if remaining > 0 {
+            tail = &tail[remaining..];
+        }
+    }
+    Ok(())
 }
 
 /// Write a server response to the client stream
@@ -98,8 +146,7 @@ where
             );
             buf[32..36].copy_from_slice(&1_i32.to_le_bytes());
 
-            stream.write_all(&buf).await?;
-            stream.write_all(response.as_bytes()).await?;
+            write_header_and_body(&buf, response.as_bytes(), stream).await?;
             Ok(())
         }
 
@@ -149,8 +196,7 @@ where
         OpCode::Msg,
     );
 
-    writer.write_all(&buf).await?;
-    writer.write_all(response.as_bytes()).await?;
+    write_header_and_body(&buf, response.as_bytes(), writer).await?;
 
     Ok(())
 }
