@@ -23,7 +23,8 @@ use deadpool::{
     Runtime,
 };
 use deadpool_postgres::{
-    ClientWrapper, Manager as PostgresManager, ManagerConfig, RecyclingMethod, Status,
+    ClientWrapper, ConfigConnectImpl, Manager as PostgresManager, ManagerConfig,
+    RecyclingMethod, Status,
 };
 use openssl::sha::Sha256;
 use tokio::{
@@ -298,9 +299,16 @@ impl ConnectionPool {
                           recycling_method: RecyclingMethod,
                           metrics: Arc<ConnectionPoolMetrics>| {
             let manager = InstrumentedManager::new(
-                PostgresManager::from_config(
+                // Transport selection: when the kernel module
+                // pg_shm_channel is loaded and slots are available, the
+                // connection is established over the shared-memory ring
+                // pair (stock wire protocol, zero sockets); otherwise the
+                // original loopback-socket connector runs unchanged.
+                PostgresManager::from_connect(
                     pg_config,
-                    T::clone(tls),
+                    crate::postgres::shmem_transport::ShmemFirstConnect::new(
+                        ConfigConnectImpl { tls: T::clone(tls) },
+                    ),
                     ManagerConfig { recycling_method },
                 ),
                 metrics,
