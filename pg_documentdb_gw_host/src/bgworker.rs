@@ -39,6 +39,22 @@ pub fn init() {
         .load();
 }
 
+/// Default number of Tokio worker threads for the embedded gateway.
+///
+/// The embedded gateway is a PostgreSQL background worker, so every thread it
+/// owns competes for the same cores as the PostgreSQL backends that execute its
+/// queries. Sizing the pool to the whole machine therefore oversubscribes it:
+/// measured on a 16 vCPU box (YCSB workloada, 80 clients, reads only, Unix
+/// socket to PostgreSQL) 16 workers reached 97.0k ops/s, 24 reached 97.6k, 6
+/// reached 98.0k, 10 reached 99.4k, 4 dropped to 81.5k, and 8 reached 103.8k.
+/// Half the cores hits that peak and leaves the rest of the machine to the
+/// backends.
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .div_ceil(2)
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
@@ -73,13 +89,15 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
     // tokio worker accumulated CPU while the PostgreSQL backends sat idle in
     // `ClientRead` waiting to be fed. Size the pool from the machine instead
     // (overridable by `DOCUMENTDB_GW_WORKER_THREADS` for experiments).
+    //
+    // The fallback deliberately uses half the cores rather than all of them:
+    // this gateway shares the host with the backends it drives, and the full
+    // core count measurably oversubscribes it (see `default_worker_threads`).
     let worker_threads = std::env::var("DOCUMENTDB_GW_WORKER_THREADS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|threads| *threads > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-        });
+        .unwrap_or_else(default_worker_threads);
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
