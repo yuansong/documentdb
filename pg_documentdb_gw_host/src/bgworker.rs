@@ -67,8 +67,22 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
     let worker_name = BackgroundWorker::get_name();
 
     // now start the gw on a worker thread.
+    //
+    // The runtime used to be pinned to a single worker thread, which serialized
+    // all socket I/O for every client connection: with 40 clients only one
+    // tokio worker accumulated CPU while the PostgreSQL backends sat idle in
+    // `ClientRead` waiting to be fed. Size the pool from the machine instead
+    // (overridable by `DOCUMENTDB_GW_WORKER_THREADS` for experiments).
+    let worker_threads = std::env::var("DOCUMENTDB_GW_WORKER_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        });
+
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .unwrap();
