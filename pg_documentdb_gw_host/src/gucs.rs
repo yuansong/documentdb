@@ -32,8 +32,7 @@ pub fn init() {
     GucRegistry::define_string_guc(
         c"documentdb_gateway.transport",
         c"Backend connection transport for the embedded gateway",
-        c"\"network\" uses the loopback socket; \"shmem\" prefers the kernel "
-        c"shared-memory ring channel with network fallback",
+        c"\"network\" uses the loopback socket; \"shmem\" prefers the kernel shared-memory ring channel with network fallback",
         &PG_DOCUMENTDB_GATEWAY_TRANSPORT,
         GucContext::Postmaster,
         GucFlags::SUPERUSER_ONLY,

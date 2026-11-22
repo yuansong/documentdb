@@ -58,10 +58,35 @@ fn default_worker_threads() -> usize {
         .div_ceil(2)
 }
 
+/// Install a panic hook that forces a full backtrace to stderr.
+///
+/// Panics inside the tokio runtime (watchdog threads, connection tasks) are
+/// otherwise swallowed by the task machinery: the JoinHandle is dropped or
+/// only logged as a one-line warn.  Routing every panic through stderr with
+/// `Backtrace::force_capture()` makes postmaster's log show exactly where
+/// and why the gateway crashed (crash-localization, 2026-11-22).
+fn install_panic_hook() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("GATEWAY PANIC: {info}");
+        eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+        default_hook(info);
+    }));
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
+    // Direct stderr diagnostics: unlike pgrx log!()/tracing, eprintln! is
+    // unfiltered (no log_min_messages, no subscriber init dependency), so
+    // the startup path is always visible in the postmaster log.
+    eprintln!("GW-HOST: documentdb_gw_worker_main entered (pid={})", std::process::id());
+
     STARTUP_INSTANT.get_or_init(Instant::now);
+
+    install_panic_hook();
+    eprintln!("GW-HOST: panic hook installed");
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
@@ -91,6 +116,11 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
         .unwrap_or_else(|| "network".to_string());
     documentdb_gateway_core::postgres::shmem_transport::set_transport_enabled(
         transport == "shmem",
+    );
+    eprintln!(
+        "GW-HOST: transport='{}', transport_enabled={}",
+        transport,
+        transport == "shmem"
     );
     log!("gateway transport: {transport}");
 
