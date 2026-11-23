@@ -39,7 +39,7 @@ pub fn init() {
         .load();
 }
 
-/// Default number of Tokio worker threads for the embedded gateway.
+/// Fallback number of Tokio worker threads for the embedded gateway.
 ///
 /// The embedded gateway is a PostgreSQL background worker, so every thread it
 /// owns competes for the same cores as the PostgreSQL backends that execute its
@@ -87,17 +87,35 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
     // The runtime used to be pinned to a single worker thread, which serialized
     // all socket I/O for every client connection: with 40 clients only one
     // tokio worker accumulated CPU while the PostgreSQL backends sat idle in
-    // `ClientRead` waiting to be fed. Size the pool from the machine instead
-    // (overridable by `DOCUMENTDB_GW_WORKER_THREADS` for experiments).
+    // `ClientRead` waiting to be fed.
+    //
+    // Worker thread resolution order (aligned with the standalone
+    // `documentdb-gateway` binary, which sizes its runtime from the same
+    // setup configuration key):
+    //   1. `async_runtime_worker_threads` in the setup configuration file,
+    //   2. `DOCUMENTDB_GW_WORKER_THREADS` environment variable,
+    //   3. half the machine's cores as fallback (see `default_worker_threads`).
     //
     // The fallback deliberately uses half the cores rather than all of them:
     // this gateway shares the host with the backends it drives, and the full
     // core count measurably oversubscribes it (see `default_worker_threads`).
-    let worker_threads = std::env::var("DOCUMENTDB_GW_WORKER_THREADS")
+    let cfg_file = std::path::PathBuf::from(setup_configuration_file.as_str());
+    let setup_configuration =
+        DocumentDBSetupConfiguration::new(&cfg_file).expect("Failed to load configuration.");
+
+    let config_worker_threads = setup_configuration.async_runtime_worker_threads;
+    let env_worker_threads = std::env::var("DOCUMENTDB_GW_WORKER_THREADS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|threads| *threads > 0)
-        .unwrap_or_else(default_worker_threads);
+        .filter(|threads| *threads > 0);
+
+    let (worker_threads, worker_threads_source) = config_worker_threads
+        .map(|threads| (threads, "setup configuration"))
+        .or_else(|| env_worker_threads.map(|threads| (threads, "DOCUMENTDB_GW_WORKER_THREADS")))
+        .unwrap_or_else(|| (default_worker_threads(), "half the cores (default)"));
+    log!(
+        "Gateway worker threads: {worker_threads} (source: {worker_threads_source})"
+    );
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -106,7 +124,7 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
         .unwrap();
 
     tokio_runtime.spawn(async move {
-        if let Err(error) = run_docdb_gateway(setup_configuration_file.as_str()).await {
+        if let Err(error) = run_docdb_gateway(setup_configuration).await {
             tracing::error!("Gateway worker failed to start: {error}");
         }
         SHUTDOWN_CONTROLLER.shutdown();
@@ -124,13 +142,8 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
     log!("{} stopped", worker_name);
 }
 
-async fn run_docdb_gateway(setup_configuration_file: &str) -> Result<()> {
-    let cfg_file = std::path::PathBuf::from(setup_configuration_file);
-
+async fn run_docdb_gateway(setup_configuration: DocumentDBSetupConfiguration) -> Result<()> {
     let shutdown_token = SHUTDOWN_CONTROLLER.token();
-
-    let setup_configuration =
-        DocumentDBSetupConfiguration::new(&cfg_file).expect("Failed to load configuration.");
 
     // Initialize tracing subscriber to handle all tracing events
     tracing_subscriber::registry()
