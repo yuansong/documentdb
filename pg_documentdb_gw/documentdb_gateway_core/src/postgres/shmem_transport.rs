@@ -31,6 +31,7 @@
 
 use std::{
     ffi::{c_int, c_void, CString},
+    future::Future,
     io,
     os::unix::io::RawFd,
     pin::Pin,
@@ -44,6 +45,7 @@ use std::{
 use deadpool_postgres::Connect;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
+use tokio::time::{sleep, Duration, Sleep};
 
 /// Structurally identical to the private `BoxFuture` alias used inside
 /// deadpool-postgres' `Connect` trait (`Pin<Box<dyn Future + Send>>`, a
@@ -55,6 +57,38 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// Both directions are 1 MB (user decision 2026-11-22).
 const REQ_RING_SIZE: usize = 1024 * 1024;
 const RESP_RING_SIZE: usize = 1024 * 1024;
+
+/* Adaptive wait discipline (2026-11-23, P0/P1):
+ *
+ * Idle diagnosis on the VM showed the gateway burning 2-5 cores NOT in a
+ * user-space spin but in a readiness storm: one conn task hot-loops
+ * `poll_read_ready -> Ready (mio cache) -> drain eventfd -> EAGAIN ->
+ * continue` without ever reaching epoll.  The ring cursors are the source
+ * of truth, so the fix restructures every wait into bounded stages:
+ *
+ *   1. fast path: cursor check (no syscall)
+ *   2. bounded spin window: cursor polling with spin_loop hints -- covers
+ *      the typical backend execution latency (~21 us) without parking
+ *   3. Dekker arm: set reader_parked/writer_parked, full fence, recheck
+ *      the peer cursor -- the kernel producer only writes the eventfd
+ *      when this flag is set (gated notify), so spinning peers cost the
+ *      producer ZERO syscalls
+ *   4. epoll wait via AsyncFd (true park)
+ *   5. stall guard: a drained-but-empty eventfd readiness (the storm
+ *      signature) is counted; past STALL_POLL_LIMIT consecutive hits the
+ *      wait degrades to a 1 ms timer poll -- bounded CPU, correctness
+ *      preserved, self-heals as soon as real data arrives.
+ */
+/* Spin windows.  CAUTION: the spin runs INSIDE poll_read, i.e. on a tokio
+ * worker thread -- while any worker spins, it cannot run other tasks and the
+ * runtime's epoll reactor only gets scheduled between polls.  A large window
+ * measurably REGRESSES throughput at high concurrency (C=80: 18.2k -> 15.0k
+ * with 4000 iters, 2026-11-23) because 80 conn tasks x 45us of spinning
+ * starve the reactor; keep the window at a few microseconds so the worker
+ * parks quickly and epoll wakeups stay prompt. */
+const RESP_SPIN_ITERS: u32 = 512;
+const REQ_SPIN_ITERS: u32 = 128;
+const STALL_POLL_LIMIT: u32 = 48;
 
 /* ------------------------------------------------------------------ */
 /* Shared-memory layout mirrors of the kernel structures               */
@@ -191,13 +225,16 @@ fn transport_enabled() -> bool {
     TRANSPORT_ENABLED.load(Ordering::SeqCst) && api().is_some()
 }
 
-/// Drain an eventfd counter (one read resets it to zero).  Errors are
+/// Drain an eventfd counter (one read resets it to zero).  Returns true
+/// when a pending notification was actually consumed.  Errors are
 /// ignored: the ring cursors are the source of truth, the eventfd only
-/// accelerates wakeup.
-fn drain_eventfd(fd: RawFd) {
+/// accelerates wakeup.  The boolean distinguishes a real notification
+/// from the "stale epoll-cache Ready but counter empty" pathology.
+fn drain_eventfd(fd: RawFd) -> bool {
     let mut val = [0u8; 8];
     unsafe {
-        let _ = libc::read(fd, val.as_mut_ptr() as *mut c_void, 8);
+        let n = libc::read(fd, val.as_mut_ptr() as *mut c_void, 8);
+        n == 8
     }
 }
 
@@ -217,6 +254,13 @@ pub struct ShmemStream {
     resp_afd: AsyncFd<RawFd>,
     /// Readable when the backend freed request-ring space (req_efd).
     req_afd: AsyncFd<RawFd>,
+    /// Stall-guard state: consecutive "eventfd readiness was Ready but the
+    /// drain found the counter empty" observations across both poll
+    /// directions (the readiness-storm signature).  Past STALL_POLL_LIMIT
+    /// the wait degrades to a 1 ms timer poll instead of hot-spinning.
+    stall_polls: u32,
+    stall_warned: bool,
+    stall_timer: Option<Pin<Box<Sleep>>>,
 }
 
 // The slot pointer lives in PostgreSQL static shared memory, stable for the
@@ -321,6 +365,9 @@ impl ShmemStream {
             generation,
             resp_afd,
             req_afd,
+            stall_polls: 0,
+            stall_warned: false,
+            stall_timer: None,
         })
     }
 
@@ -341,6 +388,32 @@ impl ShmemStream {
         slot.resp.closed.load(Ordering::Acquire) != 0
             || slot.req.closed.load(Ordering::Acquire) != 0
             || slot.generation.load(Ordering::Acquire) != self.generation
+    }
+
+    /// Exit the degraded 1 ms timer-poll mode: called whenever real
+    /// progress is observed (data arrived, EOF, error).
+    fn reset_stall(&mut self) {
+        self.stall_polls = 0;
+        self.stall_timer = None;
+        self.stall_warned = false;
+    }
+
+    /// One iteration of the degraded stall wait.  Returns true when the
+    /// timer fired and the caller may re-check the ring.
+    fn poll_stall(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.stall_polls == STALL_POLL_LIMIT && !self.stall_warned {
+            self.stall_warned = true;
+            eprintln!(
+                "GW-SHM: slot {} stale eventfd readiness detected \
+                 (epoll cache Ready, counter empty); throttling this \
+                 stream to 1ms ring polling",
+                self.slot
+            );
+        }
+        let tm = self
+            .stall_timer
+            .get_or_insert_with(|| Box::pin(sleep(Duration::from_millis(1))));
+        matches!(tm.as_mut().poll(cx), Poll::Ready(()))
     }
 
     /// Copy the available resp bytes into `buf` (single-copy fast path).
@@ -412,15 +485,21 @@ impl AsyncRead for ShmemStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // ShmemStream is Unpin (plain data + AsyncFd + boxed Sleep); take a
+        // plain &mut for the stall-guard fields without moving anything.
+        let this = unsafe { self.get_unchecked_mut() };
         unsafe {
-            let ring = self.resp_ring();
+            // raw deref: the ring lives in shared memory, not in `self`, so
+            // the reference must not borrow `this` (reset_stall below takes
+            // &mut self while `ring` stays alive).
+            let ring = &(*this.slot_ptr).resp;
 
             // corruption gate: refuse to copy from an insane ring
             if ring.corrupted() {
                 tracing::error!(
                     "shmem slot {} resp ring corrupted in poll_read: \
                      head={} tail={} size={} buf={:#x}",
-                    self.slot,
+                    this.slot,
                     ring.head.load(Ordering::Acquire),
                     ring.tail.load(Ordering::Acquire),
                     ring.size,
@@ -433,39 +512,112 @@ impl AsyncRead for ShmemStream {
             }
 
             loop {
-                // fast path: bytes already available
-                if ring.used() > 0 {
-                    self.copy_resp_available(buf);
-                    return Poll::Ready(Ok(()));
-                }
-
-                if ring.closed.load(Ordering::Acquire) != 0 {
-                    // EOF: peer released the session
-                    return Poll::Ready(Ok(()));
-                }
-
-                // Wait for the backend's eventfd notification; epoll does
-                // the parking, exactly like a socket read.
-                match self.resp_afd.poll_read_ready(cx) {
-                    Poll::Ready(Ok(guard)) => {
-                        // drain the notification counter first, then drop
-                        // the guard (clears readiness): a notify racing with
-                        // the drain re-marks readability, none is lost
-                        drain_eventfd(*self.resp_afd.get_ref());
-                        drop(guard);
-                        // loop: recheck the ring (data is likely present)
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        if self.session_dead() {
-                            // EOF: peer exited cleanly or the slot was
-                            // recycled by a fresh worker
+                // stage 0: degraded stall mode -- bounded CPU, timer-polled
+                if this.stall_polls >= STALL_POLL_LIMIT {
+                    if this.poll_stall(cx) {
+                        this.stall_polls = 0;
+                        this.stall_timer = None;
+                    } else {
+                        if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
                             return Poll::Ready(Ok(()));
                         }
-                        // lost-wake double check before sleeping
-                        if ring.used() > 0 {
+                        return Poll::Pending;
+                    }
+                }
+
+                // stage 1: fast path -- bytes already available
+                if ring.used() > 0 {
+                    this.reset_stall();
+                    ring.reader_parked.store(0, Ordering::SeqCst);
+                    this.copy_resp_available(buf);
+                    return Poll::Ready(Ok(()));
+                }
+                if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
+                    // EOF: peer released the session
+                    this.reset_stall();
+                    ring.reader_parked.store(0, Ordering::SeqCst);
+                    return Poll::Ready(Ok(()));
+                }
+
+                // stage 2: bounded spin window -- cursor polling with no
+                // syscalls, sized to cover the typical backend execution
+                for _ in 0..RESP_SPIN_ITERS {
+                    std::hint::spin_loop();
+                    if ring.used() > 0 {
+                        break;
+                    }
+                    if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
+                        break;
+                    }
+                }
+                if ring.used() > 0 {
+                    continue;
+                }
+                if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
+                    this.reset_stall();
+                    ring.reader_parked.store(0, Ordering::SeqCst);
+                    return Poll::Ready(Ok(()));
+                }
+
+                // stage 3: Dekker arm -- declare "about to sleep"; the
+                // kernel producer only writes the eventfd when this flag
+                // is set (gated notify), so a spinning gateway costs the
+                // backend zero syscalls.
+                ring.reader_parked.store(1, Ordering::SeqCst);
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if ring.used() > 0 {
+                    ring.reader_parked.store(0, Ordering::SeqCst);
+                    continue;
+                }
+                if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
+                    ring.reader_parked.store(0, Ordering::SeqCst);
+                    this.reset_stall();
+                    return Poll::Ready(Ok(()));
+                }
+
+                // stage 4: eventfd wait -- epoll does the parking
+                match this.resp_afd.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut guard)) => {
+                        let had = drain_eventfd(*this.resp_afd.get_ref());
+                        // tokio 1.44+ AsyncFdReadyGuard has NO Drop impl that
+                        // clears the readiness cache (verified in tokio-1.53.1
+                        // src/io/async_fd.rs: only clear_ready_matching does).
+                        // Dropping without clear_ready leaves the cached
+                        // READABLE set forever: the next poll_read_ready
+                        // returns Ready instantly without consulting epoll,
+                        // and this loop becomes the readiness storm that
+                        // burned 2-5 gateway cores at idle.  The eventfd was
+                        // just drained (counter empty), so clearing here is
+                        // the correct, observed-not-ready semantics; the
+                        // Dekker arm in stage 3 guarantees any later produce
+                        // re-notifies.
+                        guard.clear_ready();
+                        ring.reader_parked.store(0, Ordering::SeqCst);
+                        if ring.used() > 0 || had {
                             continue;
                         }
+                        // storm signature: readiness was cached Ready but
+                        // the counter is empty and no bytes arrived
+                        this.stall_polls += 1;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        ring.reader_parked.store(0, Ordering::SeqCst);
+                        this.reset_stall();
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        if ring.closed.load(Ordering::Acquire) != 0 || this.session_dead() {
+                            ring.reader_parked.store(0, Ordering::SeqCst);
+                            this.reset_stall();
+                            return Poll::Ready(Ok(()));
+                        }
+                        if ring.used() > 0 {
+                            ring.reader_parked.store(0, Ordering::SeqCst);
+                            continue;
+                        }
+                        // keep reader_parked set: the backend's next
+                        // produce is gated on this flag and will write
+                        // resp_efd, waking this task through epoll.
                         return Poll::Pending;
                     }
                 }
@@ -480,15 +632,16 @@ impl AsyncWrite for ShmemStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = unsafe { self.get_unchecked_mut() };
         unsafe {
-            let ring = self.req_ring();
+            let ring = &(*this.slot_ptr).req;
 
             // corruption gate: refuse to write into an insane ring
             if ring.corrupted() {
                 tracing::error!(
                     "shmem slot {} req ring corrupted in poll_write: \
                      head={} tail={} size={} buf={:#x}",
-                    self.slot,
+                    this.slot,
                     ring.head.load(Ordering::Acquire),
                     ring.tail.load(Ordering::Acquire),
                     ring.size,
@@ -503,6 +656,7 @@ impl AsyncWrite for ShmemStream {
             loop {
                 let free = ring.free();
                 if free > 0 {
+                    this.reset_stall();
                     // we are about to proceed without waiting; make sure a
                     // stale park marker does not cause a pointless notify
                     if ring.writer_parked.load(Ordering::Acquire) != 0 {
@@ -533,7 +687,7 @@ impl AsyncWrite for ShmemStream {
                     if ring.reader_parked.load(Ordering::Acquire) != 0 {
                         ring.reader_parked.store(0, Ordering::SeqCst);
                         if let Some(a) = api() {
-                            (a.wake_backend)(self.slot);
+                            (a.wake_backend)(this.slot);
                         }
                     }
                     return Poll::Ready(Ok(n));
@@ -546,21 +700,56 @@ impl AsyncWrite for ShmemStream {
                     )));
                 }
 
-                // Ring full (1 MB of outstanding request bytes): set the
-                // marker the backend consumer checks after every consume,
-                // then wait for its req_efd notification.
+                // degraded stall mode (same discipline as poll_read)
+                if this.stall_polls >= STALL_POLL_LIMIT {
+                    if this.poll_stall(cx) {
+                        this.stall_polls = 0;
+                        this.stall_timer = None;
+                    } else {
+                        if ring.closed.load(Ordering::Acquire) != 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "shm channel closed",
+                            )));
+                        }
+                        return Poll::Pending;
+                    }
+                }
+
+                // Ring full (1 MB of outstanding request bytes): short spin
+                // window first (the backend consumer usually drains within
+                // microseconds under load), then the Dekker park.
+                for _ in 0..REQ_SPIN_ITERS {
+                    std::hint::spin_loop();
+                    if ring.free() > 0 {
+                        break;
+                    }
+                    if ring.closed.load(Ordering::Acquire) != 0 {
+                        break;
+                    }
+                }
+                if ring.free() > 0 {
+                    continue;
+                }
+
+                // set the marker the backend consumer checks after every
+                // consume, then wait for its req_efd notification
                 ring.writer_parked.store(1, Ordering::SeqCst);
                 std::sync::atomic::fence(Ordering::SeqCst);
 
-                match self.req_afd.poll_read_ready(cx) {
-                    Poll::Ready(Ok(guard)) => {
-                        drain_eventfd(*self.req_afd.get_ref());
-                        drop(guard);
+                match this.req_afd.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut guard)) => {
+                        let had = drain_eventfd(*this.req_afd.get_ref());
+                        guard.clear_ready();
                         ring.writer_parked.store(0, Ordering::SeqCst);
-                        // loop: recheck free space
+                        if ring.free() > 0 || had {
+                            continue;
+                        }
+                        this.stall_polls += 1;
                     }
                     Poll::Ready(Err(e)) => {
                         ring.writer_parked.store(0, Ordering::SeqCst);
+                        this.reset_stall();
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
@@ -570,15 +759,17 @@ impl AsyncWrite for ShmemStream {
                             ring.writer_parked.store(0, Ordering::SeqCst);
                             continue;
                         }
-                        if self.session_dead() {
+                        if ring.closed.load(Ordering::Acquire) != 0 {
                             ring.writer_parked.store(0, Ordering::SeqCst);
+                            this.reset_stall();
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::BrokenPipe,
                                 "shm channel closed",
                             )));
                         }
                         // keep writer_parked set: the backend's next consume
-                        // writes req_efd and epoll wakes this task
+                        // is gated on this flag and writes req_efd, epoll
+                        // wakes this task
                         return Poll::Pending;
                     }
                 }
