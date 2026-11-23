@@ -60,17 +60,24 @@ const RESP_RING_SIZE: usize = 1024 * 1024;
 /* Shared-memory layout mirrors of the kernel structures               */
 /* ------------------------------------------------------------------ */
 
+/// Cacheline-split mirror of the kernel ShmRing (192 bytes, 3 lines).
+/// Layout must stay byte-for-byte identical to kernel/shm_channel.h:
+/// line 0 = producer side (head/writer_parked), line 1 = consumer side
+/// (tail/reader_parked), line 2 = cold (closed/size/buf/procs).
 #[repr(C)]
 struct ShmRing {
     head: AtomicU64,
+    writer_parked: AtomicU32,
+    _pad0: [u32; 12],
     tail: AtomicU64,
     reader_parked: AtomicU32,
-    writer_parked: AtomicU32,
+    _pad1: [u32; 13],
     closed: AtomicU32,
     size: u32,
     buf: u64,
     reader_proc: u64,
     writer_proc: u64,
+    _pad2: [u32; 8],
 }
 
 #[repr(C)]
