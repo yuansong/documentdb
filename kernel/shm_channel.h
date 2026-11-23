@@ -56,17 +56,38 @@
  * barrier, re-checks the peer cursor, then parks; the producer, after
  * advancing its cursor and a write barrier, clears the flag and wakes.
  */
+/*
+ * Cacheline-split ring control block (192 bytes = 3 lines).
+ *
+ * False-sharing discipline: under load the producer CPU writes head while
+ * the consumer CPU writes tail; keeping them on the same line made the
+ * line bounce between cores on every operation.  Each hot line is now
+ * written by exactly one role and read by the other:
+ *   line 0: producer writes head/writer_parked, consumer reads them
+ *   line 1: consumer writes tail/reader_parked, producer reads them
+ *   line 2: cold config + closed flag (written only at teardown)
+ * Field names are unchanged from the original layout; only offsets moved.
+ * The Rust mirror in shmem_transport.rs must stay byte-for-byte identical.
+ */
 typedef struct ShmRing
 {
+	/* --- cacheline 0: producer side --- */
 	volatile uint64 head;		/* bytes written by producer */
+	volatile uint32 writer_parked;	/* producer sleeping (ring full) */
+	volatile uint32 pad0[12];	/* pad line 0 out to 64 bytes */
+
+	/* --- cacheline 1: consumer side --- */
 	volatile uint64 tail;		/* bytes consumed by consumer */
-	volatile uint32 reader_parked;	/* consumer sleeping */
-	volatile uint32 writer_parked;	/* producer sleeping */
+	volatile uint32 reader_parked;	/* consumer sleeping (ring empty) */
+	volatile uint32 pad1[13];	/* pad line 1 out to 64 bytes */
+
+	/* --- cacheline 2: cold --- */
 	volatile uint32 closed;		/* peer gone / channel dead */
 	uint32		size;
 	char	   *buf;			/* points into the owning slot */
 	PGPROC	   *reader_proc;	/* set when reader is a PG process */
 	PGPROC	   *writer_proc;	/* set when writer is a PG process */
+	volatile uint32 pad2[8];	/* round up to 192 = 3 full lines */
 } ShmRing;
 
 /*
