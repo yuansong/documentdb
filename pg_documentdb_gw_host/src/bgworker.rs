@@ -29,14 +29,58 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::gucs::{PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_SETUP_CONFIGURATION};
 
+/// Name prefix of the gateway background workers when multiple instances are
+/// registered; individual workers are named `{PREFIX}gw{index}`.
+const WORKER_NAME_PREFIX: &str = "DocumentDB Gateway Host gw";
+
+/// Upper bound on registered gateway instances. Purely a runaway guard; any
+/// real deployment wanting more than 64 gateway workers on one box should
+/// rethink its topology first.
+const MAX_GATEWAY_INSTANCES: usize = 64;
+
+/// Resolves the number of gateway background workers to register.
+///
+/// Read from the postmaster environment (`DOCUMENTDB_GW_INSTANCES`): `_PG_init`
+/// runs while `shared_preload_libraries` is being loaded, before
+/// `postgresql.conf` GUC values are applied, so a GUC would not be reliably
+/// populated here. Defaults to 1 (single instance, unchanged behavior).
+fn gateway_instances() -> usize {
+    std::env::var("DOCUMENTDB_GW_INSTANCES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|instances| *instances > 0)
+        .unwrap_or(1)
+        .min(MAX_GATEWAY_INSTANCES)
+}
+
 pub fn init() {
-    BackgroundWorkerBuilder::new("DocumentDB Gateway Host")
-        .set_function("documentdb_gw_worker_main")
-        .set_library("pg_documentdb_gw_host")
-        .set_restart_time(Some(Duration::from_secs(1)))
-        .set_start_time(BgWorkerStartTime::ConsistentState)
-        .enable_spi_access()
-        .load();
+    let instances = gateway_instances();
+    if instances <= 1 {
+        BackgroundWorkerBuilder::new("DocumentDB Gateway Host")
+            .set_function("documentdb_gw_worker_main")
+            .set_library("pg_documentdb_gw_host")
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .set_start_time(BgWorkerStartTime::ConsistentState)
+            .enable_spi_access()
+            .load();
+        return;
+    }
+
+    // Multi-instance mode: register K workers named "... gw0".."gw{K-1}". Each
+    // runs its own tokio runtime and its own PostgreSQL connection pool, and
+    // binds the same listening port with SO_REUSEPORT; the Linux kernel
+    // load-balances new client connections across the instances by connection
+    // 4-tuple hash, so clients only need a single host:port.
+    for index in 0..instances {
+        BackgroundWorkerBuilder::new(&format!("{WORKER_NAME_PREFIX}{index}"))
+            .set_function("documentdb_gw_worker_main")
+            .set_library("pg_documentdb_gw_host")
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .set_start_time(BgWorkerStartTime::ConsistentState)
+            .enable_spi_access()
+            .set_argument(Some(pg_sys::Datum::from(index)))
+            .load();
+    }
 }
 
 /// Fallback number of Tokio worker threads for the embedded gateway.
@@ -57,10 +101,13 @@ fn default_worker_threads() -> usize {
 
 #[pg_guard]
 #[no_mangle]
-pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     STARTUP_INSTANT.get_or_init(Instant::now);
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    let instance_index = arg.value();
+    let instances = gateway_instances();
 
     let database_name = String::from(
         PG_DOCUMENTDB_GATEWAY_DATABASE
@@ -100,8 +147,19 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
     // this gateway shares the host with the backends it drives, and the full
     // core count measurably oversubscribes it (see `default_worker_threads`).
     let cfg_file = std::path::PathBuf::from(setup_configuration_file.as_str());
-    let setup_configuration =
+    let mut setup_configuration =
         DocumentDBSetupConfiguration::new(&cfg_file).expect("Failed to load configuration.");
+
+    // Multi-instance mode: every instance must set SO_REUSEPORT on its
+    // listeners so all of them can bind the same gateway port. The kernel
+    // then load-balances client connections across the instances by
+    // connection 4-tuple hash.
+    if instances > 1 {
+        setup_configuration.gateway_reuse_port = Some(true);
+        log!(
+            "Gateway instance gw{instance_index}/{instances}: SO_REUSEPORT listeners enabled"
+        );
+    }
 
     let config_worker_threads = setup_configuration.async_runtime_worker_threads;
     let env_worker_threads = std::env::var("DOCUMENTDB_GW_WORKER_THREADS")
@@ -114,7 +172,7 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(_arg: pg_sys::Datum) {
         .or_else(|| env_worker_threads.map(|threads| (threads, "DOCUMENTDB_GW_WORKER_THREADS")))
         .unwrap_or_else(|| (default_worker_threads(), "half the cores (default)"));
     log!(
-        "Gateway worker threads: {worker_threads} (source: {worker_threads_source})"
+        "Gateway worker threads: {worker_threads} (source: {worker_threads_source}, instance gw{instance_index}/{instances})"
     );
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()

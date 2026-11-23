@@ -10,7 +10,7 @@
  *-------------------------------------------------------------------------
  */
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
@@ -29,6 +29,12 @@ use crate::{
 /// If one fails, logs a warning and continues with the other.
 /// Returns an error only if both bindings fail.
 ///
+/// When `ListenerConfig::reuse_port()` is true (Linux), every listener sets
+/// `SO_REUSEPORT` before `bind(2)`. Multiple gateway processes (e.g. one
+/// background worker per instance) can then share the same listening port and
+/// the kernel load-balances new connections across their accept queues by
+/// connection 4-tuple hash — fully transparent to clients.
+///
 /// # Returns
 /// A tuple of (IPv4 listener, IPv6 listener) where either may be `None` if binding failed.
 ///
@@ -41,14 +47,20 @@ pub async fn create_tcp_listeners(
 ) -> Result<(Option<TcpListener>, Option<TcpListener>)> {
     let port = cfg.port();
     if cfg.use_local_host() {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+        let listener = bind_tcp_socket(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            cfg.reuse_port(),
+        )
+        .map_err(|err| DocumentDBError::internal_error(format!(
+            "Failed to bind to localhost address 127.0.0.1:{port}: {err}"
+        )))?;
         tracing::info!("Bound to localhost address 127.0.0.1:{port}.");
         Ok((Some(listener), None))
     } else {
         // Bind IPv6 with explicit IPV6_V6ONLY to ensure consistent behavior across platforms.
         // On Linux, IPv6 sockets default to dual-stack (accepting IPv4 too), while
         // Windows/macOS default to IPv6-only. Setting V6ONLY ensures we need both listeners.
-        let ipv6_listener = match create_ipv6_only_listener(port) {
+        let ipv6_listener = match create_ipv6_only_listener(port, cfg.reuse_port()) {
             Ok(listener) => {
                 tracing::info!("Bound to IPv6 address [::]:{}.", port);
                 Some(listener)
@@ -64,7 +76,10 @@ pub async fn create_tcp_listeners(
         };
 
         // Bind IPv4
-        let ipv4_listener = match TcpListener::bind(format!("0.0.0.0:{port}")).await {
+        let ipv4_listener = match bind_tcp_socket(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            cfg.reuse_port(),
+        ) {
             Ok(listener) => {
                 tracing::info!("Bound to IPv4 address 0.0.0.0:{port}.");
                 Some(listener)
@@ -87,11 +102,42 @@ pub async fn create_tcp_listeners(
     }
 }
 
+/// Creates an IPv4 TCP listener on `addr`.
+///
+/// `SO_REUSEADDR` is always set (fast restarts). When `reuse_port` is true,
+/// `SO_REUSEPORT` is additionally set before `bind(2)` so multiple processes
+/// may share the same address and port (Linux only; silently ignored
+/// elsewhere).
+fn bind_tcp_socket(addr: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+
+    // Allow address reuse for faster restarts
+    socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+
+    socket.bind(&addr.into())?;
+
+    // Start listening. Backlog of 4096 matches Linux kernel default (SOMAXCONN since 5.4).
+    socket.listen(4096)?;
+
+    // Set non-blocking for tokio compatibility
+    socket.set_nonblocking(true)?;
+
+    // Convert to tokio TcpListener
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+}
+
 /// Creates an IPv6 TCP listener with `IPV6_V6ONLY` set to true.
 ///
 /// This ensures the socket only accepts IPv6 connections, matching Windows/macOS behavior
 /// and allowing a separate IPv4 listener to coexist on the same port.
-fn create_ipv6_only_listener(port: u16) -> std::io::Result<TcpListener> {
+/// `reuse_port` behaves as in [`bind_tcp_socket`].
+fn create_ipv6_only_listener(port: u16, reuse_port: bool) -> std::io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
 
     // Set IPV6_V6ONLY to true - this socket will only accept IPv6 connections
@@ -99,6 +145,11 @@ fn create_ipv6_only_listener(port: u16) -> std::io::Result<TcpListener> {
 
     // Allow address reuse for faster restarts
     socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
 
     // Bind to [::]:port
     let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
@@ -210,7 +261,7 @@ mod tests {
         // This test verifies the behavior when one listener fails but the other succeeds.
         // We simulate this by first binding to IPv6 on a specific port, then calling
         // create_tcp_listeners on the same port - IPv6 should fail but IPv4 should succeed.
-        let ipv6_pre_bound = create_ipv6_only_listener(0);
+        let ipv6_pre_bound = create_ipv6_only_listener(0, false);
         if let Ok(ipv6_pre_bound) = ipv6_pre_bound {
             let port = ipv6_pre_bound.local_addr().unwrap().port();
 
@@ -244,7 +295,7 @@ mod tests {
 
         // Bind both IPv4 and IPv6 to the same port first
         let ipv4_pre_bound = TcpListener::bind(format!("0.0.0.0:{TEST_PORT}")).await;
-        let ipv6_pre_bound = create_ipv6_only_listener(TEST_PORT);
+        let ipv6_pre_bound = create_ipv6_only_listener(TEST_PORT, false);
 
         if let (Ok(_ipv4_pre), Ok(_ipv6_pre)) = (&ipv4_pre_bound, &ipv6_pre_bound) {
             // Both ports are now taken, create_tcp_listeners should fail
@@ -254,5 +305,50 @@ mod tests {
         }
         // If either pre-bind failed (port already in use by another process),
         // skip the test - we can't guarantee port availability in CI
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reuse_port_allows_multiple_binders_on_same_port() {
+        // SO_REUSEPORT must let a second listener bind the same port when BOTH
+        // sockets set it before bind(), and must still fail when only one does
+        // (the pre-bound socket here is a plain tokio bind without REUSEPORT).
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        let first = bind_tcp_socket(
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            true,
+        )
+        .expect("first SO_REUSEPORT bind");
+        let second = bind_tcp_socket(
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            true,
+        )
+        .expect("second SO_REUSEPORT bind on the same port must succeed");
+        drop(first);
+        drop(second);
+
+        // Without SO_REUSEPORT on the second socket, bind must fail.
+        let plain = bind_tcp_socket(
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            false,
+        );
+        let should_fail = {
+            let holder = bind_tcp_socket(
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                true,
+            )
+            .expect("holder bind");
+            let failed = plain.is_err();
+            drop(holder);
+            failed
+        };
+        assert!(
+            should_fail,
+            "bind without SO_REUSEPORT must fail while a REUSEPORT holder exists"
+        );
     }
 }

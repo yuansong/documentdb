@@ -39,7 +39,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{fmt::Debug, fs, path::Path, str::EscapeDebug, sync::Arc, time::SystemTime};
+use std::{fmt::Debug, fs, path::Path, str::EscapeDebug, sync::Arc, time::Duration, time::SystemTime};
 
 use arc_swap::ArcSwap;
 use openssl::{
@@ -129,26 +129,12 @@ impl CertificateStorePaths {
                         "TLS auto-gen: reusing existing certificate at {cert_path} (set {ENV_TLS_STATE_DIR} to override)"
                     );
                 } else {
-                    tracing::info!(
-                        "TLS auto-gen: generating self-signed certificate at {cert_path} (set {ENV_TLS_STATE_DIR} to override)"
-                    );
-                    docdb_openssl::generate_auth_keys(&key_path, &cert_path)?;
-                    // openssl(1) honors the process umask when writing the
-                    // key file, which on most systems leaves it world- or
-                    // group-readable. Explicitly tighten to owner-only RW
-                    // so the private key is not exposed even if the
-                    // parent directory permissions were loosened by an
-                    // admin or skipped by ensure_tls_state_dir (e.g.
-                    // pre-existing dir we can't chmod).
-                    #[cfg(unix)]
-                    if let Err(e) =
-                        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-                    {
-                        tracing::warn!(
-                            "Failed to tighten permissions on generated private key {key_path}: {e}. \
-                             Verify the file is not world- or group-readable."
-                        );
-                    }
+                    // Multiple gateway instances (e.g. SO_REUSEPORT background
+                    // workers) may race to generate the same material on a
+                    // first-ever start. Serialize them with an atomically
+                    // created lock file: exactly one process generates, the
+                    // others wait for the material to appear.
+                    Self::generate_exclusively(&key_path, &cert_path)?;
                 }
 
                 Ok(Self {
@@ -156,6 +142,73 @@ impl CertificateStorePaths {
                     private_key: key_path,
                     ca: None,
                 })
+            }
+        }
+    }
+
+    /// Generates self-signed TLS material, serialized across processes.
+    ///
+    /// Uses `File::create_new` (atomic O_EXCL) as a lock file next to the
+    /// material. The process that wins creates the material; losers poll for
+    /// its existence. Deliberately lock-free of external crates (std only) so
+    /// the offline vendored build is unaffected.
+    ///
+    /// # Errors
+    /// Errors if generation fails, or if another process holds the lock for
+    /// longer than [`TLS_GENERATION_WAIT_TIMEOUT_SECS`] (a stale lock left by
+    /// a crashed generator; delete the lock file to recover).
+    fn generate_exclusively(key_path: &str, cert_path: &str) -> Result<()> {
+        let lock_path = format!("{cert_path}.lock");
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            // We are the generator.
+            Ok(_lock) => {
+                tracing::info!(
+                    "TLS auto-gen: generating self-signed certificate at {cert_path} (set {ENV_TLS_STATE_DIR} to override)"
+                );
+                docdb_openssl::generate_auth_keys(key_path, cert_path)?;
+                // openssl(1) honors the process umask when writing the
+                // key file, which on most systems leaves it world- or
+                // group-readable. Explicitly tighten to owner-only RW
+                // so the private key is not exposed even if the
+                // parent directory permissions were loosened by an
+                // admin or skipped by ensure_tls_state_dir (e.g.
+                // pre-existing dir we can't chmod).
+                #[cfg(unix)]
+                if let Err(e) = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(
+                        "Failed to tighten permissions on generated private key {key_path}: {e}. \
+                         Verify the file is not world- or group-readable."
+                    );
+                }
+                // Remove the lock so concurrent waiters resume immediately.
+                if let Err(e) = fs::remove_file(&lock_path) {
+                    tracing::warn!("Failed to remove TLS generation lock {lock_path}: {e}");
+                }
+                Ok(())
+            }
+            // Someone else is (or was) generating.
+            Err(_) => {
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(TLS_GENERATION_WAIT_TIMEOUT_SECS);
+                loop {
+                    if Path::new(cert_path).exists() && Path::new(key_path).exists() {
+                        tracing::info!(
+                            "TLS auto-gen: waited for certificate generated by another gateway instance at {cert_path}"
+                        );
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(DocumentDBError::internal_error(format!(
+                            "Timed out waiting for TLS material generation (lock {lock_path}). \
+                             If a previous gateway crashed mid-generation, delete the lock file and restart."
+                        )));
+                    }
+                    std::thread::sleep(TLS_GENERATION_WAIT_POLL_INTERVAL);
+                }
             }
         }
     }

@@ -21,6 +21,7 @@ use crate::configuration::SetupConfiguration;
 pub struct ListenerConfig {
     use_local_host: bool,
     port: u16,
+    reuse_port: bool,
     unix_socket_path: Option<String>,
     unix_socket_permissions: u32,
 }
@@ -33,6 +34,7 @@ impl ListenerConfig {
         Self {
             use_local_host: true,
             port,
+            reuse_port: false,
             unix_socket_path: None,
             unix_socket_permissions: 0o600,
         }
@@ -45,6 +47,7 @@ impl ListenerConfig {
         Self {
             use_local_host: false,
             port,
+            reuse_port: false,
             unix_socket_path: None,
             unix_socket_permissions: 0o600,
         }
@@ -60,6 +63,13 @@ impl ListenerConfig {
     #[must_use]
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Whether the TCP listeners should set SO_REUSEPORT so multiple
+    /// processes can share the same listening port (Linux only).
+    #[must_use]
+    pub const fn reuse_port(&self) -> bool {
+        self.reuse_port
     }
 
     /// The Unix domain socket path, if a Unix socket listener is configured.
@@ -80,6 +90,7 @@ impl From<&dyn SetupConfiguration> for ListenerConfig {
         Self {
             use_local_host: cfg.use_local_host(),
             port: cfg.gateway_listen_port(),
+            reuse_port: cfg.gateway_reuse_port(),
             unix_socket_path: cfg.unix_socket_path().map(ToOwned::to_owned),
             unix_socket_permissions: cfg.unix_socket_file_permissions(),
         }
@@ -96,6 +107,7 @@ mod tests {
         let setup = DocumentDBSetupConfiguration {
             use_local_host: Some(true),
             gateway_listen_port: Some(12345),
+            gateway_reuse_port: Some(true),
             unix_socket_path: Some("/tmp/gw.sock".to_owned()),
             unix_socket_file_permissions: Some("640".to_owned()),
             ..Default::default()
@@ -105,6 +117,7 @@ mod tests {
 
         assert!(cfg.use_local_host());
         assert_eq!(cfg.port(), 12345);
+        assert!(cfg.reuse_port());
         assert_eq!(cfg.unix_socket_path(), Some("/tmp/gw.sock"));
         assert_eq!(cfg.unix_socket_permissions(), 0o640);
     }
