@@ -662,6 +662,19 @@ bool EnableUpdateWorkerPlanCache =
 bool EnableUpdateWorkerSingleWriteNoSubTransaction =
 	DEFAULT_ENABLE_UPDATE_WORKER_SINGLE_WRITE_NO_SUB_TRANSACTION;
 
+/*
+ * Gateway-side write procedure flags. The Rust gateway dynamic configuration
+ * reads these from pg_settings (keys "enableWriteProcedures" and
+ * "enableWriteProceduresWithBatchCommit" after stripping the "documentdb."
+ * prefix); defaults mirror the gateway defaults in dynamic.rs.
+ */
+#define DEFAULT_ENABLE_WRITE_PROCEDURES true
+bool EnableWriteProcedures = DEFAULT_ENABLE_WRITE_PROCEDURES;
+
+#define DEFAULT_ENABLE_WRITE_PROCEDURES_WITH_BATCH_COMMIT false
+bool EnableWriteProceduresWithBatchCommit =
+	DEFAULT_ENABLE_WRITE_PROCEDURES_WITH_BATCH_COMMIT;
+
 /* Added in v1.2, pending stabilization, enable in v1.3 */
 #define DEFAULT_ENABLE_ARRAY_BSON_STATS_WITH_PLANNER_STATISTICS false
 bool EnableArrayBsonStatsWithPlannerStatistics =
@@ -1832,6 +1845,32 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		NULL,
 		&EnableUpdateWorkerSingleWriteNoSubTransaction,
 		DEFAULT_ENABLE_UPDATE_WORKER_SINGLE_WRITE_NO_SUB_TRANSACTION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableWriteProcedures", newGucPrefix),
+		gettext_noop(
+			"Whether write commands execute through write procedures "
+			"(txn procs) instead of plain function calls. Read by the "
+			"gateway dynamic configuration."),
+		NULL,
+		&EnableWriteProcedures,
+		DEFAULT_ENABLE_WRITE_PROCEDURES,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableWriteProceduresWithBatchCommit", newGucPrefix),
+		gettext_noop(
+			"Whether write procedures use the batch commit path "
+			"(insert_bulk/update_bulk). Requires enableWriteProcedures. "
+			"Read by the gateway dynamic configuration."),
+		NULL,
+		&EnableWriteProceduresWithBatchCommit,
+		DEFAULT_ENABLE_WRITE_PROCEDURES_WITH_BATCH_COMMIT,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
