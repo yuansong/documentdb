@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include <errno.h>
+#include <sched.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -72,6 +73,7 @@ static ShmChannelControl *ShmChannelCtl = NULL;
 
 static bool		shm_channel_enabled = false;
 static int		shm_channel_nslots = 64;	/* PGC_POSTMASTER */
+static int		shm_channel_backend_cpu_start = -1;		/* PGC_POSTMASTER */
 static bool		shm_channel_gucs_defined = false;
 
 static inline void
@@ -303,8 +305,24 @@ ring_send(ShmRing *r, const char *src, Size len, int data_efd)
 			if (MyShmChannel != NULL)
 				MyShmChannel->diag_resp_bytes += chunk;
 
-			/* eventfd coalesces: one write() per chunk, like a socket send */
-			shm_notify_eventfd(data_efd);
+			/*
+			 * Gated notify (2026-11-23, P1): wake the gateway only when it
+			 * has armed reader_parked -- i.e. it committed to sleeping in
+			 * epoll.  While the gateway is spinning it observes the new
+			 * bytes through the ring cursors, so skipping the write()
+			 * saves one syscall per response chunk on the hot path (idle
+			 * diagnosis measured ~1 core of pure eventfd_write in the
+			 * gateway).  Dekker discipline makes this safe in both orders:
+			 * if the gateway armed after our read, its own fenced recheck
+			 * of head saw our advance and it never sleeps; if it armed
+			 * before, we see the flag and notify.
+			 */
+			pg_memory_barrier();
+			if (r->reader_parked)
+			{
+				r->reader_parked = 0;
+				shm_notify_eventfd(data_efd);
+			}
 		}
 		else
 		{
@@ -557,6 +575,33 @@ ShmChannelWorkerMainPublic(Datum main_arg)
 	Port	   *port;
 
 	Assert(ShmChannelCtl != NULL);
+
+	/*
+	 * Optional core pinning (P1): do this first so every later allocation
+	 * and the latch park loop run on the assigned core.  Slot idx maps to
+	 * cpu (start + idx % span); with 16 vCPUs and start=8 that puts slots
+	 * 0-7 on cpus 8-15 and wraps after that.
+	 */
+	if (shm_channel_backend_cpu_start >= 0)
+	{
+		int			ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
+		int			span = ncpu - shm_channel_backend_cpu_start;
+
+		if (ncpu > 0 && span > 0)
+		{
+			int			core = shm_channel_backend_cpu_start + (idx % span);
+			cpu_set_t	set;
+
+			CPU_ZERO(&set);
+			CPU_SET(core, &set);
+			if (sched_setaffinity(0, sizeof(set), &set) == 0)
+				elog(LOG, "shm worker slot %d pinned to cpu %d", idx, core);
+			else
+				elog(LOG, "shm worker slot %d: sched_setaffinity cpu %d "
+					 "failed: %m", idx, core);
+		}
+	}
+
 	slot = &ShmChannelCtl->slots[idx];
 
 	/* claim the slot for this lifetime */
@@ -688,6 +733,25 @@ ShmChannelDefineGUCs(void)
 							64,
 							1,
 							SHM_CH_MAX_SLOTS,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
+
+	/*
+	 * Optional core partitioning (2026-11-23, P1): pin each shm backend
+	 * worker to cpu (backend_cpu_start + slot_idx % remaining_cpus).  Pair
+	 * this with DOCUMENTDB_GW_CPU_AFFINITY on the gateway side (e.g.
+	 * gateway on 0-7, backends on 8-15) to cut cross-core IPIs and
+	 * cacheline migration on the ring cursors.  -1 (default) disables.
+	 */
+	DefineCustomIntVariable("shm_channel.backend_cpu_start",
+							"First CPU for shm backend worker affinity "
+							"(-1 disables pinning).",
+							NULL,
+							&shm_channel_backend_cpu_start,
+							-1,
+							-1,
+							1024,
 							PGC_POSTMASTER,
 							0,
 							NULL, NULL, NULL);
