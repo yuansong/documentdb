@@ -99,10 +99,84 @@ fn default_worker_threads() -> usize {
         .div_ceil(2)
 }
 
+/// Install a panic hook that forces a full backtrace to stderr.
+///
+/// Panics inside the tokio runtime (watchdog threads, connection tasks) are
+/// otherwise swallowed by the task machinery: the JoinHandle is dropped or
+/// only logged as a one-line warn.  Routing every panic through stderr with
+/// `Backtrace::force_capture()` makes postmaster's log show exactly where
+/// and why the gateway crashed (crash-localization, 2026-11-22).
+fn install_panic_hook() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("GATEWAY PANIC: {info}");
+        eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+        default_hook(info);
+    }));
+}
+
+/// Optional gateway CPU affinity (2026-11-23, P1).
+///
+/// `DOCUMENTDB_GW_CPU_AFFINITY="0-7"` (or a single cpu, e.g. "3") pins the
+/// gateway main thread to the given core range.  The tokio worker threads
+/// are spawned after this call and inherit the creator's mask, so the whole
+/// gateway lands on the partitioned cores (cuts cross-core IPIs between the
+/// gateway and the backends).  Unset / malformed values disable pinning.
+fn apply_gateway_affinity() {
+    let raw = match std::env::var("DOCUMENTDB_GW_CPU_AFFINITY") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let raw = raw.trim();
+    let parsed: std::result::Result<(usize, usize), _> = match raw.split_once('-') {
+        Some((lo, hi)) => lo
+            .trim()
+            .parse::<usize>()
+            .and_then(|lo| hi.trim().parse::<usize>().map(|hi| (lo, hi))),
+        None => raw.parse::<usize>().map(|v| (v, v)),
+    };
+    let (lo, hi) = match parsed {
+        Ok(pair) if pair.0 <= pair.1 && pair.1 < 1024 => pair,
+        _ => {
+            eprintln!("GW-HOST: ignoring malformed DOCUMENTDB_GW_CPU_AFFINITY='{raw}'");
+            return;
+        }
+    };
+
+    // sched_setaffinity via a plain 128-byte cpu_set_t (8 * 1024 bits), no
+    // libc CPU_* macros needed.
+    extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+    }
+    let mut mask = [0u8; 128];
+    for cpu in lo..=hi {
+        mask[cpu / 8] |= 1 << (cpu % 8);
+    }
+    let rc = unsafe { sched_setaffinity(0, mask.len(), mask.as_ptr()) };
+    eprintln!(
+        "GW-HOST: gateway affinity cpus {lo}-{hi} -> rc={rc} ({})",
+        if rc == 0 { "pinned" } else { "failed" }
+    );
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
+    // Direct stderr diagnostics: unlike pgrx log!()/tracing, eprintln! is
+    // unfiltered (no log_min_messages, no subscriber init dependency), so
+    // the startup path is always visible in the postmaster log.
+    eprintln!(
+        "GW-HOST: documentdb_gw_worker_main entered (pid={})",
+        std::process::id()
+    );
+
+    apply_gateway_affinity();
+
     STARTUP_INSTANT.get_or_init(Instant::now);
+
+    install_panic_hook();
+    eprintln!("GW-HOST: panic hook installed");
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
