@@ -311,44 +311,33 @@ mod tests {
     #[tokio::test]
     async fn test_reuse_port_allows_multiple_binders_on_same_port() {
         // SO_REUSEPORT must let a second listener bind the same port when BOTH
-        // sockets set it before bind(), and must still fail when only one does
-        // (the pre-bound socket here is a plain tokio bind without REUSEPORT).
-        let port = {
-            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            probe.local_addr().unwrap().port()
-        };
-
+        // sockets set it before bind(), and must still fail when only one does.
+        //
+        // The first REUSEPORT binder is created on an ephemeral port (port 0)
+        // and stays alive for the whole test: it doubles as the port probe, so
+        // no other process can steal the port between probe and re-bind
+        // (TOCTOU), and it does not block the second REUSEPORT bind.
         let first = bind_tcp_socket(
-            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
             true,
         )
-        .expect("first SO_REUSEPORT bind");
-        let second = bind_tcp_socket(
-            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-            true,
-        )
-        .expect("second SO_REUSEPORT bind on the same port must succeed");
-        drop(first);
-        drop(second);
+        .expect("ephemeral SO_REUSEPORT bind");
+        let port = first.local_addr().unwrap().port();
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
 
-        // Without SO_REUSEPORT on the second socket, bind must fail.
-        let plain = bind_tcp_socket(
-            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-            false,
-        );
-        let should_fail = {
-            let holder = bind_tcp_socket(
-                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
-                true,
-            )
-            .expect("holder bind");
-            let failed = plain.is_err();
-            drop(holder);
-            failed
-        };
+        // A second SO_REUSEPORT binder on the same port must succeed.
+        let second = bind_tcp_socket(addr, true)
+            .expect("second SO_REUSEPORT bind on the same port must succeed");
+
+        // While a REUSEPORT holder is alive, a plain bind must fail.
+        let plain = bind_tcp_socket(addr, false);
         assert!(
-            should_fail,
+            plain.is_err(),
             "bind without SO_REUSEPORT must fail while a REUSEPORT holder exists"
         );
+
+        drop(plain);
+        drop(second);
+        drop(first);
     }
 }

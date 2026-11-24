@@ -63,6 +63,13 @@ use state_dir::{resolve_tls_paths, ENV_TLS_STATE_DIR};
 /// Certificate file change monitoring interval in seconds
 const CERT_FILES_CHANGE_WATCH_INTERVAL: u64 = 60;
 
+/// Max time a gateway instance waits for another instance to finish
+/// generating the shared TLS material (stale-lock recovery window).
+const TLS_GENERATION_WAIT_TIMEOUT_SECS: u64 = 60;
+
+/// Poll interval while waiting for the TLS material to appear.
+const TLS_GENERATION_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Internal certificate store that manages certificate file paths.
 ///
 /// The main difference between `CertificateStorePaths` and `CertificateOptions` is that
@@ -159,6 +166,19 @@ impl CertificateStorePaths {
     /// a crashed generator; delete the lock file to recover).
     fn generate_exclusively(key_path: &str, cert_path: &str) -> Result<()> {
         let lock_path = format!("{cert_path}.lock");
+
+        /// Removes the lock file when dropped, so a failed or panicked
+        /// generator never leaves a stale lock behind (which would make
+        /// every subsequent start wait for the full timeout and fail).
+        struct LockGuard(String);
+        impl Drop for LockGuard {
+            fn drop(&mut self) {
+                if let Err(e) = fs::remove_file(&self.0) {
+                    tracing::warn!("Failed to remove TLS generation lock {}: {e}", self.0);
+                }
+            }
+        }
+
         match fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -166,6 +186,7 @@ impl CertificateStorePaths {
         {
             // We are the generator.
             Ok(_lock) => {
+                let _lock_guard = LockGuard(lock_path.clone());
                 tracing::info!(
                     "TLS auto-gen: generating self-signed certificate at {cert_path} (set {ENV_TLS_STATE_DIR} to override)"
                 );
@@ -184,14 +205,12 @@ impl CertificateStorePaths {
                          Verify the file is not world- or group-readable."
                     );
                 }
-                // Remove the lock so concurrent waiters resume immediately.
-                if let Err(e) = fs::remove_file(&lock_path) {
-                    tracing::warn!("Failed to remove TLS generation lock {lock_path}: {e}");
-                }
+                // LockGuard drops here and removes the lock so concurrent
+                // waiters resume immediately.
                 Ok(())
             }
-            // Someone else is (or was) generating.
-            Err(_) => {
+            // The lock file exists: someone else is (or was) generating.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let deadline =
                     std::time::Instant::now() + Duration::from_secs(TLS_GENERATION_WAIT_TIMEOUT_SECS);
                 loop {
@@ -210,6 +229,12 @@ impl CertificateStorePaths {
                     std::thread::sleep(TLS_GENERATION_WAIT_POLL_INTERVAL);
                 }
             }
+            // Any other open failure (permissions, fd exhaustion, ...) is a
+            // real error, not a contended lock: report it immediately rather
+            // than masquerading it as a generation wait.
+            Err(e) => Err(DocumentDBError::internal_error(format!(
+                "Failed to create TLS generation lock {lock_path}: {e}"
+            ))),
         }
     }
 }

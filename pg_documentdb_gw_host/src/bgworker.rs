@@ -45,12 +45,17 @@ const MAX_GATEWAY_INSTANCES: usize = 64;
 /// `postgresql.conf` GUC values are applied, so a GUC would not be reliably
 /// populated here. Defaults to 1 (single instance, unchanged behavior).
 fn gateway_instances() -> usize {
-    std::env::var("DOCUMENTDB_GW_INSTANCES")
+    let parsed = std::env::var("DOCUMENTDB_GW_INSTANCES")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|instances| *instances > 0)
-        .unwrap_or(1)
-        .min(MAX_GATEWAY_INSTANCES)
+        .unwrap_or(1);
+    if parsed > MAX_GATEWAY_INSTANCES {
+        eprintln!(
+            "GW-HOST: DOCUMENTDB_GW_INSTANCES={parsed} exceeds the limit, clamping to {MAX_GATEWAY_INSTANCES}"
+        );
+    }
+    parsed.min(MAX_GATEWAY_INSTANCES)
 }
 
 pub fn init() {
@@ -107,7 +112,12 @@ fn default_worker_threads() -> usize {
 /// `Backtrace::force_capture()` makes postmaster's log show exactly where
 /// and why the gateway crashed (crash-localization, 2026-11-22).
 fn install_panic_hook() {
-    std::env::set_var("RUST_BACKTRACE", "1");
+    // Only default the env var when the operator hasn't set one: mutating the
+    // environment of a running process is process-global (and unsafe under
+    // Rust 2024), so never clobber an explicit operator choice.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("GATEWAY PANIC: {info}");
@@ -228,7 +238,22 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     // listeners so all of them can bind the same gateway port. The kernel
     // then load-balances client connections across the instances by
     // connection 4-tuple hash.
+    //
+    // A Unix socket listener cannot be shared this way: each instance would
+    // unlink and re-bind the same socket file, silently stealing it from the
+    // previously started instances (their accept fds keep pointing at the
+    // deleted inode, so clients hashed there lose their connections). Reject
+    // the combination loudly instead of misbehaving quietly.
     if instances > 1 {
+        if setup_configuration.unix_socket_path.is_some() {
+            log!(
+                "Gateway instance gw{instance_index}/{instances} cannot start: a Unix socket \
+                 listener is not compatible with multiple gateway instances sharing one port. \
+                 Remove `unix_socket_path` from the setup configuration, or set \
+                 DOCUMENTDB_GW_INSTANCES=1."
+            );
+            return;
+        }
         setup_configuration.gateway_reuse_port = Some(true);
         log!(
             "Gateway instance gw{instance_index}/{instances}: SO_REUSEPORT listeners enabled"
