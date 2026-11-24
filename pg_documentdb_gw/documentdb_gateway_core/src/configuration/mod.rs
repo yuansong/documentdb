@@ -116,6 +116,16 @@ pub trait SetupConfiguration: DynClone + Send + Sync + Debug {
     /// Returns whether TLS should be enforced for all connections.
     fn enforce_tls(&self) -> bool;
 
+    /// Returns whether the gateway's TCP listeners should set SO_REUSEPORT.
+    ///
+    /// When enabled, multiple gateway processes can bind the same listening
+    /// port and the Linux kernel load-balances new connections across them
+    /// by connection 4-tuple hash. Defaults to `false`; only meaningful on
+    /// Linux.
+    fn gateway_reuse_port(&self) -> bool {
+        false
+    }
+
     /// Returns the file permissions for Unix socket files (octal format).
     /// Defaults to 0o660 (owner+group read/write) if not specified.
     fn unix_socket_file_permissions(&self) -> u32;

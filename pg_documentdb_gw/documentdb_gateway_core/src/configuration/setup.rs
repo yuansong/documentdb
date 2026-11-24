@@ -71,6 +71,11 @@ pub struct DocumentDBSetupConfiguration {
     pub use_local_host: Option<bool>,
     pub gateway_listen_port: Option<u16>,
     pub enforce_tls: Option<bool>,
+    // Set all listeners' SO_REUSEPORT socket option so multiple gateway
+    // processes (or background workers) can bind the same listening port;
+    // the kernel load-balances new connections across them by connection
+    // 4-tuple hash. Only meaningful on Linux.
+    pub gateway_reuse_port: Option<bool>,
 
     // Postgres configuration
     #[serde(default = "default_user")]
@@ -183,6 +188,7 @@ impl std::fmt::Debug for DocumentDBSetupConfiguration {
             )
             .field("stream_read_buffer_size", &self.stream_read_buffer_size)
             .field("stream_write_buffer_size", &self.stream_write_buffer_size)
+            .field("gateway_reuse_port", &self.gateway_reuse_port)
             .field("unix_socket_path", &self.unix_socket_path)
             .field(
                 "unix_socket_file_permissions",
@@ -953,6 +959,10 @@ impl SetupConfiguration for DocumentDBSetupConfiguration {
 
     fn enforce_tls(&self) -> bool {
         self.enforce_tls.unwrap_or(true)
+    }
+
+    fn gateway_reuse_port(&self) -> bool {
+        self.gateway_reuse_port.unwrap_or(false)
     }
 
     #[expect(clippy::unwrap_used, reason = "validated octal string")]
