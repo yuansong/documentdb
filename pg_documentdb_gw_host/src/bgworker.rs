@@ -60,13 +60,17 @@ fn gateway_instances() -> usize {
 /// only logged as a one-line warn. Routing every panic through stderr with
 /// `Backtrace::force_capture()` makes the postmaster log show exactly where
 /// and why the gateway crashed.
+///
+/// Deliberately does NOT set `RUST_BACKTRACE=1` for this: the panic hook uses
+/// `Backtrace::force_capture()`, which is independent of that env var.
+/// Forcing the env var on would silently re-enable the cheap-looking
+/// `Backtrace::capture()` inside [`crate::error::DocumentDBError`], turning
+/// every expected per-request error construction (missing collection, strict
+/// info fallback, query bookkeeping) into a full ~13-200us stack unwind and
+/// capping gateway throughput at a fraction of the standalone gateway
+/// (measured on 24 vCPU: ~27k vs ~87k ops/s). Operators who want backtraces
+/// in `Backtrace::capture()` can still opt in via RUST_BACKTRACE/RUST_LIB_BACKTRACE.
 fn install_panic_hook() {
-    // Only default the env var when the operator hasn't set one: mutating the
-    // environment of a running process is process-global (and unsafe under
-    // Rust 2024), so never clobber an explicit operator choice.
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "1");
-    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("GATEWAY PANIC: {info}");
