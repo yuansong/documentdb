@@ -18,7 +18,9 @@ use documentdb_gateway_core::{
     error::Result,
     postgres::{conn_mgmt, create_query_catalog, DocumentDBDataClient},
     run_gateway,
-    service::{DefaultRequestRouter, TlsProvider},
+    service::{
+        set_tls_state_dir_override, DefaultRequestRouter, TlsProvider,
+    },
     shutdown_controller::SHUTDOWN_CONTROLLER,
     startup::{create_postgres_object, get_service_context},
     time::STARTUP_INSTANT,
@@ -30,24 +32,30 @@ use pgrx::{
 use tokio::time::Instant;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::gucs::{PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_SETUP_CONFIGURATION};
+use crate::gucs::{self, PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_SETUP_CONFIGURATION};
 
 /// Resolves the number of gateway background workers to register.
 ///
-/// Read from the postmaster environment (`DOCUMENTDB_GW_INSTANCES`): `_PG_init`
-/// runs while `shared_preload_libraries` is being loaded, before
-/// `postgresql.conf` GUC values are applied, so a GUC would not be reliably
-/// populated here. Defaults to 1 (single instance, unchanged behavior).
+/// Primary source: the `documentdb_gateway.gateway_instances` GUC.
+/// `_PG_init` runs while `shared_preload_libraries` is being loaded; the
+/// configuration file has already been processed at that point, and
+/// postgresql.conf entries for the not-yet-defined GUC are applied the
+/// moment it is defined (PostgreSQL's customized-option placeholder
+/// mechanism). The `DOCUMENTDB_GW_INSTANCES` environment variable is kept
+/// as a fallback for deployments that configure through env (containers,
+/// existing scripts); without either, a single instance is registered
+/// (unchanged default behavior).
 ///
 /// The value comes from the shared capacity module so that registration and
-/// the worker main thread can never disagree about how many instances exist --
-/// they both used to parse the environment variable themselves.
+/// the worker main thread can never disagree about how many instances exist.
 fn gateway_instances() -> usize {
     let requested = capacity::requested_gateway_instance_count();
     let instances = capacity::gateway_instance_count();
     if requested > instances {
         eprintln!(
-            "GW-HOST: DOCUMENTDB_GW_INSTANCES={requested} exceeds the limit, clamping to {instances}"
+            "GW-HOST: documentdb_gateway.gateway_instances / \
+             DOCUMENTDB_GW_INSTANCES={requested} exceeds the limit, \
+             clamping to {instances}"
         );
     }
     instances
@@ -81,17 +89,18 @@ fn install_panic_hook() {
 
 /// Optional gateway CPU affinity.
 ///
-/// `DOCUMENTDB_GW_CPU_AFFINITY="0-7"` (or a single cpu, e.g. "3") pins the
-/// gateway main thread to the given core range. The tokio worker threads are
-/// spawned after this call and inherit the creator's mask, so the whole
-/// gateway lands on the partitioned cores (cuts cross-core IPIs between the
-/// gateway and the backends). Unset / malformed values disable pinning. When
-/// multiple gateway instances are registered they all receive the same mask;
+/// `documentdb_gateway.cpu_affinity` GUC, with the
+/// `DOCUMENTDB_GW_CPU_AFFINITY` environment variable as fallback:
+/// "0-7" (or a single cpu, e.g. "3") pins the gateway main thread to the
+/// given core range. The tokio worker threads are spawned after this call
+/// and inherit the creator's mask, so the whole gateway lands on the
+/// partitioned cores (cuts cross-core IPIs between the gateway and the
+/// backends). Unset / malformed values disable pinning. When multiple
+/// gateway instances are registered they all receive the same mask;
 /// partition per instance instead if cores must be split.
-fn apply_gateway_affinity() {
-    let raw = match std::env::var("DOCUMENTDB_GW_CPU_AFFINITY") {
-        Ok(v) => v,
-        Err(_) => return,
+fn apply_gateway_affinity(raw: Option<&str>) {
+    let Some(raw) = raw else {
+        return;
     };
     let raw = raw.trim();
     let parsed: std::result::Result<(usize, usize), _> = match raw.split_once('-') {
@@ -104,7 +113,10 @@ fn apply_gateway_affinity() {
     let (lo, hi) = match parsed {
         Ok(pair) if pair.0 <= pair.1 && pair.1 < 1024 => pair,
         _ => {
-            eprintln!("GW-HOST: ignoring malformed DOCUMENTDB_GW_CPU_AFFINITY='{raw}'");
+            eprintln!(
+                "GW-HOST: ignoring malformed gateway cpu affinity \
+                 (documentdb_gateway.cpu_affinity / DOCUMENTDB_GW_CPU_AFFINITY)='{raw}'"
+            );
             return;
         }
     };
@@ -126,6 +138,16 @@ fn apply_gateway_affinity() {
 }
 
 pub fn init() {
+    // Snapshot the `documentdb_gateway.*` GUCs once: this crate is the only
+    // one with pgrx, so the values are injected into the pure-Rust `capacity`
+    // module (which the standalone gateway also links without PostgreSQL).
+    // All later sizing resolutions run on tokio threads and must never touch
+    // GUC FFI.
+    capacity::set_guc_overrides(capacity::GucOverrides {
+        gateway_instances: gucs::gateway_instances(),
+        worker_threads: gucs::worker_threads(),
+        data_pool_connections: gucs::data_pool_connections(),
+    });
     let instances = gateway_instances();
     if instances <= 1 {
         BackgroundWorkerBuilder::new("DocumentDB Gateway Host")
@@ -166,7 +188,11 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
         std::process::id()
     );
 
-    apply_gateway_affinity();
+    // Affinity source resolved once (GUC > env) and reused for the startup
+    // performance dump.
+    let cpu_affinity_raw =
+        gucs::cpu_affinity().or_else(|| std::env::var("DOCUMENTDB_GW_CPU_AFFINITY").ok());
+    apply_gateway_affinity(cpu_affinity_raw.as_deref());
 
     STARTUP_INSTANT.get_or_init(Instant::now);
 
@@ -194,6 +220,20 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     );
     BackgroundWorker::connect_worker_to_spi(Some(database_name.as_str()), None);
 
+    // Publish the `documentdb_gateway.tls_state_dir` GUC (if configured)
+    // as the highest-priority TLS state directory override before any TLS
+    // material is resolved. The standalone gateway never publishes this
+    // override and keeps resolving via the env var / defaults.
+    if let Some(dir) = gucs::tls_state_dir() {
+        set_tls_state_dir_override(dir);
+    }
+
+    // Log filter: `documentdb_gateway.log_filter` GUC first, then the
+    // `RUST_LOG` environment variable. Resolved here on the PG thread and
+    // handed to the runtime as a plain value — the tokio task must never
+    // touch GUC FFI.
+    let log_filter = gucs::log_filter().or_else(|| std::env::var("RUST_LOG").ok());
+
     let shutdown_token = SHUTDOWN_CONTROLLER.token();
     let worker_name = BackgroundWorker::get_name();
 
@@ -207,6 +247,7 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     // Sizing it to the whole machine instead oversubscribes it, because this
     // gateway competes for cores with the backends it drives and with the other
     // gateway instances on the same host. `capacity` owns the rule:
+    //   * `documentdb_gateway.async_runtime_worker_threads` GUC (per instance),
     //   * explicit value from the setup configuration file (per instance),
     //   * `DOCUMENTDB_GW_WORKER_THREADS` (per instance),
     //   * derived default: half the cores, split across instances, leaving
@@ -235,7 +276,8 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
             "GW-HOST: {instances} gateway instances exceed the gateway thread budget \
              ({gateway_thread_budget} on {cores} cores); every instance still gets \
              {worker_threads} thread(s), so instances will timeslice. Reduce \
-             DOCUMENTDB_GW_INSTANCES or raise the core count."
+             documentdb_gateway.gateway_instances (or DOCUMENTDB_GW_INSTANCES) \
+             or raise the core count."
         );
     }
 
@@ -246,8 +288,13 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
         .unwrap();
 
     tokio_runtime.spawn(async move {
-        if let Err(error) =
-            run_docdb_gateway(setup_configuration_file.as_str(), instance_index).await
+        if let Err(error) = run_docdb_gateway(
+            setup_configuration_file.as_str(),
+            instance_index,
+            log_filter,
+            cpu_affinity_raw,
+        )
+        .await
         {
             tracing::error!("Gateway worker failed to start: {error}");
         }
@@ -266,7 +313,12 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     log!("{} stopped", worker_name);
 }
 
-async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize) -> Result<()> {
+async fn run_docdb_gateway(
+    setup_configuration_file: &str,
+    instance_index: usize,
+    log_filter: Option<String>,
+    cpu_affinity_raw: Option<String>,
+) -> Result<()> {
     let cfg_file = std::path::PathBuf::from(setup_configuration_file);
 
     let shutdown_token = SHUTDOWN_CONTROLLER.token();
@@ -291,7 +343,7 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
                 "GW-HOST: gw{instance_index}/{instances} cannot start: a Unix socket \
                  listener is not compatible with multiple gateway instances sharing one port. \
                  Remove `unix_socket_path` from the setup configuration, or set \
-                 DOCUMENTDB_GW_INSTANCES=1."
+                 documentdb_gateway.gateway_instances=1 (or DOCUMENTDB_GW_INSTANCES=1)."
             );
             return Ok(());
         }
@@ -301,20 +353,22 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
         );
     }
 
-    // Initialize tracing subscriber to handle all tracing events. `RUST_LOG`
-    // selects the verbosity per module (e.g. `RUST_LOG=documentdb_gateway_core=debug`
-    // turns on the per-request forwarding-path diagnostics); without it, info
-    // and above are kept, which is the quiet default used for benchmarks.
-    let rust_log = std::env::var("RUST_LOG").ok();
+    // Initialize tracing subscriber to handle all tracing events. The filter
+    // comes from the `documentdb_gateway.log_filter` GUC, falling back to
+    // `RUST_LOG` (e.g. `RUST_LOG=documentdb_gateway_core=debug` turns on the
+    // per-request forwarding-path diagnostics); without either, info and
+    // above are kept, which is the quiet default used for benchmarks.
     let env_filter =
-        rust_log.as_deref().map_or_else(|| EnvFilter::new("info"), EnvFilter::new);
+        log_filter.as_deref().map_or_else(|| EnvFilter::new("info"), EnvFilter::new);
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     tracing::info!(
-        log_filter = rust_log.as_deref().unwrap_or("info (RUST_LOG unset, default)"),
+        log_filter = log_filter
+            .as_deref()
+            .unwrap_or("info (no GUC or RUST_LOG set, default)"),
         "Tracing subscriber initialised"
     );
 
@@ -375,6 +429,7 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
         dynamic_configuration.as_ref(),
         instances,
         capacity::instance_worker_threads(setup_configuration.async_runtime_worker_threads),
+        cpu_affinity_raw.as_deref().unwrap_or(""),
     );
 
     let service_context = get_service_context(
@@ -410,16 +465,19 @@ fn log_performance_parameters(
     dynamic_configuration: &dyn DynamicConfiguration,
     instances: usize,
     worker_threads: usize,
+    cpu_affinity_raw: &str,
 ) {
     let cores = capacity::available_cores();
-    let thread_source = if capacity::worker_threads_from_env().is_some() {
+    let thread_source = if capacity::worker_threads_guc().is_some() {
+        "guc (documentdb_gateway.async_runtime_worker_threads)"
+    } else if capacity::worker_threads_from_env().is_some() {
         "env (DOCUMENTDB_GW_WORKER_THREADS)"
     } else if setup_configuration.async_runtime_worker_threads.is_some() {
         "setup configuration (AsyncRuntimeWorkerThreads)"
     } else {
         "derived (cores/2 split across instances)"
     };
-    let data_pool_override = capacity::data_pool_connections_from_env();
+    let data_pool_override = capacity::data_pool_connections_override();
     let data_pool_connections = data_pool_override.unwrap_or_else(|| {
         capacity::per_instance_data_pool_connections(
             dynamic_configuration.max_connections(),
@@ -457,7 +515,7 @@ fn log_performance_parameters(
         pool_prune_interval_sec = dynamic_configuration.gateway_connection_pruning_interval_sec(),
         pool_idle_lifetime_sec = dynamic_configuration.gateway_connection_idle_lifetime_sec(),
         pool_lifetime_sec = dynamic_configuration.gateway_connection_lifetime_sec(),
-        cpu_affinity = std::env::var("DOCUMENTDB_GW_CPU_AFFINITY").unwrap_or_default(),
+        cpu_affinity = cpu_affinity_raw,
         "gw_host performance parameters (the standalone gateway prints the same dump; \
          diff the two lines when comparing throughput)"
     );

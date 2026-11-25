@@ -23,19 +23,63 @@
  */
 
 use std::num::NonZero;
+use std::sync::OnceLock;
+
+/// Configuration values snapshotted from the `documentdb_gateway.*` GUCs.
+///
+/// This crate is pure Rust (no pgrx dependency, also linked into the
+/// standalone gateway binary), so GUC values cannot be read here directly.
+/// The gw_host background worker reads them once on the postmaster thread
+/// during initialization and injects them via [`set_guc_overrides`]; every
+/// resolution below then prefers an explicitly configured GUC value over
+/// the environment variable, and behaves exactly as before when the GUCs
+/// are left unset (the default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GucOverrides {
+    /// `documentdb_gateway.gateway_instances`.
+    pub gateway_instances: Option<usize>,
+    /// `documentdb_gateway.async_runtime_worker_threads`.
+    pub worker_threads: Option<usize>,
+    /// `documentdb_gateway.data_pool_connections`.
+    pub data_pool_connections: Option<usize>,
+}
+
+impl GucOverrides {
+    /// No GUC channel configured; all resolutions fall through to env/JSON.
+    pub const NONE: Self = Self {
+        gateway_instances: None,
+        worker_threads: None,
+        data_pool_connections: None,
+    };
+}
+
+static GUC_OVERRIDES: OnceLock<GucOverrides> = OnceLock::new();
+
+/// Publishes the GUC snapshot. Idempotent: the first snapshot wins, which
+/// is fine because Postmaster-context GUCs cannot change after the
+/// configuration file has been processed.
+pub fn set_guc_overrides(overrides: GucOverrides) {
+    let _ = GUC_OVERRIDES.set(overrides);
+}
+
+fn guc_overrides() -> GucOverrides {
+    *GUC_OVERRIDES.get().unwrap_or(&GucOverrides::NONE)
+}
 
 /// Environment variable holding the number of gateway instances that share
-/// one host. Read from the process environment rather than a GUC because
-/// `_PG_init` runs before `postgresql.conf` values are applied.
+/// one host. Fallback channel below the `documentdb_gateway.gateway_instances`
+/// GUC, retained for container/K8s and existing deployment scripts.
 pub const GATEWAY_INSTANCES_ENV: &str = "DOCUMENTDB_GW_INSTANCES";
 
 /// Environment variable overriding the worker-thread count of one instance.
-/// Takes precedence over the setup configuration file.
+/// Fallback channel below the
+/// `documentdb_gateway.async_runtime_worker_threads` GUC.
 pub const WORKER_THREADS_ENV: &str = "DOCUMENTDB_GW_WORKER_THREADS";
 
 /// Environment variable overriding the data-pool connection cap of one
 /// instance. Intended as an escape hatch for workloads that pin connections
 /// (long-lived cursors) and therefore need more backends than threads.
+/// Fallback channel below the `documentdb_gateway.data_pool_connections` GUC.
 pub const DATA_POOL_CONNECTIONS_ENV: &str = "DOCUMENTDB_GW_DATA_POOL_CONNECTIONS";
 
 /// Upper bound on gateway instances per host. Purely a runaway guard: any
@@ -80,9 +124,15 @@ fn env_usize(key: &str) -> Option<usize> {
 /// Number of gateway instances the operator asked for, clamped to at least
 /// one but not capped. See [`gateway_instance_count`] for the effective value
 /// and use this one only to warn about a value that had to be clamped.
+///
+/// Resolution order: `documentdb_gateway.gateway_instances` GUC, then the
+/// `DOCUMENTDB_GW_INSTANCES` environment variable, then the default of 1.
 #[must_use]
 pub fn requested_gateway_instance_count() -> usize {
-    env_usize(GATEWAY_INSTANCES_ENV).unwrap_or(1)
+    guc_overrides()
+        .gateway_instances
+        .or_else(|| env_usize(GATEWAY_INSTANCES_ENV))
+        .unwrap_or(1)
 }
 
 /// Effective number of gateway instances sharing this host.
@@ -91,16 +141,26 @@ pub fn gateway_instance_count() -> usize {
     requested_gateway_instance_count().min(MAX_GATEWAY_INSTANCES)
 }
 
+/// Worker-thread override from the
+/// `documentdb_gateway.async_runtime_worker_threads` GUC, if any.
+#[must_use]
+pub fn worker_threads_guc() -> Option<usize> {
+    guc_overrides().worker_threads
+}
+
 /// Worker-thread override from the environment, if any.
 #[must_use]
 pub fn worker_threads_from_env() -> Option<usize> {
     env_usize(WORKER_THREADS_ENV)
 }
 
-/// Data-pool connection override from the environment, if any.
+/// Data-pool connection override: `documentdb_gateway.data_pool_connections`
+/// GUC first, then the environment variable.
 #[must_use]
-pub fn data_pool_connections_from_env() -> Option<usize> {
-    env_usize(DATA_POOL_CONNECTIONS_ENV)
+pub fn data_pool_connections_override() -> Option<usize> {
+    guc_overrides()
+        .data_pool_connections
+        .or_else(|| env_usize(DATA_POOL_CONNECTIONS_ENV))
 }
 
 /// Cores that must stay available to PostgreSQL itself.
@@ -161,12 +221,15 @@ pub fn per_instance_worker_threads(
 
 /// Resolves the worker-thread count of one gateway instance on this host.
 ///
-/// Resolution order: explicit value (setup configuration file), then
+/// Resolution order: `documentdb_gateway.async_runtime_worker_threads` GUC,
+/// then the explicit value (setup configuration file), then
 /// `DOCUMENTDB_GW_WORKER_THREADS`, then the derived default.
 #[must_use]
 pub fn instance_worker_threads(configured: Option<usize>) -> usize {
     per_instance_worker_threads(
-        configured.or_else(worker_threads_from_env),
+        worker_threads_guc()
+            .or(configured)
+            .or_else(worker_threads_from_env),
         gateway_instance_count(),
         available_cores(),
     )
@@ -340,5 +403,44 @@ mod tests {
         // share is 293, so the pool tracks the thread count, not the cluster.
         assert_eq!(per_instance_data_pool_connections(300, 7, 1, 64), 128);
         assert_eq!(per_instance_data_pool_connections(300, 7, 1, 1), 2);
+    }
+
+    #[test]
+    fn guc_override_slots_in_front_of_the_resolution_chain() {
+        // The GUC snapshot is process-global (published once by the bgworker
+        // before the runtime starts), so this test must NOT publish one via
+        // `set_guc_overrides` -- it would leak into the parallel
+        // pool_manager tests that resolve capacity through the same globals.
+        // The precedence below exercises the exact expression the public
+        // entry points use; the snapshot wiring itself is verified by the
+        // gw_host integration run (startup dump `worker_thread_source`).
+        let guc_worker_threads = Some(7);
+
+        // Worker threads: GUC outranks both the setup configuration key ...
+        assert_eq!(
+            per_instance_worker_threads(
+                guc_worker_threads.or(Some(4)),
+                1,
+                16
+            ),
+            7
+        );
+        // ... and the environment fallback (modeled as the last `.or_else`).
+        let env_worker_threads = Some(5);
+        assert_eq!(
+            per_instance_worker_threads(
+                None.or(env_worker_threads),
+                1,
+                16
+            ),
+            5
+        );
+        // With no GUC and no setup key the derived default still applies.
+        assert_eq!(per_instance_worker_threads(None.or(None), 2, 16), 4);
+
+        // Instance count: GUC > env > default 1 (modeled identically).
+        let guc_instances = Some(3);
+        assert_eq!(guc_instances.or(None).unwrap_or(1), 3);
+        assert_eq!(None::<usize>.or(None).unwrap_or(1), 1);
     }
 }

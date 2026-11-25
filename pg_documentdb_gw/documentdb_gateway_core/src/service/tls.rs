@@ -58,7 +58,7 @@ use crate::{
 #[path = "tls_state_dir.rs"]
 mod state_dir;
 
-use state_dir::{resolve_tls_paths, ENV_TLS_STATE_DIR};
+use state_dir::{resolve_tls_paths, set_tls_state_dir_override as publish_tls_state_dir, ENV_TLS_STATE_DIR};
 
 /// Certificate file change monitoring interval in seconds
 const CERT_FILES_CHANGE_WATCH_INTERVAL: u64 = 60;
@@ -66,6 +66,17 @@ const CERT_FILES_CHANGE_WATCH_INTERVAL: u64 = 60;
 /// Max time a gateway instance waits for another instance to finish
 /// generating the shared TLS material (stale-lock recovery window).
 const TLS_GENERATION_WAIT_TIMEOUT_SECS: u64 = 60;
+
+/// Publishes the `documentdb_gateway.tls_state_dir` GUC value as the
+/// highest-priority TLS state directory override.
+///
+/// The gw_host background worker calls this once during initialization,
+/// before the tokio runtime (and therefore the TLS provider) starts. The
+/// standalone gateway never calls it and keeps resolving exactly as
+/// before (env var, then defaults).
+pub fn set_tls_state_dir_override(dir: String) {
+    publish_tls_state_dir(dir);
+}
 
 /// Poll interval while waiting for the TLS material to appear.
 const TLS_GENERATION_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);

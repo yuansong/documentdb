@@ -115,7 +115,7 @@ impl PgPoolSettings {
         worker_threads: usize,
     ) -> Self {
         let mut settings = Self::from_configuration(config);
-        let data_pool_connections = capacity::data_pool_connections_from_env().unwrap_or_else(|| {
+        let data_pool_connections = capacity::data_pool_connections_override().unwrap_or_else(|| {
             capacity::per_instance_data_pool_connections(
                 settings.max_connections,
                 settings.system_connection_budget,

@@ -15,8 +15,25 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{env, fs, path::Path};
+use std::sync::OnceLock;
 
 use crate::error::{DocumentDBError, Result};
+
+/// GUC-injected TLS state directory (`documentdb_gateway.tls_state_dir`).
+///
+/// This crate cannot read GUCs itself (no pgrx dependency; the standalone
+/// gateway links it without PostgreSQL), so the gw_host background worker
+/// reads the GUC once on the postmaster thread during initialization and
+/// publishes it here. The override is checked before the
+/// `DOCUMENTDB_TLS_STATE_DIR` environment variable, which keeps the
+/// standalone gateway (no GUC environment) unchanged.
+static GUC_TLS_STATE_DIR: OnceLock<String> = OnceLock::new();
+
+/// Publishes the GUC value. Idempotent (first snapshot wins); callers
+/// should only pass non-empty, trimmed values.
+pub(super) fn set_tls_state_dir_override(dir: String) {
+    let _ = GUC_TLS_STATE_DIR.set(dir);
+}
 
 /// Default directory for auto-generated TLS material when the operator
 /// has not pinned a location via `DOCUMENTDB_TLS_STATE_DIR`.
@@ -55,6 +72,8 @@ const TLS_KEY_FILENAME: &str = "pkey.pem";
 /// creating it as a side effect.
 ///
 /// Resolution order:
+///   0. `documentdb_gateway.tls_state_dir` GUC (gw_host only; published by
+///      [`set_tls_state_dir_override`]).
 ///   1. `DOCUMENTDB_TLS_STATE_DIR` env var (any non-empty value). Honored
 ///      verbatim — if the operator pointed us somewhere uncreatable,
 ///      surface their error rather than silently picking another path.
@@ -70,9 +89,14 @@ const TLS_KEY_FILENAME: &str = "pkey.pem";
 ///      installs the operator sets `DOCUMENTDB_TLS_STATE_DIR` explicitly.
 ///
 /// Fallbacks past step 2 emit `tracing::warn!` so operators see the
-/// fallback in `journalctl` and know to set the env var if they want a
-/// pinned location.
+/// fallback in `journalctl` and know to set the env var or the GUC if they
+/// want a pinned location.
 pub(super) fn resolve_tls_state_dir() -> Result<String> {
+    if let Some(explicit) = GUC_TLS_STATE_DIR.get() {
+        ensure_tls_state_dir(explicit)?;
+        return Ok(explicit.clone());
+    }
+
     if let Some(explicit) = env::var(ENV_TLS_STATE_DIR)
         .ok()
         .map(|s| s.trim().to_owned())

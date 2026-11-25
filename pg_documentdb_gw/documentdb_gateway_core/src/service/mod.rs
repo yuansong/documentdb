@@ -17,5 +17,6 @@ pub use connection_loop::{process_request_message, DefaultRequestRouter, Request
 pub use listener_config::ListenerConfig;
 pub use tcp_listener::create_tcp_listeners;
 pub use tls::{
-    spawn_certificate_reload_task, CertificateBundle, CertificateStorePaths, TlsProvider,
+    set_tls_state_dir_override, spawn_certificate_reload_task, CertificateBundle,
+    CertificateStorePaths, TlsProvider,
 };
