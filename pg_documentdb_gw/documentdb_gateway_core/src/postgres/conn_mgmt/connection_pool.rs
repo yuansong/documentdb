@@ -58,13 +58,6 @@ struct BackendConnectionConfig {
     ssl_mode: SslMode,
 }
 
-/// Pool acquisitions slower than this mean requests are queuing behind other
-/// requests for a backend instead of doing work. Logged at warn level with a
-/// pool snapshot (size/available/waiting) so pool exhaustion — the classic
-/// "throughput caps out below expectations / requests hang" failure mode —
-/// shows up directly in the gateway log rather than only as a percentile tail.
-const POOL_ACQUIRE_SLOW_WARN: Duration = Duration::from_millis(50);
-
 fn pg_configuration(
     setup_configuration: &dyn SetupConfiguration,
     query_catalog: &QueryCatalog,
@@ -401,10 +394,7 @@ impl ConnectionPool {
     ) -> std::result::Result<PoolConnection, deadpool_postgres::PoolError> {
         self.touch();
 
-        let acquire_start = Instant::now();
-        let result = self.pool.get().await;
-        self.log_slow_acquire(acquire_start.elapsed(), "primary");
-        result.inspect_err(|error| {
+        self.pool.get().await.inspect_err(|error| {
             self.metrics.record_timeout_if_pool_timeout(error);
         })
     }
@@ -436,10 +426,7 @@ impl ConnectionPool {
     ) -> std::result::Result<PoolConnection, deadpool_postgres::PoolError> {
         self.touch();
 
-        let acquire_start = Instant::now();
-        let result = self.timeout_pool.get().await;
-        self.log_slow_acquire(acquire_start.elapsed(), "timeout");
-        result.inspect_err(|error| {
+        self.timeout_pool.get().await.inspect_err(|error| {
             self.metrics.record_timeout_if_pool_timeout(error);
         })
     }
@@ -529,29 +516,6 @@ impl ConnectionPool {
             available: primary.available + timeout.available,
             waiting: primary.waiting + timeout.waiting,
         }
-    }
-
-    /// Warns when a backend acquisition took longer than
-    /// [`POOL_ACQUIRE_SLOW_WARN`], attaching the pool snapshot so the log line
-    /// alone answers whether the pool was exhausted (`available == 0`) or a
-    /// backend had to be created first (`size < max_size`, connect cost).
-    fn log_slow_acquire(&self, waited: Duration, pool: &'static str) {
-        if waited < POOL_ACQUIRE_SLOW_WARN {
-            return;
-        }
-
-        let status = self.combined_status();
-        tracing::warn!(
-            pool,
-            identifier = self.identifier.as_str(),
-            waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-            max_size = status.max_size,
-            size = status.size,
-            available = status.available,
-            waiting = status.waiting,
-            "Slow connection-pool acquisition: requests are queuing for a backend \
-             (available == 0 means the pool is exhausted)"
-        );
     }
 }
 
