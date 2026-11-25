@@ -11,7 +11,10 @@ use std::{sync::Arc, time::Duration};
 
 use documentdb_gateway_core::{
     auth::AuthenticationManager,
-    configuration::{capacity, DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
+    configuration::{
+        capacity, DocumentDBSetupConfiguration, DynamicConfiguration, PgConfiguration,
+        SetupConfiguration,
+    },
     error::Result,
     postgres::{conn_mgmt, create_query_catalog, DocumentDBDataClient},
     run_gateway,
@@ -294,11 +297,22 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
         );
     }
 
-    // Initialize tracing subscriber to handle all tracing events
+    // Initialize tracing subscriber to handle all tracing events. `RUST_LOG`
+    // selects the verbosity per module (e.g. `RUST_LOG=documentdb_gateway_core=debug`
+    // turns on the per-request forwarding-path diagnostics); without it, info
+    // and above are kept, which is the quiet default used for benchmarks.
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let env_filter =
+        rust_log.as_deref().map_or_else(|| EnvFilter::new("info"), EnvFilter::new);
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    tracing::info!(
+        log_filter = rust_log.as_deref().unwrap_or("info (RUST_LOG unset, default)"),
+        "Tracing subscriber initialised"
+    );
 
     tracing::info!("Starting server with configuration: {setup_configuration:?}");
 
@@ -348,6 +362,17 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
         Err(error) => return Err(error),
     };
 
+    // One structured dump of everything that can move throughput, logged once
+    // per instance at startup. The standalone gateway emits the same dump, so
+    // a `gw_host` vs standalone performance comparison starts by diffing the
+    // two lines (threads, pool sizes, buffers, timeouts) instead of guessing.
+    log_performance_parameters(
+        &setup_configuration,
+        dynamic_configuration.as_ref(),
+        instances,
+        capacity::instance_worker_threads(setup_configuration.async_runtime_worker_threads),
+    );
+
     let service_context = get_service_context(
         Box::new(setup_configuration),
         dynamic_configuration,
@@ -363,4 +388,73 @@ async fn run_docdb_gateway(setup_configuration_file: &str, instance_index: usize
         shutdown_token,
     )
     .await
+}
+
+/// One-shot, structured dump of every performance-relevant parameter this
+/// gateway instance will run with, logged once at info level so the default
+/// filter always captures it.
+///
+/// Every number that decides throughput appears here: runtime threads (and
+/// where the value came from), the data-pool capacity derived from cores and
+/// `max_connections`, socket and per-connection buffer sizes, and the
+/// request/transaction/connect timeouts. When `gw_host` underperforms a
+/// standalone gateway deployment, diffing this line between the two shows
+/// whether the sizing (threads, pool, buffers) or the timeouts diverged before
+/// any per-request debugging is needed.
+fn log_performance_parameters(
+    setup_configuration: &DocumentDBSetupConfiguration,
+    dynamic_configuration: &dyn DynamicConfiguration,
+    instances: usize,
+    worker_threads: usize,
+) {
+    let cores = capacity::available_cores();
+    let thread_source = if capacity::worker_threads_from_env().is_some() {
+        "env (DOCUMENTDB_GW_WORKER_THREADS)"
+    } else if setup_configuration.async_runtime_worker_threads.is_some() {
+        "setup configuration (AsyncRuntimeWorkerThreads)"
+    } else {
+        "derived (cores/2 split across instances)"
+    };
+    let data_pool_override = capacity::data_pool_connections_from_env();
+    let data_pool_connections = data_pool_override.unwrap_or_else(|| {
+        capacity::per_instance_data_pool_connections(
+            dynamic_configuration.max_connections(),
+            dynamic_configuration.system_connection_budget(),
+            instances,
+            worker_threads,
+        )
+    });
+
+    tracing::info!(
+        gateway_instances = instances,
+        cores,
+        worker_threads,
+        worker_thread_source = thread_source,
+        pg_reserved_cores = capacity::pg_reserved_cores(cores),
+        gateway_thread_budget = capacity::default_total_worker_threads(cores),
+        listen_port = setup_configuration.gateway_listen_port(),
+        reuse_port = setup_configuration.gateway_reuse_port(),
+        v2_runtime = setup_configuration.enable_v2_runtime(),
+        enforce_tls = setup_configuration.enforce_tls(),
+        stream_read_buffer_bytes = setup_configuration.stream_read_buffer_size(),
+        stream_write_buffer_bytes = setup_configuration.stream_write_buffer_size(),
+        connection_buffer_bytes = dynamic_configuration.gateway_connection_buffer_size(),
+        max_connections = dynamic_configuration.max_connections(),
+        system_connection_budget = dynamic_configuration.system_connection_budget(),
+        data_pool_connections,
+        data_pool_override_set = data_pool_override.is_some(),
+        max_request_timeout_sec = dynamic_configuration.max_request_timeout_sec(),
+        transaction_timeout_sec = dynamic_configuration.transaction_timeout_sec(),
+        // 0 means "not configured" (no client-side connect timeout).
+        connect_timeout_ms = dynamic_configuration.connect_timeout().map_or(0, |timeout| {
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+        }),
+        socket_idle_timeout_sec = dynamic_configuration.socket_connection_idle_timeout_sec(),
+        pool_prune_interval_sec = dynamic_configuration.gateway_connection_pruning_interval_sec(),
+        pool_idle_lifetime_sec = dynamic_configuration.gateway_connection_idle_lifetime_sec(),
+        pool_lifetime_sec = dynamic_configuration.gateway_connection_lifetime_sec(),
+        cpu_affinity = std::env::var("DOCUMENTDB_GW_CPU_AFFINITY").unwrap_or_default(),
+        "gw_host performance parameters (the standalone gateway prints the same dump; \
+         diff the two lines when comparing throughput)"
+    );
 }

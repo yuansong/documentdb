@@ -15,11 +15,120 @@ use crate::{
     error::Result,
     postgres::PgDataClient,
     protocol::header::Header,
-    requests::{RequestIntervalKind, RequestObservation},
+    requests::{
+        request_tracker::RequestTracker, RequestIntervalKind, RequestObservation,
+    },
     responses,
     service::connection_loop::routing::RequestRouter,
     telemetry::{self, client_info},
 };
+
+/// Requests slower than this are worth surfacing at info level even when the
+/// debug-level per-request diagnostics stay disabled: on a healthy benchmark
+/// workload every request is sub-millisecond, so a slow request is a real
+/// regression signal rather than noise.
+const DEFAULT_SLOW_REQUEST_LOG_THRESHOLD_MS: u64 = 250;
+
+/// Per-interval elapsed time of one request, in microseconds.
+///
+/// The tracker accumulates nanoseconds; microseconds keep the log readable
+/// (a 0.7 ms read shows up as `read_us=700`, not `0.0007`).
+fn interval_us(tracker: &RequestTracker, interval: RequestIntervalKind) -> u64 {
+    tracker.get_interval_elapsed_time(interval) / 1_000
+}
+
+/// Threshold above which a completed request is reported at info level.
+///
+/// The dynamic configuration key `slowQueryLogIntervalInMilliseconds`
+/// overrides the built-in default when set to a positive value.
+fn slow_request_threshold_ms(connection_context: &ConnectionContext) -> u64 {
+    let configured = connection_context
+        .dynamic_configuration()
+        .slow_query_log_interval_ms();
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_SLOW_REQUEST_LOG_THRESHOLD_MS
+    }
+}
+
+/// Emits the request forwarding-path breakdown as one structured log line.
+///
+/// The intervals come from the request tracker that the whole pipeline records
+/// into, so the line is the exact decomposition operators need to answer
+/// "where did this request spend its time": socket read, wire parse
+/// (`format`), backend connection acquisition (`open_backend`), the backend
+/// round trip (`pg_exec`), the transaction bookkeeping round trips
+/// (`begin_txn` / `set_timeout` / `commit_txn`), and the response write.
+///
+/// Levels, from quietest to loudest:
+///
+/// * `debug` — every completed request, only when the subscriber filter
+///   enables debug (the `enabled!` guard keeps the cost to one atomic-free
+///   check per request otherwise);
+/// * `info` — failed requests, and requests slower than the configured
+///   threshold, so regressions are visible without raising the log level.
+///
+/// `total` falls back to `HandleRequest` when `HandleMessage` was never
+/// closed (error path), so a failed request still shows its overall span.
+fn log_request_diagnostics(
+    connection_context: &ConnectionContext,
+    header: &Header,
+    request_context: &RequestContext<'_>,
+    response_bytes: usize,
+    failed: bool,
+) {
+    let tracker = request_context.tracker;
+    let total_us = interval_us(tracker, RequestIntervalKind::HandleMessage);
+    let handle_request_us = interval_us(tracker, RequestIntervalKind::HandleRequest);
+    let total_us = if total_us > 0 {
+        total_us
+    } else {
+        handle_request_us
+    };
+    let total_ms = total_us / 1_000;
+
+    let is_debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+    let slow = !failed && total_ms >= slow_request_threshold_ms(connection_context);
+
+    if !failed && !slow && !is_debug_enabled {
+        // Quiet, healthy request on an info-only filter: log nothing.
+        return;
+    }
+
+    macro_rules! request_diagnostics {
+        ($level:ident, $message:expr) => {
+            tracing::$level!(
+                activity_id = request_context.activity_id,
+                op = %request_context.request().request_type(),
+                request_bytes = header.message_length(),
+                response_bytes,
+                read_us = interval_us(tracker, RequestIntervalKind::ReadRequest),
+                format_us = interval_us(tracker, RequestIntervalKind::FormatRequest),
+                open_backend_us = interval_us(tracker, RequestIntervalKind::OpenBackendConnection),
+                pg_exec_us = interval_us(tracker, RequestIntervalKind::ProcessRequest),
+                begin_txn_us = interval_us(tracker, RequestIntervalKind::PostgresBeginTransaction),
+                set_timeout_us =
+                    interval_us(tracker, RequestIntervalKind::PostgresSetStatementTimeout),
+                commit_txn_us =
+                    interval_us(tracker, RequestIntervalKind::PostgresCommitTransaction),
+                handle_request_us,
+                write_response_us = interval_us(tracker, RequestIntervalKind::WriteResponse),
+                total_us,
+                total_ms,
+                $message
+            );
+        };
+    }
+
+    if failed {
+        request_diagnostics!(debug, "request FAILED (forwarding-path timings)");
+    } else if slow {
+        request_diagnostics!(info, "SLOW REQUEST (forwarding-path timings)");
+    } else {
+        request_diagnostics!(debug, "request completed (forwarding-path timings)");
+    }
+}
 
 pub(super) async fn handle_request<T, R, W>(
     connection_context: &mut ConnectionContext,
@@ -49,6 +158,7 @@ where
     let response = match response_result {
         Ok(response) => response,
         Err(error) => {
+            log_request_diagnostics(connection_context, header, request_context, 0, true);
             return Err(error);
         }
     };
@@ -60,6 +170,7 @@ where
     if connection_context.requires_response {
         let handle_response_start = Instant::now();
         let raw_response = response.as_raw_document()?;
+        let response_bytes = raw_response.as_bytes().len();
         let write_response_start = Instant::now();
         responses::writer::write_and_flush(header, raw_response, writer)
             .instrument(tracing::info_span!("gateway.write_response"))
@@ -70,6 +181,8 @@ where
         request_context
             .tracker
             .record_duration(RequestIntervalKind::HandleResponse, handle_response_start);
+
+        log_request_diagnostics(connection_context, header, request_context, response_bytes, false);
     }
 
     if connection_context.request_metrics_enabled() {

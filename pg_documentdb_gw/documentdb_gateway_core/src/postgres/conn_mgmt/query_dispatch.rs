@@ -421,6 +421,23 @@ where
                                 tracing::warn!(
                                     "Failed to acquire connection from timeout pool: {e:?}"
                                 );
+                            } else if matches!(&e, PoolError::Timeout(_)) {
+                                // A pool acquisition timeout means requests are
+                                // blocked on backends, not failing inside
+                                // PostgreSQL. Attach the snapshot so the line
+                                // distinguishes exhaustion (`available == 0`)
+                                // from backend creation trouble.
+                                let status = pool.status();
+                                let pool_status = status.status();
+                                tracing::warn!(
+                                    pool = status.identifier(),
+                                    max_size = pool_status.max_size,
+                                    size = pool_status.size,
+                                    available = pool_status.available,
+                                    waiting = pool_status.waiting,
+                                    "Failed to acquire a data-pool connection \
+                                     (exhaustion or acquisition timeout)"
+                                );
                             }
 
                             break 'attempt Err(DocumentDBError::from(e));
