@@ -6,6 +6,7 @@
  *-------------------------------------------------------------------------
  */
 
+pub mod capacity;
 mod certs;
 mod dynamic;
 mod pg_configuration;
@@ -14,6 +15,7 @@ mod version;
 
 use std::fmt::Debug;
 
+pub use capacity::MAX_GATEWAY_INSTANCES;
 pub use certs::{CertInputType, CertificateOptions};
 use dyn_clone::{clone_trait_object, DynClone};
 pub use dynamic::{
@@ -99,6 +101,17 @@ pub trait SetupConfiguration: DynClone + Send + Sync + Debug {
 
     /// Returns the number of worker threads for the async runtime.
     fn async_runtime_worker_threads(&self) -> usize;
+
+    /// Returns the operator-configured worker-thread count, if the setup
+    /// configuration pins one explicitly.
+    ///
+    /// Unlike [`SetupConfiguration::async_runtime_worker_threads`], this does
+    /// **not** substitute a machine-derived default, so callers that size
+    /// per-instance resources (connection pools) can tell "the operator asked
+    /// for 32 threads" apart from "nobody said anything, use the default".
+    fn async_runtime_worker_threads_override(&self) -> Option<usize> {
+        None
+    }
 
     /// Returns the size of the read buffer for streams.
     fn stream_read_buffer_size(&self) -> usize;

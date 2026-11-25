@@ -941,6 +941,10 @@ impl SetupConfiguration for DocumentDBSetupConfiguration {
         })
     }
 
+    fn async_runtime_worker_threads_override(&self) -> Option<usize> {
+        self.async_runtime_worker_threads.filter(|threads| *threads > 0)
+    }
+
     fn stream_read_buffer_size(&self) -> usize {
         self.stream_read_buffer_size.unwrap_or(8 * 1024)
     }

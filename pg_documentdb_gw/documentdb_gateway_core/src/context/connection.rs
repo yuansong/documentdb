@@ -24,7 +24,7 @@ use crate::{
         LogicalSessionId, ServiceContext, TransactionNumber,
     },
     error::Result,
-    postgres::conn_mgmt::{Connection, PgPoolSettings},
+    postgres::conn_mgmt::Connection,
     security::principal::Principal,
     service::TlsProvider,
     telemetry::TelemetryProvider,
@@ -265,9 +265,13 @@ impl ConnectionContext {
     ) -> Result<()> {
         let username = user.principal()?.name();
 
-        let settings = PgPoolSettings::from_configuration(
-            self.service_context.dynamic_configuration().as_ref(),
-        );
+        // Pool settings must be the same ones every other allocation site
+        // computes, otherwise the authenticated user's pool is sized from the
+        // cluster total and every instance claims the whole budget.
+        let settings = self
+            .service_context
+            .connection_pool_manager()
+            .data_pool_settings(self.service_context.dynamic_configuration().as_ref());
 
         self.service_context
             .connection_pool_manager()

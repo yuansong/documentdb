@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use documentdb_gateway_core::{
     auth::AuthenticationManager,
-    configuration::{DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
+    configuration::{capacity, DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
     error::Result,
     postgres::{conn_mgmt, create_query_catalog, DocumentDBDataClient},
     run_gateway,
@@ -29,29 +29,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::gucs::{PG_DOCUMENTDB_GATEWAY_DATABASE, PG_DOCUMENTDB_SETUP_CONFIGURATION};
 
-/// Upper bound on registered gateway instances. Purely a runaway guard; any
-/// real deployment wanting more than 64 gateway workers on one box should
-/// rethink its topology first.
-const MAX_GATEWAY_INSTANCES: usize = 64;
-
 /// Resolves the number of gateway background workers to register.
 ///
 /// Read from the postmaster environment (`DOCUMENTDB_GW_INSTANCES`): `_PG_init`
 /// runs while `shared_preload_libraries` is being loaded, before
 /// `postgresql.conf` GUC values are applied, so a GUC would not be reliably
 /// populated here. Defaults to 1 (single instance, unchanged behavior).
+///
+/// The value comes from the shared capacity module so that registration and
+/// the worker main thread can never disagree about how many instances exist --
+/// they both used to parse the environment variable themselves.
 fn gateway_instances() -> usize {
-    let parsed = std::env::var("DOCUMENTDB_GW_INSTANCES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|instances| *instances > 0)
-        .unwrap_or(1);
-    if parsed > MAX_GATEWAY_INSTANCES {
+    let requested = capacity::requested_gateway_instance_count();
+    let instances = capacity::gateway_instance_count();
+    if requested > instances {
         eprintln!(
-            "GW-HOST: DOCUMENTDB_GW_INSTANCES={parsed} exceeds the limit, clamping to {MAX_GATEWAY_INSTANCES}"
+            "GW-HOST: DOCUMENTDB_GW_INSTANCES={requested} exceeds the limit, clamping to {instances}"
         );
     }
-    parsed.min(MAX_GATEWAY_INSTANCES)
+    instances
 }
 
 /// Install a panic hook that forces a full backtrace to stderr.
@@ -195,8 +191,49 @@ pub extern "C-unwind" fn documentdb_gw_worker_main(arg: pg_sys::Datum) {
     let worker_name = BackgroundWorker::get_name();
 
     // now start the gw on a worker thread.
+    //
+    // The runtime used to be pinned to a single worker thread, which serialized
+    // all socket I/O for every client connection: with 40 clients only one
+    // tokio worker accumulated CPU while the PostgreSQL backends sat idle in
+    // `ClientRead` waiting to be fed.
+    //
+    // Sizing it to the whole machine instead oversubscribes it, because this
+    // gateway competes for cores with the backends it drives and with the other
+    // gateway instances on the same host. `capacity` owns the rule:
+    //   * explicit value from the setup configuration file (per instance),
+    //   * `DOCUMENTDB_GW_WORKER_THREADS` (per instance),
+    //   * derived default: half the cores, split across instances, leaving
+    //     room for PostgreSQL's own maintenance/autovacuum/pg_cron workers.
+    //
+    // The connection pool is sized from the same resolved count, so it must be
+    // computed here and from the same inputs (see `PoolManager::data_pool_settings`).
+    let instances = gateway_instances();
+    let configured_worker_threads =
+        DocumentDBSetupConfiguration::new(&std::path::PathBuf::from(
+            setup_configuration_file.as_str(),
+        ))
+        .ok()
+        .and_then(|configuration| configuration.async_runtime_worker_threads);
+    let worker_threads = capacity::instance_worker_threads(configured_worker_threads);
+
+    let cores = capacity::available_cores();
+    let gateway_thread_budget = capacity::default_total_worker_threads(cores);
+    eprintln!(
+        "GW-HOST: gw{instance_index}/{instances} tokio worker threads: {worker_threads} \
+         (cores={cores}, reserved for postgres={}, gateway budget={gateway_thread_budget})",
+        capacity::pg_reserved_cores(cores)
+    );
+    if instances > gateway_thread_budget {
+        eprintln!(
+            "GW-HOST: {instances} gateway instances exceed the gateway thread budget \
+             ({gateway_thread_budget} on {cores} cores); every instance still gets \
+             {worker_threads} thread(s), so instances will timeslice. Reduce \
+             DOCUMENTDB_GW_INSTANCES or raise the core count."
+        );
+    }
+
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .unwrap();

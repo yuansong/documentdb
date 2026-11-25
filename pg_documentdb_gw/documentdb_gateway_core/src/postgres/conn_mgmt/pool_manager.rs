@@ -17,7 +17,7 @@ use tokio_postgres::{
 };
 
 use crate::{
-    configuration::{DynamicConfiguration, SetupConfiguration},
+    configuration::{capacity, DynamicConfiguration, SetupConfiguration},
     error::{DocumentDBError, Result},
     postgres::{
         conn_mgmt::{Connection, ConnectionPool, ConnectionPoolStatus, PgPoolSettings},
@@ -115,6 +115,28 @@ where
         }
     }
 
+    /// Data-pool settings for the pool this instance hands to one credential,
+    /// sharded across the gateway instances that share this host.
+    ///
+    /// Every allocation site must go through here: sizing a pool from the
+    /// cluster alone lets K instances (and every distinct user) each claim the
+    /// whole `max_connections` budget, which shows up as clients hanging while
+    /// they wait for a backend slot, not as a clean error.
+    #[must_use]
+    pub fn data_pool_settings(
+        &self,
+        dynamic_configuration: &dyn DynamicConfiguration,
+    ) -> PgPoolSettings {
+        PgPoolSettings::for_gateway_instance(
+            dynamic_configuration,
+            capacity::gateway_instance_count(),
+            capacity::instance_worker_threads(
+                self.setup_configuration
+                    .async_runtime_worker_threads_override(),
+            ),
+        )
+    }
+
     /// Allocates the data pool for `username`, reusing the existing one when it
     /// was built with the same credential. Every authenticated connection calls
     /// this, so rebuilding unconditionally would discard warm backends.
@@ -127,7 +149,7 @@ where
         password: &str,
         dynamic_configuration: &dyn DynamicConfiguration,
     ) -> Result<()> {
-        let settings = PgPoolSettings::from_configuration(dynamic_configuration);
+        let settings = self.data_pool_settings(dynamic_configuration);
         self.allocate_data_pool_with_settings(username, password, settings)
     }
 
@@ -182,7 +204,7 @@ where
         username: &str,
         dynamic_configuration: &dyn DynamicConfiguration,
     ) -> Result<Arc<ConnectionPool>> {
-        let settings = PgPoolSettings::from_configuration(dynamic_configuration);
+        let settings = self.data_pool_settings(dynamic_configuration);
         self.get_data_pool_with_settings(username, settings)
     }
 
@@ -209,7 +231,7 @@ where
         &self,
         dynamic_configuration: &dyn DynamicConfiguration,
     ) -> Result<Arc<ConnectionPool>> {
-        let settings = PgPoolSettings::from_configuration(dynamic_configuration);
+        let settings = self.data_pool_settings(dynamic_configuration);
 
         match self.shared_data_pools.entry(settings) {
             Entry::Occupied(pool_ref) => {
@@ -446,6 +468,11 @@ mod tests {
         postgres::create_query_catalog,
     };
 
+    /// Runtime worker threads the pool-sizing tests assume.
+    const TEST_WORKER_THREADS: usize = 4;
+    /// Data-pool capacity those tests expect: `TEST_WORKER_THREADS` * 2.
+    const TEST_DATA_POOL_CONNECTIONS: usize = TEST_WORKER_THREADS * 2;
+
     #[derive(Debug)]
     struct MaxConnectionConfig {
         // Needed for interior mutability in tests.
@@ -566,6 +593,9 @@ mod tests {
             },
             postgres_system_user: system_user.clone(),
             postgres_data_user: system_user,
+            // Pin the runtime size so the data-pool capacity derived from it is
+            // the same on every test host (4 threads -> 8 connections).
+            async_runtime_worker_threads: Some(TEST_WORKER_THREADS),
             ..Default::default()
         }
     }
@@ -669,9 +699,11 @@ mod tests {
             );
 
             let shared_pool = shared_pool_result.unwrap();
-            // max_size is the combined capacity of the primary + timeout pools
+            // max_size is the combined capacity of the primary + timeout pools.
+            // The capacity is capped by what the runtime can drive (threads * 2),
+            // so a 100-slot cluster does not translate into 100 backends here.
             assert_eq!(
-                dynamic_configuration.max_conn() * 2,
+                TEST_DATA_POOL_CONNECTIONS * 2,
                 shared_pool.status().status().max_size,
                 "Should have the combined size of primary and timeout pools"
             );
@@ -698,8 +730,10 @@ mod tests {
             .get_system_shared_pool(&dynamic_configuration)
             .unwrap();
 
-        // change the max connection
-        dynamic_configuration.set_max_conn(42);
+        // Change the max connections to a value *below* the runtime cap so the
+        // cluster budget is the binding constraint and the size must change.
+        // (With 4 threads the cap is 8 connections; 100 and 42 would both cap.)
+        dynamic_configuration.set_max_conn(6);
 
         let new_shared_pool = pool_manager
             .get_system_shared_pool(&dynamic_configuration)
@@ -804,7 +838,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            dynamic_configuration.max_conn() * 2,
+            TEST_DATA_POOL_CONNECTIONS * 2,
             user_pool.status().status().max_size
         );
     }
@@ -894,7 +928,7 @@ mod tests {
 
         let dynamic_configuration = MaxConnectionConfig::new(100);
         let pool_manager = test_pool_manager();
-        let cached_settings = PgPoolSettings::from_configuration(&dynamic_configuration);
+        let cached_settings = pool_manager.data_pool_settings(&dynamic_configuration);
 
         pool_manager
             .allocate_data_pool("user", "password", &dynamic_configuration)
